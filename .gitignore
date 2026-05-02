@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Database (production state, not committed)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Local environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.tar.gz
+
+# Triagewall-specific runtime state
+position.json
+/var/
+
+# Backups
+*.backup-*
+*.bak
+*.orig
+
+# Local config overrides
+config/local.json
+config/*.local.json
+
+# One-time bootstrap script (kept locally, not for distribution)
+bootstrap.sh

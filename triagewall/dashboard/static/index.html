@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Triage Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background: #0b0f17; color: #e5e7eb; font-family: ui-sans-serif, system-ui, sans-serif; }
+  .card { background: #131a26; border: 1px solid #1f2937; }
+  .v-real { color: #f87171; }
+  .v-false_positive { color: #6ee7b7; }
+  .v-uncertain { color: #fbbf24; }
+  .badge { padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+  .badge-real { background: rgba(248,113,113,.15); color: #f87171; }
+  .badge-false_positive { background: rgba(110,231,183,.15); color: #6ee7b7; }
+  .badge-uncertain { background: rgba(251,191,36,.15); color: #fbbf24; }
+  .reasoning { font-size: 0.85rem; color: #9ca3af; line-height: 1.5; }
+  .demo-banner { background: #7c2d12; color: #fff; }
+</style>
+</head>
+<body class="min-h-screen">
+<div id="app" class="max-w-6xl mx-auto p-6">
+
+  <div id="demoBanner" class="demo-banner hidden p-3 rounded mb-4 text-sm">
+    Demo mode — internal IPs masked, feedback disabled. Source: <a class="underline" href="https://github.com/Aphifer07/triagewall" target="_blank">github.com/Aphifer07/triagewall</a>
+  </div>
+
+  <header class="mb-6">
+    <h1 class="text-3xl font-bold">Triage Agent</h1>
+    <p class="text-gray-400 text-sm">Local LLM-powered Suricata alert triage. Built on AXON.</p>
+  </header>
+
+  <div id="stats" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"></div>
+
+  <div class="flex flex-wrap gap-2 mb-4 items-center">
+      <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="">All</button>
+      <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="real">Real</button>
+      <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="false_positive">False Positive</button>
+      <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="uncertain">Uncertain</button>
+      <span class="text-gray-600 text-xs">|</span>
+      <button class="model-btn card px-3 py-1.5 rounded text-sm" data-model="">All sources</button>
+      <button class="model-btn card px-3 py-1.5 rounded text-sm" data-model="llm">LLM only</button>
+      <button class="model-btn card px-3 py-1.5 rounded text-sm" data-model="prefilter">Prefilter only</button>
+      <input id="sigFilter" class="card px-3 py-1.5 rounded text-sm flex-1 min-w-[200px]" placeholder="Filter by signature...">
+      <span class="text-xs text-gray-500" id="lastUpdate"></span>
+  </div>
+
+  <div id="verdicts" class="space-y-3"></div>
+</div>
+
+<script>
+const API = "";
+let currentFilter = { verdict: "", signature: "", model:"" };
+let mode = "local";
+
+async function load() {
+  const params = new URLSearchParams();
+  if (currentFilter.verdict) params.set("verdict", currentFilter.verdict);
+  if (currentFilter.signature) params.set("signature", currentFilter.signature);
+  if (currentFilter.model) params.set("model", currentFilter.model);
+  const res = await fetch(`${API}/api/verdicts?${params}`);
+  const data = await res.json();
+  mode = data.mode;
+  if (mode === "demo") document.getElementById("demoBanner").classList.remove("hidden");
+  renderStats(data.stats);
+  renderVerdicts(data.verdicts);
+  document.getElementById("lastUpdate").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+function renderStats(s) {
+  const reviewPct = s.reviewed && s.total ? Math.round((s.reviewed / s.total) * 100) : 0;
+  const agreePct = s.reviewed ? Math.round((s.agreed / s.reviewed) * 100) : null;
+  const cards = [
+    { label: "Total", val: s.total ?? 0, cls: "" },
+    { label: "Real", val: s.real_ ?? 0, cls: "v-real" },
+    { label: "False Positive", val: s.fp ?? 0, cls: "v-false_positive" },
+    { label: "Uncertain", val: s.unc ?? 0, cls: "v-uncertain" },
+    { label: "Agreement", val: agreePct === null ? "—" : `${agreePct}%`, cls: "" },
+  ];
+  document.getElementById("stats").innerHTML = cards.map(c => `
+    <div class="card p-3 rounded">
+      <div class="text-xs text-gray-400 uppercase tracking-wide">${c.label}</div>
+      <div class="text-2xl font-bold ${c.cls}">${c.val}</div>
+    </div>
+  `).join("");
+}
+
+function renderVerdicts(list) {
+  if (!list.length) {
+    document.getElementById("verdicts").innerHTML = `<div class="card p-6 rounded text-center text-gray-500">No verdicts match the current filter.</div>`;
+    return;
+  }
+  document.getElementById("verdicts").innerHTML = list.map(v => {
+    const conf = (v.confidence * 100).toFixed(0);
+    const reviewed = v.human_verdict ? `<span class="text-xs ${v.agreed ? 'text-green-400' : 'text-red-400'}">Reviewed: ${v.human_verdict} (${v.agreed ? 'agreed' : 'disagreed'})</span>` : '';
+    const fbBtns = (mode === "demo" || v.human_verdict) ? '' : `
+      <div class="flex gap-2 mt-2">
+        <button onclick="feedback(${v.id}, '${v.verdict}')" class="text-xs px-2 py-1 rounded bg-green-900/30 text-green-300 hover:bg-green-900/50">✓ Agree</button>
+        <button onclick="feedbackOther(${v.id})" class="text-xs px-2 py-1 rounded bg-red-900/30 text-red-300 hover:bg-red-900/50">✗ Disagree</button>
+      </div>`;
+    return `
+    <div class="card p-4 rounded">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="badge badge-${v.verdict}">${v.verdict.replace('_',' ')}</span>
+            <span class="text-xs text-gray-500">${conf}% conf</span>
+            <span class="text-xs text-gray-500">SID ${v.signature_id ?? '?'}</span>
+            <span class="text-xs text-gray-600">${v.processed_at?.slice(0, 19).replace('T', ' ') ?? ''}</span>
+          </div>
+          <div class="font-semibold mt-1">${escapeHtml(v.signature ?? '?')}</div>
+          <div class="text-xs text-gray-500 mt-1">
+            ${v.src_ip ?? '?'}:${v.src_port ?? '?'} → ${v.dest_ip ?? '?'}:${v.dest_port ?? '?'} (${v.proto ?? '?'})
+          </div>
+          <div class="reasoning mt-2">${escapeHtml(v.reasoning ?? '')}</div>
+          ${reviewed}
+          ${fbBtns}
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function feedback(id, agentVerdict, customVerdict = null) {
+  const human_verdict = customVerdict || agentVerdict;
+  const res = await fetch(`${API}/api/feedback/${id}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ human_verdict }),
+  });
+  if (res.ok) load();
+}
+
+function feedbackOther(id) {
+  const choice = prompt("What's the correct verdict? (real / false_positive / uncertain)");
+  if (!choice) return;
+  const norm = choice.trim().toLowerCase();
+  if (!["real", "false_positive", "uncertain"].includes(norm)) {
+    alert("Invalid verdict");
+    return;
+  }
+  feedback(id, null, norm);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+document.querySelectorAll(".filter-btn").forEach(b =>
+  b.addEventListener("click", () => { currentFilter.verdict = b.dataset.verdict; load(); })
+);
+document.querySelectorAll(".model-btn").forEach(b =>
+  b.addEventListener("click", () => { currentFilter.model = b.dataset.model; load(); })
+);
+document.getElementById("sigFilter").addEventListener("input", e => {
+  currentFilter.signature = e.target.value;
+  clearTimeout(window._t);
+  window._t = setTimeout(load, 300);
+});
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html><!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Triage Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background: #0b0f17; color: #e5e7eb; font-family: ui-sans-serif, system-ui, sans-serif; }
+  .card { background: #131a26; border: 1px solid #1f2937; }
+  .v-real { color: #f87171; }
+  .v-false_positive { color: #6ee7b7; }
+  .v-uncertain { color: #fbbf24; }
+  .badge { padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+  .badge-real { background: rgba(248,113,113,.15); color: #f87171; }
+  .badge-false_positive { background: rgba(110,231,183,.15); color: #6ee7b7; }
+  .badge-uncertain { background: rgba(251,191,36,.15); color: #fbbf24; }
+  .reasoning { font-size: 0.85rem; color: #9ca3af; line-height: 1.5; }
+  .demo-banner { background: #7c2d12; color: #fff; }
+</style>
+</head>
+<body class="min-h-screen">
+<div id="app" class="max-w-6xl mx-auto p-6">
+
+  <div id="demoBanner" class="demo-banner hidden p-3 rounded mb-4 text-sm">
+    Demo mode — internal IPs masked, feedback disabled. Source: <a class="underline" href="https://github.com/Aphifer07/triagewall" target="_blank">github.com/Aphifer07/triagewall</a>
+  </div>
+
+  <header class="mb-6">
+    <h1 class="text-3xl font-bold">Triage Agent</h1>
+    <p class="text-gray-400 text-sm">Local LLM-powered Suricata alert triage. Built on AXON.</p>
+  </header>
+
+  <div id="stats" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"></div>
+
+  <div class="flex flex-wrap gap-2 mb-4 items-center">
+    <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="">All</button>
+    <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="real">Real</button>
+    <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="false_positive">False Positive</button>
+    <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="uncertain">Uncertain</button>
+    <input id="sigFilter" class="card px-3 py-1.5 rounded text-sm flex-1 min-w-[200px]" placeholder="Filter by signature...">
+    <span class="text-xs text-gray-500" id="lastUpdate"></span>
+  </div>
+
+  <div id="verdicts" class="space-y-3"></div>
+</div>
+
+<script>
+const API = "";
+let currentFilter = { verdict: "", signature: "" };
+let mode = "local";
+
+async function load() {
+  const params = new URLSearchParams();
+  if (currentFilter.verdict) params.set("verdict", currentFilter.verdict);
+  if (currentFilter.signature) params.set("signature", currentFilter.signature);
+  const res = await fetch(`${API}/api/verdicts?${params}`);
+  const data = await res.json();
+  mode = data.mode;
+  if (mode === "demo") document.getElementById("demoBanner").classList.remove("hidden");
+  renderStats(data.stats);
+  renderVerdicts(data.verdicts);
+  document.getElementById("lastUpdate").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+function renderStats(s) {
+  const reviewPct = s.reviewed && s.total ? Math.round((s.reviewed / s.total) * 100) : 0;
+  const agreePct = s.reviewed ? Math.round((s.agreed / s.reviewed) * 100) : null;
+  const cards = [
+    { label: "Total", val: s.total ?? 0, cls: "" },
+    { label: "Real", val: s.real_ ?? 0, cls: "v-real" },
+    { label: "False Positive", val: s.fp ?? 0, cls: "v-false_positive" },
+    { label: "Uncertain", val: s.unc ?? 0, cls: "v-uncertain" },
+    { label: "Agreement", val: agreePct === null ? "—" : `${agreePct}%`, cls: "" },
+  ];
+  document.getElementById("stats").innerHTML = cards.map(c => `
+    <div class="card p-3 rounded">
+      <div class="text-xs text-gray-400 uppercase tracking-wide">${c.label}</div>
+      <div class="text-2xl font-bold ${c.cls}">${c.val}</div>
+    </div>
+  `).join("");
+}
+
+function renderVerdicts(list) {
+  if (!list.length) {
+    document.getElementById("verdicts").innerHTML = `<div class="card p-6 rounded text-center text-gray-500">No verdicts match the current filter.</div>`;
+    return;
+  }
+  document.getElementById("verdicts").innerHTML = list.map(v => {
+    const conf = (v.confidence * 100).toFixed(0);
+    const reviewed = v.human_verdict ? `<span class="text-xs ${v.agreed ? 'text-green-400' : 'text-red-400'}">Reviewed: ${v.human_verdict} (${v.agreed ? 'agreed' : 'disagreed'})</span>` : '';
+    const fbBtns = (mode === "demo" || v.human_verdict) ? '' : `
+      <div class="flex gap-2 mt-2">
+        <button onclick="feedback(${v.id}, '${v.verdict}')" class="text-xs px-2 py-1 rounded bg-green-900/30 text-green-300 hover:bg-green-900/50">✓ Agree</button>
+        <button onclick="feedbackOther(${v.id})" class="text-xs px-2 py-1 rounded bg-red-900/30 text-red-300 hover:bg-red-900/50">✗ Disagree</button>
+      </div>`;
+    return `
+    <div class="card p-4 rounded">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="badge badge-${v.verdict}">${v.verdict.replace('_',' ')}</span>
+            <span class="text-xs text-gray-500">${conf}% conf</span>
+            <span class="text-xs text-gray-500">SID ${v.signature_id ?? '?'}</span>
+            <span class="text-xs text-gray-600">${v.processed_at?.slice(0, 19).replace('T', ' ') ?? ''}</span>
+          </div>
+          <div class="font-semibold mt-1">${escapeHtml(v.signature ?? '?')}</div>
+          <div class="text-xs text-gray-500 mt-1">
+            ${v.src_ip ?? '?'}:${v.src_port ?? '?'} → ${v.dest_ip ?? '?'}:${v.dest_port ?? '?'} (${v.proto ?? '?'})
+          </div>
+          <div class="reasoning mt-2">${escapeHtml(v.reasoning ?? '')}</div>
+          ${reviewed}
+          ${fbBtns}
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function feedback(id, agentVerdict, customVerdict = null) {
+  const human_verdict = customVerdict || agentVerdict;
+  const res = await fetch(`${API}/api/feedback/${id}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ human_verdict }),
+  });
+  if (res.ok) load();
+}
+
+function feedbackOther(id) {
+  const choice = prompt("What's the correct verdict? (real / false_positive / uncertain)");
+  if (!choice) return;
+  const norm = choice.trim().toLowerCase();
+  if (!["real", "false_positive", "uncertain"].includes(norm)) {
+    alert("Invalid verdict");
+    return;
+  }
+  feedback(id, null, norm);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+document.querySelectorAll(".filter-btn").forEach(b =>
+  b.addEventListener("click", () => { currentFilter.verdict = b.dataset.verdict; load(); })
+);
+document.getElementById("sigFilter").addEventListener("input", e => {
+  currentFilter.signature = e.target.value;
+  clearTimeout(window._t);
+  window._t = setTimeout(load, 300);
+});
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

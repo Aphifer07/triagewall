@@ -1,0 +1,41 @@
+{
+  "auto_false_positive": [
+    {
+      "signature_ids": [
+        2016149,
+        2016150
+      ],
+      "reason": "STUN binding request/response - normal NAT traversal traffic, used by Tailscale, WebRTC, VoIP, gaming."
+    },
+    {
+      "signature_ids": [
+        2016151,
+        2033078
+      ],
+      "reason": "STUN binding on non-standard high port - same NAT traversal mechanism, different rule pattern."
+    },
+    {
+      "signature_ids": [
+        2001117
+      ],
+      "reason": "DNS NXDOMAIN response - benign DNS lookup failure (typo'd domains, browser prefetch, Pi-hole blocks). DGA-style abuse is caught separately by SID 2008470."
+    },
+    {
+      "signature_ids": [
+        2024897,
+        2060251
+      ],
+      "reason": "Go HTTP client user agent - normal traffic from Go-based services in the homelab (containers, internal tools, CI/CD agents)."
+    },
+    {
+      "signature_ids": [
+        2035464,
+        2035465,
+        2035466,
+        2060502,
+        2060503
+      ],
+      "reason": "Discord chat service traffic - normal Discord usage from desktop/mobile clients."
+    }
+  ]
+}
