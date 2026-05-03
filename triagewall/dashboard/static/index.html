@@ -3,56 +3,162 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Triage Dashboard</title>
+<title>Triagewall — Local-LLM alert triage</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  body { background: #0b0f17; color: #e5e7eb; font-family: ui-sans-serif, system-ui, sans-serif; }
-  .card { background: #131a26; border: 1px solid #1f2937; }
-  .v-real { color: #f87171; }
-  .v-false_positive { color: #6ee7b7; }
-  .v-uncertain { color: #fbbf24; }
-  .badge { padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
-  .badge-real { background: rgba(248,113,113,.15); color: #f87171; }
-  .badge-false_positive { background: rgba(110,231,183,.15); color: #6ee7b7; }
-  .badge-uncertain { background: rgba(251,191,36,.15); color: #fbbf24; }
-  .reasoning { font-size: 0.85rem; color: #9ca3af; line-height: 1.5; }
+  body {
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+    font-feature-settings: "ss01", "cv01", "cv02";
+  }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .card { background: #161b22; border: 1px solid #21262d; }
+  .card-hover:hover { border-color: #30363d; }
+  .v-real { color: #ff7b72; }
+  .v-false_positive { color: #7ee787; }
+  .v-uncertain { color: #d29922; }
+  .badge { padding: 2px 8px; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.02em; }
+  .badge-real { background: rgba(255,123,114,.15); color: #ff7b72; }
+  .badge-false_positive { background: rgba(126,231,135,.15); color: #7ee787; }
+  .badge-uncertain { background: rgba(210,153,34,.15); color: #d29922; }
+  .badge-prefilter { background: rgba(110,118,129,.2); color: #8b949e; border: 1px solid #30363d; }
+  .badge-llm { background: rgba(88,166,255,.15); color: #58a6ff; }
+  .reasoning { font-size: 0.875rem; color: #8b949e; line-height: 1.55; }
   .demo-banner { background: #7c2d12; color: #fff; }
+  .focused { outline: 2px solid #d29922; outline-offset: -2px; }
+  .filter-pill { background: transparent; border: 1px solid #30363d; color: #8b949e; transition: all 0.15s; }
+  .filter-pill:hover { border-color: #58a6ff; color: #c9d1d9; }
+  .filter-pill.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .hero-stat { font-feature-settings: "tnum"; letter-spacing: -0.02em; }
+  .freshness {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.75rem;
+    color: #6e7681;
+  }
+  .freshness::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #3fb950;
+    box-shadow: 0 0 8px #3fb950;
+  }
+  kbd {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    color: #c9d1d9;
+    padding: 1px 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+  }
+  .btn-agree {
+    background: rgba(46,160,67,.15);
+    color: #3fb950;
+    border: 1px solid rgba(46,160,67,.3);
+    transition: all 0.15s;
+  }
+  .btn-agree:hover { background: rgba(46,160,67,.25); border-color: rgba(46,160,67,.5); }
+  .btn-disagree {
+    background: transparent;
+    color: #8b949e;
+    border: 1px solid #30363d;
+    transition: all 0.15s;
+  }
+  .btn-disagree:hover { color: #ff7b72; border-color: rgba(255,123,114,.4); }
 </style>
 </head>
 <body class="min-h-screen">
 <div id="app" class="max-w-6xl mx-auto p-6">
 
   <div id="demoBanner" class="demo-banner hidden p-3 rounded mb-4 text-sm">
-    Demo mode — internal IPs masked, feedback disabled. Source: <a class="underline" href="https://github.com/Aphifer07/triagewall" target="_blank">github.com/Aphifer07/triagewall</a>
+    Demo mode — internal IPs masked, feedback disabled.
+    Source: <a class="underline" href="https://github.com/Aphifer07/triagewall" target="_blank">github.com/Aphifer07/triagewall</a>
   </div>
 
-  <header class="mb-6">
-    <h1 class="text-3xl font-bold">Triage Agent</h1>
-    <p class="text-gray-400 text-sm">Local LLM-powered Suricata alert triage. Built on AXON.</p>
+  <header class="mb-8 flex items-end justify-between flex-wrap gap-4">
+    <div>
+      <h1 class="text-3xl font-bold text-white tracking-tight">Triagewall</h1>
+      <p class="text-gray-500 text-sm mt-1">Local-LLM alert triage for self-hosted SOCs.</p>
+    </div>
+    <div class="freshness" id="freshness">Live · Updated never</div>
   </header>
 
-  <div id="stats" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"></div>
-
-  <div class="flex flex-wrap gap-2 mb-4 items-center">
-      <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="">All</button>
-      <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="real">Real</button>
-      <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="false_positive">False Positive</button>
-      <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="uncertain">Uncertain</button>
-      <span class="text-gray-600 text-xs">|</span>
-      <button class="model-btn card px-3 py-1.5 rounded text-sm" data-model="">All sources</button>
-      <button class="model-btn card px-3 py-1.5 rounded text-sm" data-model="llm">LLM only</button>
-      <button class="model-btn card px-3 py-1.5 rounded text-sm" data-model="prefilter">Prefilter only</button>
-      <input id="sigFilter" class="card px-3 py-1.5 rounded text-sm flex-1 min-w-[200px]" placeholder="Filter by signature...">
-      <span class="text-xs text-gray-500" id="lastUpdate"></span>
+  <!-- Hero stat: 24h prefilter ratio -->
+  <div class="card rounded-lg p-6 mb-6">
+    <div class="flex items-end justify-between flex-wrap gap-4">
+      <div>
+        <div class="text-xs text-gray-500 uppercase tracking-widest font-semibold">Last 24 hours</div>
+        <div class="hero-stat text-5xl font-bold text-white mt-1">
+          <span id="heroPct">—</span><span class="text-3xl text-gray-500">% prefiltered</span>
+        </div>
+        <div class="text-sm text-gray-500 mt-2 mono" id="heroDetail">Loading…</div>
+      </div>
+      <div class="text-right">
+        <div class="text-xs text-gray-500 uppercase tracking-widest font-semibold">All-time</div>
+        <div class="text-2xl font-semibold text-gray-300 mt-1 mono" id="lifetimeTotal">—</div>
+        <div class="text-xs text-gray-500 mt-1">alerts processed</div>
+      </div>
+    </div>
   </div>
 
-  <div id="verdicts" class="space-y-3"></div>
+  <!-- Secondary stats -->
+  <div id="stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"></div>
+
+  <!-- Filters -->
+  <div class="flex flex-wrap gap-2 mb-4 items-center">
+    <span class="text-xs text-gray-500 uppercase tracking-wider mr-1">Verdict:</span>
+    <button class="filter-pill filter-btn px-3 py-1 rounded-full text-xs font-medium" data-verdict="">All</button>
+    <button class="filter-pill filter-btn px-3 py-1 rounded-full text-xs font-medium" data-verdict="real">Real</button>
+    <button class="filter-pill filter-btn px-3 py-1 rounded-full text-xs font-medium" data-verdict="false_positive">False Positive</button>
+    <button class="filter-pill filter-btn px-3 py-1 rounded-full text-xs font-medium" data-verdict="uncertain">Uncertain</button>
+
+    <span class="text-gray-700 mx-2">·</span>
+
+    <span class="text-xs text-gray-500 uppercase tracking-wider mr-1">Source:</span>
+    <button class="filter-pill model-btn px-3 py-1 rounded-full text-xs font-medium active" data-model="llm">LLM only</button>
+    <button class="filter-pill model-btn px-3 py-1 rounded-full text-xs font-medium" data-model="">All</button>
+    <button class="filter-pill model-btn px-3 py-1 rounded-full text-xs font-medium" data-model="prefilter">Prefilter only</button>
+
+    <input id="sigFilter" class="card px-3 py-1.5 rounded text-sm flex-1 min-w-[200px] ml-2" placeholder="Filter by signature…">
+  </div>
+
+  <!-- Alert list -->
+  <div id="verdicts" class="space-y-2"></div>
+
+  <!-- Keyboard shortcuts hint -->
+  <div class="mt-8 pt-6 border-t border-gray-800 text-xs text-gray-600 flex flex-wrap gap-x-6 gap-y-2">
+    <span><kbd>J</kbd> / <kbd>K</kbd> navigate</span>
+    <span><kbd>A</kbd> agree</span>
+    <span><kbd>D</kbd> mark different</span>
+    <span><kbd>U</kbd> mark uncertain</span>
+    <span class="ml-auto">
+      <a href="https://github.com/Aphifer07/triagewall" target="_blank" class="hover:text-gray-400">github.com/Aphifer07/triagewall</a>
+    </span>
+  </div>
 </div>
 
 <script>
 const API = "";
-let currentFilter = { verdict: "", signature: "", model:"" };
+let currentFilter = { verdict: "", signature: "", model: "llm" };
 let mode = "local";
+let focusedIndex = 0;
+let currentVerdicts = [];
+
+function setActive(selector, dataKey, value) {
+  // "All" pills (data-* === "") represent absence of filter — don't visually highlight
+  document.querySelectorAll(selector).forEach(b => {
+    const isActive = value !== "" && b.dataset[dataKey] === value;
+    b.classList.toggle("active", isActive);
+  });
+}
 
 async function load() {
   const params = new URLSearchParams();
@@ -63,63 +169,116 @@ async function load() {
   const data = await res.json();
   mode = data.mode;
   if (mode === "demo") document.getElementById("demoBanner").classList.remove("hidden");
+  renderHero(data.stats);
   renderStats(data.stats);
   renderVerdicts(data.verdicts);
-  document.getElementById("lastUpdate").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  document.getElementById("freshness").textContent = `Live · Updated ${new Date().toLocaleTimeString()}`;
+}
+
+function renderHero(s) {
+  const t24 = s.today_total ?? 0;
+  const p24 = s.today_prefilter ?? 0;
+  const l24 = s.today_llm ?? 0;
+  const pct = t24 > 0 ? (100 * p24 / t24) : 0;
+  document.getElementById("heroPct").textContent = pct.toFixed(1);
+  document.getElementById("heroDetail").textContent =
+    `${p24.toLocaleString()} of ${t24.toLocaleString()} alerts auto-classified · ${l24.toLocaleString()} sent to LLM`;
+  document.getElementById("lifetimeTotal").textContent = (s.total ?? 0).toLocaleString();
 }
 
 function renderStats(s) {
-  const reviewPct = s.reviewed && s.total ? Math.round((s.reviewed / s.total) * 100) : 0;
   const agreePct = s.reviewed ? Math.round((s.agreed / s.reviewed) * 100) : null;
   const cards = [
-    { label: "Total", val: s.total ?? 0, cls: "" },
-    { label: "Real", val: s.real_ ?? 0, cls: "v-real" },
-    { label: "False Positive", val: s.fp ?? 0, cls: "v-false_positive" },
-    { label: "Uncertain", val: s.unc ?? 0, cls: "v-uncertain" },
-    { label: "Agreement", val: agreePct === null ? "—" : `${agreePct}%`, cls: "" },
+    { label: "Real", val: (s.real_ ?? 0).toLocaleString(), cls: "v-real" },
+    { label: "False Positive", val: (s.fp ?? 0).toLocaleString(), cls: "v-false_positive" },
+    { label: "Uncertain", val: (s.unc ?? 0).toLocaleString(), cls: "v-uncertain" },
+    {
+      label: "Agreement",
+      val: agreePct === null ? "—" : `${agreePct}%`,
+      cls: "",
+      sub: s.reviewed ? `${(s.reviewed ?? 0).toLocaleString()} reviewed` : null
+    },
   ];
   document.getElementById("stats").innerHTML = cards.map(c => `
     <div class="card p-3 rounded">
-      <div class="text-xs text-gray-400 uppercase tracking-wide">${c.label}</div>
-      <div class="text-2xl font-bold ${c.cls}">${c.val}</div>
+      <div class="text-xs text-gray-500 uppercase tracking-wider font-semibold">${c.label}</div>
+      <div class="text-2xl font-bold mono ${c.cls} mt-1">${c.val}</div>
+      ${c.sub ? `<div class="text-xs text-gray-600 mt-0.5">${c.sub}</div>` : ''}
     </div>
   `).join("");
 }
 
 function renderVerdicts(list) {
+  currentVerdicts = list;
+  if (focusedIndex >= list.length) focusedIndex = Math.max(0, list.length - 1);
+
   if (!list.length) {
-    document.getElementById("verdicts").innerHTML = `<div class="card p-6 rounded text-center text-gray-500">No verdicts match the current filter.</div>`;
+    document.getElementById("verdicts").innerHTML = `
+      <div class="card p-8 rounded text-center">
+        <div class="text-gray-500 text-sm">Nothing matches the current filter.</div>
+        <div class="text-gray-600 text-xs mt-2">If "LLM only" is selected, this means your prefilter is doing its job — no recent alerts needed model classification.</div>
+      </div>`;
     return;
   }
-  document.getElementById("verdicts").innerHTML = list.map(v => {
+
+  document.getElementById("verdicts").innerHTML = list.map((v, i) => {
     const conf = (v.confidence * 100).toFixed(0);
-    const reviewed = v.human_verdict ? `<span class="text-xs ${v.agreed ? 'text-green-400' : 'text-red-400'}">Reviewed: ${v.human_verdict} (${v.agreed ? 'agreed' : 'disagreed'})</span>` : '';
+    const isPrefilter = v.model_used === "prefilter";
+    const sourceBadge = isPrefilter
+      ? `<span class="badge badge-prefilter">prefilter</span>`
+      : `<span class="badge badge-llm mono">${escapeHtml(v.model_used ?? 'llm')}</span>`;
+
+    const reviewed = v.human_verdict
+      ? `<div class="text-xs mt-2 ${v.agreed ? 'text-green-400' : 'text-red-400'}">
+           Reviewed: <span class="mono">${v.human_verdict}</span>
+           <span class="text-gray-500">(${v.agreed ? 'agreed' : 'disagreed'})</span>
+         </div>`
+      : '';
+
     const fbBtns = (mode === "demo" || v.human_verdict) ? '' : `
-      <div class="flex gap-2 mt-2">
-        <button onclick="feedback(${v.id}, '${v.verdict}')" class="text-xs px-2 py-1 rounded bg-green-900/30 text-green-300 hover:bg-green-900/50">✓ Agree</button>
-        <button onclick="feedbackOther(${v.id})" class="text-xs px-2 py-1 rounded bg-red-900/30 text-red-300 hover:bg-red-900/50">✗ Disagree</button>
+      <div class="flex gap-2 mt-3">
+        <button onclick="event.stopPropagation(); feedback(${v.id}, '${v.verdict}')" class="btn-agree text-xs px-3 py-1.5 rounded font-medium">
+          ✓ Agree
+        </button>
+        <button onclick="event.stopPropagation(); feedbackOther(${v.id})" class="btn-disagree text-xs px-3 py-1.5 rounded font-medium">
+          Mark different
+        </button>
       </div>`;
+
+    const ts = v.processed_at
+      ? new Date(v.processed_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      : '';
+
     return `
-    <div class="card p-4 rounded">
-      <div class="flex items-start justify-between gap-3">
+    <div class="card card-hover rounded p-4 ${i === focusedIndex ? 'focused' : ''}" data-idx="${i}" onclick="focusAlert(${i})">
+      <div class="flex items-start gap-3">
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-2 flex-wrap">
-            <span class="badge badge-${v.verdict}">${v.verdict.replace('_',' ')}</span>
-            <span class="text-xs text-gray-500">${conf}% conf</span>
-            <span class="text-xs text-gray-500">SID ${v.signature_id ?? '?'}</span>
-            <span class="text-xs text-gray-600">${v.processed_at?.slice(0, 19).replace('T', ' ') ?? ''}</span>
+            <span class="badge badge-${v.verdict}">${v.verdict.replace('_', ' ')}</span>
+            ${sourceBadge}
+            <span class="text-xs text-gray-500 mono">${conf}%</span>
+            <span class="text-xs text-gray-500 mono">SID ${v.signature_id ?? '?'}</span>
+            <span class="text-xs text-gray-600 mono ml-auto">${ts}</span>
           </div>
-          <div class="font-semibold mt-1">${escapeHtml(v.signature ?? '?')}</div>
-          <div class="text-xs text-gray-500 mt-1">
-            ${v.src_ip ?? '?'}:${v.src_port ?? '?'} → ${v.dest_ip ?? '?'}:${v.dest_port ?? '?'} (${v.proto ?? '?'})
+          <div class="font-semibold text-gray-200 mt-2 leading-snug">${escapeHtml(v.signature ?? '?')}</div>
+          <div class="text-xs text-gray-500 mt-1.5 mono">
+            ${v.src_ip ?? '?'}:${v.src_port ?? '?'} → ${v.dest_ip ?? '?'}:${v.dest_port ?? '?'}
+            <span class="text-gray-600">${v.proto ?? ''}</span>
           </div>
-          <div class="reasoning mt-2">${escapeHtml(v.reasoning ?? '')}</div>
+          <div class="reasoning mt-2.5">${escapeHtml(v.reasoning ?? '')}</div>
           ${reviewed}
           ${fbBtns}
         </div>
       </div>
     </div>`;
   }).join("");
+}
+
+function focusAlert(idx) {
+  focusedIndex = idx;
+  document.querySelectorAll('[data-idx]').forEach(el => {
+    el.classList.toggle('focused', parseInt(el.dataset.idx) === idx);
+  });
 }
 
 async function feedback(id, agentVerdict, customVerdict = null) {
@@ -144,176 +303,63 @@ function feedbackOther(id) {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// Filter buttons
 document.querySelectorAll(".filter-btn").forEach(b =>
-  b.addEventListener("click", () => { currentFilter.verdict = b.dataset.verdict; load(); })
+  b.addEventListener("click", () => {
+    currentFilter.verdict = b.dataset.verdict;
+    setActive(".filter-btn", "verdict", b.dataset.verdict);
+    load();
+  })
 );
+
 document.querySelectorAll(".model-btn").forEach(b =>
-  b.addEventListener("click", () => { currentFilter.model = b.dataset.model; load(); })
+  b.addEventListener("click", () => {
+    currentFilter.model = b.dataset.model;
+    setActive(".model-btn", "model", b.dataset.model);
+    load();
+  })
 );
+
 document.getElementById("sigFilter").addEventListener("input", e => {
   currentFilter.signature = e.target.value;
   clearTimeout(window._t);
   window._t = setTimeout(load, 300);
 });
 
-load();
-setInterval(load, 5000);
-</script>
-</body>
-</html><!DOCTYPE html>
-<html lang="en" class="dark">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Triage Dashboard</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>
-  body { background: #0b0f17; color: #e5e7eb; font-family: ui-sans-serif, system-ui, sans-serif; }
-  .card { background: #131a26; border: 1px solid #1f2937; }
-  .v-real { color: #f87171; }
-  .v-false_positive { color: #6ee7b7; }
-  .v-uncertain { color: #fbbf24; }
-  .badge { padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
-  .badge-real { background: rgba(248,113,113,.15); color: #f87171; }
-  .badge-false_positive { background: rgba(110,231,183,.15); color: #6ee7b7; }
-  .badge-uncertain { background: rgba(251,191,36,.15); color: #fbbf24; }
-  .reasoning { font-size: 0.85rem; color: #9ca3af; line-height: 1.5; }
-  .demo-banner { background: #7c2d12; color: #fff; }
-</style>
-</head>
-<body class="min-h-screen">
-<div id="app" class="max-w-6xl mx-auto p-6">
+// Set initial active states
+setActive(".filter-btn", "verdict", currentFilter.verdict);
+setActive(".model-btn", "model", currentFilter.model);
 
-  <div id="demoBanner" class="demo-banner hidden p-3 rounded mb-4 text-sm">
-    Demo mode — internal IPs masked, feedback disabled. Source: <a class="underline" href="https://github.com/Aphifer07/triagewall" target="_blank">github.com/Aphifer07/triagewall</a>
-  </div>
+// Keyboard shortcuts
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
 
-  <header class="mb-6">
-    <h1 class="text-3xl font-bold">Triage Agent</h1>
-    <p class="text-gray-400 text-sm">Local LLM-powered Suricata alert triage. Built on AXON.</p>
-  </header>
-
-  <div id="stats" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"></div>
-
-  <div class="flex flex-wrap gap-2 mb-4 items-center">
-    <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="">All</button>
-    <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="real">Real</button>
-    <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="false_positive">False Positive</button>
-    <button class="filter-btn card px-3 py-1.5 rounded text-sm" data-verdict="uncertain">Uncertain</button>
-    <input id="sigFilter" class="card px-3 py-1.5 rounded text-sm flex-1 min-w-[200px]" placeholder="Filter by signature...">
-    <span class="text-xs text-gray-500" id="lastUpdate"></span>
-  </div>
-
-  <div id="verdicts" class="space-y-3"></div>
-</div>
-
-<script>
-const API = "";
-let currentFilter = { verdict: "", signature: "" };
-let mode = "local";
-
-async function load() {
-  const params = new URLSearchParams();
-  if (currentFilter.verdict) params.set("verdict", currentFilter.verdict);
-  if (currentFilter.signature) params.set("signature", currentFilter.signature);
-  const res = await fetch(`${API}/api/verdicts?${params}`);
-  const data = await res.json();
-  mode = data.mode;
-  if (mode === "demo") document.getElementById("demoBanner").classList.remove("hidden");
-  renderStats(data.stats);
-  renderVerdicts(data.verdicts);
-  document.getElementById("lastUpdate").textContent = `Updated ${new Date().toLocaleTimeString()}`;
-}
-
-function renderStats(s) {
-  const reviewPct = s.reviewed && s.total ? Math.round((s.reviewed / s.total) * 100) : 0;
-  const agreePct = s.reviewed ? Math.round((s.agreed / s.reviewed) * 100) : null;
-  const cards = [
-    { label: "Total", val: s.total ?? 0, cls: "" },
-    { label: "Real", val: s.real_ ?? 0, cls: "v-real" },
-    { label: "False Positive", val: s.fp ?? 0, cls: "v-false_positive" },
-    { label: "Uncertain", val: s.unc ?? 0, cls: "v-uncertain" },
-    { label: "Agreement", val: agreePct === null ? "—" : `${agreePct}%`, cls: "" },
-  ];
-  document.getElementById("stats").innerHTML = cards.map(c => `
-    <div class="card p-3 rounded">
-      <div class="text-xs text-gray-400 uppercase tracking-wide">${c.label}</div>
-      <div class="text-2xl font-bold ${c.cls}">${c.val}</div>
-    </div>
-  `).join("");
-}
-
-function renderVerdicts(list) {
-  if (!list.length) {
-    document.getElementById("verdicts").innerHTML = `<div class="card p-6 rounded text-center text-gray-500">No verdicts match the current filter.</div>`;
-    return;
+  const key = e.key.toLowerCase();
+  if (key === "j") {
+    if (focusedIndex < currentVerdicts.length - 1) focusAlert(focusedIndex + 1);
+    document.querySelector(`[data-idx="${focusedIndex}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    e.preventDefault();
+  } else if (key === "k") {
+    if (focusedIndex > 0) focusAlert(focusedIndex - 1);
+    document.querySelector(`[data-idx="${focusedIndex}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    e.preventDefault();
+  } else if (key === "a") {
+    const v = currentVerdicts[focusedIndex];
+    if (v && !v.human_verdict && mode !== "demo") feedback(v.id, v.verdict);
+    e.preventDefault();
+  } else if (key === "d") {
+    const v = currentVerdicts[focusedIndex];
+    if (v && !v.human_verdict && mode !== "demo") feedbackOther(v.id);
+    e.preventDefault();
+  } else if (key === "u") {
+    const v = currentVerdicts[focusedIndex];
+    if (v && !v.human_verdict && mode !== "demo") feedback(v.id, null, "uncertain");
+    e.preventDefault();
   }
-  document.getElementById("verdicts").innerHTML = list.map(v => {
-    const conf = (v.confidence * 100).toFixed(0);
-    const reviewed = v.human_verdict ? `<span class="text-xs ${v.agreed ? 'text-green-400' : 'text-red-400'}">Reviewed: ${v.human_verdict} (${v.agreed ? 'agreed' : 'disagreed'})</span>` : '';
-    const fbBtns = (mode === "demo" || v.human_verdict) ? '' : `
-      <div class="flex gap-2 mt-2">
-        <button onclick="feedback(${v.id}, '${v.verdict}')" class="text-xs px-2 py-1 rounded bg-green-900/30 text-green-300 hover:bg-green-900/50">✓ Agree</button>
-        <button onclick="feedbackOther(${v.id})" class="text-xs px-2 py-1 rounded bg-red-900/30 text-red-300 hover:bg-red-900/50">✗ Disagree</button>
-      </div>`;
-    return `
-    <div class="card p-4 rounded">
-      <div class="flex items-start justify-between gap-3">
-        <div class="flex-1 min-w-0">
-          <div class="flex items-center gap-2 flex-wrap">
-            <span class="badge badge-${v.verdict}">${v.verdict.replace('_',' ')}</span>
-            <span class="text-xs text-gray-500">${conf}% conf</span>
-            <span class="text-xs text-gray-500">SID ${v.signature_id ?? '?'}</span>
-            <span class="text-xs text-gray-600">${v.processed_at?.slice(0, 19).replace('T', ' ') ?? ''}</span>
-          </div>
-          <div class="font-semibold mt-1">${escapeHtml(v.signature ?? '?')}</div>
-          <div class="text-xs text-gray-500 mt-1">
-            ${v.src_ip ?? '?'}:${v.src_port ?? '?'} → ${v.dest_ip ?? '?'}:${v.dest_port ?? '?'} (${v.proto ?? '?'})
-          </div>
-          <div class="reasoning mt-2">${escapeHtml(v.reasoning ?? '')}</div>
-          ${reviewed}
-          ${fbBtns}
-        </div>
-      </div>
-    </div>`;
-  }).join("");
-}
-
-async function feedback(id, agentVerdict, customVerdict = null) {
-  const human_verdict = customVerdict || agentVerdict;
-  const res = await fetch(`${API}/api/feedback/${id}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ human_verdict }),
-  });
-  if (res.ok) load();
-}
-
-function feedbackOther(id) {
-  const choice = prompt("What's the correct verdict? (real / false_positive / uncertain)");
-  if (!choice) return;
-  const norm = choice.trim().toLowerCase();
-  if (!["real", "false_positive", "uncertain"].includes(norm)) {
-    alert("Invalid verdict");
-    return;
-  }
-  feedback(id, null, norm);
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-document.querySelectorAll(".filter-btn").forEach(b =>
-  b.addEventListener("click", () => { currentFilter.verdict = b.dataset.verdict; load(); })
-);
-document.getElementById("sigFilter").addEventListener("input", e => {
-  currentFilter.signature = e.target.value;
-  clearTimeout(window._t);
-  window._t = setTimeout(load, 300);
 });
 
 load();

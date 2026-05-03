@@ -92,7 +92,12 @@ def list_verdicts(verdict: str = None, signature: str = None, model: str = None,
                 SUM(verdict = 'uncertain') AS unc,
                 SUM(human_verdict IS NOT NULL) AS reviewed,
                 SUM(agreed = 1) AS agreed,
-                SUM(agreed = 0) AS disagreed
+                SUM(agreed = 0) AS disagreed,
+                SUM(model_used = 'prefilter') AS prefilter_count,
+                SUM(model_used != 'prefilter') AS llm_count,
+                SUM(processed_at >= datetime('now', '-24 hours')) AS today_total,
+                SUM(model_used = 'prefilter' AND processed_at >= datetime('now', '-24 hours')) AS today_prefilter,
+                SUM(model_used != 'prefilter' AND processed_at >= datetime('now', '-24 hours')) AS today_llm
                 FROM triage_events"""
         ).fetchone()
 
