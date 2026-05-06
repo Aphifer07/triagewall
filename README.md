@@ -38,8 +38,20 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 git clone https://github.com/Aphifer07/triagewall.git
 cd triagewall
 cp .env.example .env
-# edit .env: set OLLAMA_HOST and EVE_PATH
-docker compose up -d
+
+# Try it without real data first:
+# Set DEMO_MODE=true in .env, then:
+docker compose up -d        # Docker Compose v2+
+# OR
+docker-compose up -d        # Older Docker / Compose v1
+
+# Open http://localhost:8084 to see the dashboard with sample alerts.
+
+# For production: edit .env to set:
+#   - DEMO_MODE=false
+#   - HOST_EVE_PATH=/path/to/your/eve.json on the host
+#   - OLLAMA_HOST=http://your-ollama-instance:11434
+# Then `docker compose up -d` again.
 ```
 
 ## Performance & accuracy

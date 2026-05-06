@@ -223,6 +223,14 @@ def demo_loop():
 
 def tail_file():
     """Main loop: poll the file, process new lines."""
+    if EVE_PATH.is_dir():
+        log.error(f"{EVE_PATH} is a directory, not a file.")
+        log.error("Either:")
+        log.error("  1. Set DEMO_MODE=true in .env to test without real Suricata data")
+        log.error("  2. Set HOST_EVE_PATH in .env to your actual eve.json file path")
+        log.error("  3. Make sure the file exists on the host before starting the container")
+        sys.exit(1)
+
     ensure_db_initialized()
 
     log.info(f"Starting ingest daemon")

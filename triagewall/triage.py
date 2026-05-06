@@ -58,7 +58,7 @@ Verdict guidance:
 
 Be honest about uncertainty. Do not default to false_positive when you lack context."""
 
-PREFILTER_CONFIG_PATH = Path(__file__).parent.parent / "config" / "prefilter.json"
+PREFILTER_CONFIG_PATH = Path(__file__).parent / "config" / "prefilter.json"
 
 def load_prefilter():
     """Load the prefilter config. Returns dict mapping signature_id -> reason string."""

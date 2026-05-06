@@ -216,6 +216,7 @@ def health():
 # --- Static files ------------------------------------------------------------
 
 @app.get("/")
+@app.head("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
 
