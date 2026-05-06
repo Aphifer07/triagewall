@@ -26,8 +26,16 @@ app = FastAPI(title="Triage Dashboard")
 
 # --- Helpers -----------------------------------------------------------------
 
-def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+def db(readonly: bool = False):
+    """
+    Return a SQLite connection.
+    - readonly=True → open in read-only mode for polling endpoints
+    - readonly=False → standard read-write connection (used for feedback)
+    """
+    if readonly:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30.0)
+    else:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -72,7 +80,9 @@ def list_verdicts(verdict: str = None, signature: str = None, model: str = None,
         where.append("model_used = 'prefilter'")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    with db() as conn:
+    # Use a read-only connection for the high-frequency polling endpoint to reduce
+    # lock contention with the ingest daemon.
+    with db(readonly=True) as conn:
         rows = conn.execute(
             f"""SELECT id, timestamp, src_ip, src_port, dest_ip, dest_port, proto,
                        signature_id, signature, category, severity,
@@ -138,7 +148,35 @@ def submit_feedback(event_id: int, payload: dict = Body(...)):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "mode": MODE, "db_exists": DB_PATH.exists()}
+    last_processed_at = None
+    with db(readonly=True) as conn:
+        try:
+            row = conn.execute(
+                "SELECT MAX(processed_at) AS last_processed_at FROM triage_events"
+            ).fetchone()
+            if row:
+                last_processed_at = row["last_processed_at"]
+        except sqlite3.OperationalError:
+            # If schema/table doesn't exist yet, treat as stale.
+            last_processed_at = None
+
+    now = datetime.now(timezone.utc)
+    age_seconds = 10**9
+    if last_processed_at:
+        try:
+            dt = datetime.fromisoformat(str(last_processed_at))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_seconds = int((now - dt).total_seconds())
+        except Exception:
+            age_seconds = 10**9
+
+    payload = {"last_alert_age_seconds": max(0, age_seconds)}
+    if age_seconds > 600:
+        payload["status"] = "stale"
+        return JSONResponse(payload, status_code=503)
+    payload["status"] = "ok"
+    return payload
 
 
 # --- Static files ------------------------------------------------------------

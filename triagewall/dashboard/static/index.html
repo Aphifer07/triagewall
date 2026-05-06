@@ -91,6 +91,11 @@
     <div class="freshness" id="freshness">Live · Updated never</div>
   </header>
 
+  <div id="staleBanner" class="hidden mb-6 rounded-lg border border-yellow-700/40 bg-yellow-900/30 text-yellow-100 px-4 py-3 text-sm">
+    <span class="font-semibold">⚠️ Ingestion stalled.</span>
+    <span id="staleBannerText">Last alert seen — minutes ago.</span>
+  </div>
+
   <!-- Hero stat: 24h prefilter ratio -->
   <div class="card rounded-lg p-6 mb-6">
     <div class="flex items-end justify-between flex-wrap gap-4">
@@ -165,6 +170,27 @@ async function load() {
   if (currentFilter.verdict) params.set("verdict", currentFilter.verdict);
   if (currentFilter.signature) params.set("signature", currentFilter.signature);
   if (currentFilter.model) params.set("model", currentFilter.model);
+
+  // Check ingestion freshness
+  try {
+    const healthRes = await fetch(`${API}/api/health`);
+    const health = await healthRes.json();
+    const banner = document.getElementById("staleBanner");
+    const bannerText = document.getElementById("staleBannerText");
+    const age = Number(health.last_alert_age_seconds ?? NaN);
+    const isStale = !healthRes.ok || health.status === "stale";
+    if (isStale) {
+      const mins = isFinite(age) ? Math.max(0, age) / 60.0 : NaN;
+      const minsText = isFinite(mins) ? mins.toFixed(1) : "—";
+      bannerText.textContent = `Last alert seen ${minsText} minutes ago.`;
+      banner.classList.remove("hidden");
+    } else {
+      banner.classList.add("hidden");
+    }
+  } catch (e) {
+    // If health can't be fetched, don't block the main UI.
+  }
+
   const res = await fetch(`${API}/api/verdicts?${params}`);
   const data = await res.json();
   mode = data.mode;

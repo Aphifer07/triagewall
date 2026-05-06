@@ -1,0 +1,5 @@
+{"timestamp": "2026-05-05T12:00:00.000000+0000", "event_type": "alert", "src_ip": "10.0.0.50", "dest_ip": "8.8.8.8", "alert": {"signature_id": 2000000, "signature": "Test Alert Env Fix", "category": "Misc"}, "flow_id": 12346}
+{"timestamp": "2026-05-05T14:55:00.000000+0000", "event_type": "alert", "src_ip": "10.0.0.50", "dest_ip": "8.8.8.8", "alert": {"signature_id": 2000000, "signature": "Brand New Alert", "category": "Misc"}, "flow_id": 99999}
+{"timestamp": "2026-05-05T14:55:00.000000+0000", "event_type": "alert", "src_ip": "10.0.0.50", "dest_ip": "8.8.8.8", "alert": {"signature_id": 2000000, "signature": "Brand New Alert", "category": "Misc"}, "flow_id": 99999}
+{"timestamp": "2026-05-05T12:00:00.000000+0000", "event_type": "alert", "src_ip": "10.0.0.50", "dest_ip": "8.8.8.8", "alert": {"signature_id": 2000000, "signature": "Test Alert Env Fix", "category": "Misc"}, "flow_id": 12346}
+{"timestamp": "2026-05-05T13:30:00.000000+0000", "event_type": "alert", "src_ip": "10.0.0.50", "dest_ip": "8.8.8.8", "alert": {"signature_id": 2000000, "signature": "Heartbeat Clear Test", "category": "Misc"}, "flow_id": 88888}

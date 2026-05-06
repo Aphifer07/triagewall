@@ -23,7 +23,11 @@ import urllib.error
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_URL = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
 MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
-DB_PATH = Path(__file__).parent.parent / "triage.db"
+DB_PATH = Path(
+    os.getenv("TRIAGE_DB")
+    or os.getenv("DB_PATH")
+    or str(Path(__file__).parent.parent / "triage.db")
+)
 REQUEST_TIMEOUT = 120  # seconds
 
 SYSTEM_PROMPT = """You are a SOC analyst classifying Suricata IDS alerts.

@@ -17,16 +17,23 @@ import json
 import sqlite3
 import signal
 import logging
+import random
 from pathlib import Path
 from datetime import datetime, timezone
 
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
-from triage import call_ollama, insert_triage_row, MODEL, DB_PATH
+from triage import call_ollama, insert_triage_row, MODEL
 
 # --- Config ---
+DEMO_MODE = os.getenv("DEMO_MODE", "false").strip().lower() == "true"
 EVE_PATH = Path(os.getenv("EVE_PATH", "/var/log/suricata-opnsense/eve.json"))
 POSITION_PATH = Path(os.getenv("POSITION_PATH", "/var/lib/triagewall/position.json"))
+DB_PATH = Path(
+    os.getenv("TRIAGE_DB")
+    or os.getenv("DB_PATH")
+    or str(Path(__file__).parent.parent / "triage.db")
+)
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))  # seconds
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
@@ -45,6 +52,22 @@ def _handle_signal(signum, frame):
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
+
+
+def ensure_db_initialized():
+    if DB_PATH.exists():
+        return
+
+    os.makedirs(DB_PATH.parent, exist_ok=True)
+    schema_path = Path(__file__).parent / "schema.sql"
+    schema_sql = schema_path.read_text()
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    try:
+        conn.executescript(schema_sql)
+        conn.commit()
+    finally:
+        conn.close()
+    log.info("Initialized new database from schema.sql")
 
 
 def load_position():
@@ -78,6 +101,33 @@ def is_duplicate(conn, alert):
     return row is not None
 
 
+def insert_with_retry(conn, event, verdict, max_retries=3, base_backoff_ms=100):
+    """
+    Insert a triage row with simple exponential backoff on SQLite 'database is locked' errors.
+    Returns True on success, False if we give up after max_retries.
+    """
+    for attempt in range(max_retries):
+        try:
+            insert_triage_row(conn, event, verdict)
+            conn.commit()
+            return True
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                if attempt < max_retries - 1:
+                    sleep_time = (base_backoff_ms * (2**attempt)) / 1000.0
+                    logging.warning(
+                        f"Database locked, retrying in {sleep_time}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(sleep_time)
+                else:
+                    logging.error(
+                        f"Failed to insert alert after {max_retries} attempts. Dropping event: {event.get('flow_id')}"
+                    )
+                    return False
+            else:
+                raise
+
+
 def process_line(conn, line):
     """Parse one line, triage if it's an alert, return True if we did work."""
     line = line.strip()
@@ -98,7 +148,8 @@ def process_line(conn, line):
     sig = event.get("alert", {}).get("signature", "?")
     try:
         verdict = call_ollama(event)
-        insert_triage_row(conn, event, verdict)
+        if not insert_with_retry(conn, event, verdict):
+            return False
         log.info(
             f"[{verdict['verdict']:>15}] {verdict['confidence']:.2f}  {sig[:80]}"
         )
@@ -108,11 +159,42 @@ def process_line(conn, line):
         return False
 
 
+def demo_loop():
+    fixtures_path = Path(__file__).parent.parent / "tests" / "fixtures" / "diverse_alerts.json"
+    if not fixtures_path.exists():
+        log.error(f"Demo fixtures not found at {fixtures_path}")
+        sys.exit(1)
+
+    try:
+        with open(fixtures_path, "r") as f:
+            demo_lines = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        log.error(f"Failed to load demo fixtures: {type(e).__name__}: {e}")
+        sys.exit(1)
+
+    if not demo_lines:
+        log.error("Demo fixtures file is empty (expected JSON-Lines).")
+        sys.exit(1)
+
+    ensure_db_initialized()
+
+    log.info(f"Demo fixtures loaded: {len(demo_lines)} alerts")
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+
+    try:
+        while not _stop:
+            for line in demo_lines:
+                if _stop:
+                    break
+                process_line(conn, line)
+                time.sleep(random.uniform(2, 8))
+    finally:
+        conn.close()
+
+
 def tail_file():
     """Main loop: poll the file, process new lines."""
-    if not DB_PATH.exists():
-        log.error(f"Database not found at {DB_PATH}")
-        sys.exit(1)
+    ensure_db_initialized()
 
     log.info(f"Starting ingest daemon")
     log.info(f"  eve.json: {EVE_PATH}")
@@ -122,9 +204,21 @@ def tail_file():
 
     state = load_position()
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    last_line_seen_ts = time.time()
+    last_stall_warning_ts = 0.0
 
     while not _stop:
         try:
+            # Warn if we haven't seen new eve.json lines recently (rate-limited).
+            now = time.time()
+            gap = now - last_line_seen_ts
+            if gap > 300 and (now - last_stall_warning_ts) > 300:
+                mins = gap / 60.0
+                log.warning(
+                    f"Ingestion stalled. No new lines seen in eve.json for {mins:.1f} minutes."
+                )
+                last_stall_warning_ts = now
+
             if not EVE_PATH.exists():
                 log.warning(f"{EVE_PATH} doesn't exist yet, waiting...")
                 time.sleep(POLL_INTERVAL)
@@ -158,6 +252,7 @@ def tail_file():
                     line = f.readline()
                     if not line:
                         break
+                    last_line_seen_ts = time.time()
                     new_lines += 1
                     if process_line(conn, line):
                         processed += 1
@@ -177,4 +272,8 @@ def tail_file():
 
 
 if __name__ == "__main__":
-    tail_file()
+    if DEMO_MODE:
+        log.info("Running in DEMO MODE using local fixtures...")
+        demo_loop()
+    else:
+        tail_file()
