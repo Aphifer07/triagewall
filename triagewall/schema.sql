@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS triage_events (
     reviewed_at TEXT
 );
 
-CREATE INDEX idx_triage_timestamp ON triage_events(timestamp);
-CREATE INDEX idx_triage_signature_id ON triage_events(signature_id);
-CREATE INDEX idx_triage_verdict ON triage_events(verdict);
-CREATE INDEX idx_triage_processed ON triage_events(processed_at);
+CREATE INDEX IF NOT EXISTS idx_triage_dup_check ON triage_events(flow_id, signature_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_model_processed_at ON triage_events(model_used, processed_at);
+
+CREATE INDEX IF NOT EXISTS idx_triage_timestamp ON triage_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_triage_signature_id ON triage_events(signature_id);
+CREATE INDEX IF NOT EXISTS idx_triage_verdict ON triage_events(verdict);
+CREATE INDEX IF NOT EXISTS idx_triage_processed ON triage_events(processed_at);

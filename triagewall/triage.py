@@ -29,11 +29,12 @@ DB_PATH = Path(
     or str(Path(__file__).parent.parent / "triage.db")
 )
 REQUEST_TIMEOUT = 120  # seconds
+INTERNAL_SUBNETS = os.environ.get("INTERNAL_SUBNETS", "10.0.0.0/24 and 192.168.1.0/24")
 
-SYSTEM_PROMPT = """You are a SOC analyst classifying Suricata IDS alerts.
+SYSTEM_PROMPT = f"""You are a SOC analyst classifying Suricata IDS alerts.
 
 Network facts:
-- Internal subnets: 10.0.0.0/24 and 192.168.1.0/24
+- Internal subnets: {INTERNAL_SUBNETS}
 - Multicast addresses (224.0.0.0/4) are not endpoints
 
 Your job: examine each alert and decide if it warrants investigation.
@@ -44,11 +45,11 @@ For each alert, analyze:
 3. Whether the traffic pattern matches the rule's intent or is incidental
 
 Output strict JSON with this exact structure (no other text):
-   {
+   {{
      "verdict": "real" | "false_positive" | "uncertain",
      "confidence": 0.0-1.0,
      "reasoning": "1-2 sentences. State what specific elements suggest real and what suggest benign before giving the verdict."
-   }
+   }}
 
 Verdict guidance:
 - "real" = something an analyst should actually look at

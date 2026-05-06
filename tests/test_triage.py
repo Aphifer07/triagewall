@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Reuse the existing triage module
-from triage import call_ollama, insert_triage_row, MODEL, DB_PATH
+from triagewall.triage import call_ollama, insert_triage_row, MODEL, DB_PATH
 
 LIMIT = 20
 
@@ -65,6 +65,6 @@ def main(fixture_path: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python3 src/triage_test.py <fixtures_file>", file=sys.stderr)
+        print("Usage: python3 tests/test_triage.py tests/fixtures/diverse_alerts.json", file=sys.stderr)
         sys.exit(1)
     main(sys.argv[1])

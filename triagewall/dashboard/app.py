@@ -48,6 +48,7 @@ def _load_dotenv(override: bool = False) -> None:
 _load_dotenv(override=False)
 
 MODE = os.environ.get("MODE", "local").lower()
+STALE_THRESHOLD_SECONDS = int(os.environ.get("STALE_THRESHOLD_SECONDS", "600"))
 DB_PATH = Path(
     os.environ.get("DB_PATH")
     or os.environ.get("TRIAGE_DB")
@@ -205,7 +206,7 @@ def health():
             age_seconds = 10**9
 
     payload = {"last_alert_age_seconds": max(0, age_seconds)}
-    if age_seconds > 600:
+    if age_seconds > STALE_THRESHOLD_SECONDS:
         payload["status"] = "stale"
         return JSONResponse(payload, status_code=503)
     payload["status"] = "ok"
