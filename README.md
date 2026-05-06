@@ -2,9 +2,9 @@
 
 > ⚠️ **Pre-release.** Triagewall is actively building toward v0.1. Not yet ready for general use. **Star the repo to be notified when v0.1 ships.** First public release expected mid-2026.
 
-**Local-LLM alert triage for self-hosted SOCs.** Point it at your Suricata `eve.json` and Wazuh API, stop drowning in alerts. Runs entirely on your hardware. No telemetry. No cloud. AGPL-3.0.
+**Local-LLM alert triage for self-hosted SOCs.** Point it at your Suricata `eve.json`, stop drowning in alerts. Runs entirely on your hardware. No telemetry. No cloud. AGPL-3.0.
 
-> **TL;DR** — `docker compose up`, point it at your alert sources, give feedback on the first 50 alerts, and Triagewall starts pre-filtering the noise. Designed for homelabs and small SOCs running Wazuh + Suricata on OPNsense, pfSense, or any sensor that writes Suricata-format `eve.json`.
+> **TL;DR** — `docker compose up`, point it at your alert sources, and Triagewall pre-filters known noise out of the box. The remaining alerts get classified by a local LLM, with a dashboard showing what to investigate. Designed for homelabs and small SOCs running Suricata on OPNsense, pfSense, or any sensor that writes Suricata-format `eve.json`.
 
 ---
 
@@ -17,12 +17,25 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 ## What it does
 
 - **Reads Suricata `eve.json`** in real time
-- **Reads Wazuh alerts** via the Wazuh API (optional)
 - **Triages each alert** with a local LLM (Ollama, default model: `gemma4:e4b`)
 - **Pre-filters known-benign rules** with a curated SID allowlist (the "I already know what STUN traffic is, stop telling me" filter)
-- **Learns from your verdicts** — mark an alert as a false positive once, similar alerts get pre-filtered automatically
+- **Tracks model agreement** — every verdict can be reviewed, building a labeled dataset and measurable agreement rate (currently 99%)
 - **Surfaces what matters** in a clean web dashboard
-- **Sends a daily digest** to Discord, Slack, ntfy, or email (planned)
+
+## Performance & accuracy
+
+Measured on a homelab running OPNsense → Suricata (ET Open ruleset, alert-only) → Triagewall.
+
+| Metric | Value |
+|---|---|
+| Alerts ingested per day | ~67,000 (WAN monitoring) — ~180,000 (LAN monitoring) |
+| Pre-filtered (zero LLM cost) | 92% (WAN) — 98%+ (LAN) |
+| LLM-classified | 8% (WAN) — under 2% (LAN) |
+| Average LLM latency per alert | 2–10 seconds |
+| Hardware (reference deployment) | RTX 4060 (8GB VRAM), Ollama, gemma4:e4b |
+| Daemon RAM footprint (excluding Ollama) | ~13 MB |
+
+These are real numbers from the development environment. Yours will vary based on your network, your Suricata ruleset, and your prefilter tuning.
 
 ## What it does not do
 
@@ -54,43 +67,21 @@ docker-compose up -d        # Older Docker / Compose v1
 # Then `docker compose up -d` again.
 ```
 
-## Performance & accuracy
-
-Measured on a homelab running OPNsense → Suricata (ET Open ruleset, alert-only) → Triagewall.
-
-| Metric | Value |
-|---|---|
-| Alerts ingested per day | ~62,000–80,000 |
-| Pre-filtered (zero LLM cost) | ~90% |
-| LLM-classified | ~10% |
-| Average LLM latency per alert | ~2–10 seconds |
-| Daemon RAM footprint (excluding Ollama) | ~13 MB |
-
-These are real numbers from the development environment. Yours will vary based on your network, your Suricata ruleset, and your prefilter tuning.
-
 ## Roadmap
 
 - [x] Suricata `eve.json` ingestion
-- [x] Wazuh API integration
 - [x] LLM triage with feedback loop
-- [x] Web dashboard (basic)
+- [x] Web dashboard with hourly trend chart
 - [x] Curated prefilter for known-benign signatures
-- [ ] Docker compose packaging (v0.1)
-- [ ] Demo mode with anonymized sample data (v0.1)
-- [ ] Configuration via `.env` only (no code edits) (v0.1)
-- [ ] Health endpoint with stale-data detection (v0.1)
+- [x] Docker compose packaging
+- [x] Demo mode with anonymized sample data
+- [x] Configuration via `.env` only (no code edits)
+- [x] Health endpoint with stale-data detection
 - [ ] Discord webhook digest (v0.1)
+- [ ] Wazuh API integration (v0.2)
 - [ ] Investigation agent — correlates flagged alerts across sources (v0.2)
 - [ ] Pi-hole DNS correlation (v0.2)
 - [ ] Multi-host cluster mode (Team tier)
-
-## Free vs. hosted
-
-Triagewall is **free forever for self-hosted single-node use**. AGPL-3.0.
-
-If you don't want to operate a Triagewall node yourself, **Triagewall Cloud** ($15/mo, planned for late 2026) hosts it for you — same code, runs in a region of your choice, no telemetry from the application itself. Designed for homelab folks who want the alerts without the maintenance.
-
-For teams, multi-host clustering, SSO, and shared verdict databases will be available in **Triagewall Team** ($49/mo). Single-tenant on-prem licenses for cleared environments and air-gapped networks are available — contact licensing@triagewall.io.
 
 ## Contributing
 
