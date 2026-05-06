@@ -8,4 +8,5 @@ RUN pip install --no-cache-dir -r triagewall/dashboard/requirements.txt
 
 EXPOSE 8084
 
+# Default can be overridden by docker-compose `command:` / runtime args.
 CMD ["uvicorn", "triagewall.dashboard.app:app", "--host", "0.0.0.0", "--port", "8084"]

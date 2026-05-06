@@ -3,35 +3,50 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ingest
+    command:
+      - python3
+      - triagewall/ingest.py
     environment:
-      TRIAGE_DB: /var/lib/triagewall/triage.db
-      TZ: UTC
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
-      EVE_PATH: /var/log/suricata/eve.json
-      POSITION_PATH: /var/lib/triagewall/position.json
-      # On Linux, you may need to replace host.docker.internal with your host IP (e.g. http://192.168.1.10:11434)
-      OLLAMA_HOST: http://10.0.0.170:11434
-      DEMO_MODE: "true"
+      DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
+      EVE_PATH: ${EVE_PATH:-/var/log/suricata/eve.json}
+      POSITION_PATH: ${POSITION_PATH:-/var/lib/triagewall/position.json}
+      POLL_INTERVAL: ${POLL_INTERVAL:-10}
+
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://localhost:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e4b}
+
+      DEMO_MODE: ${DEMO_MODE:-false}
     volumes:
-      - triage_data:/var/lib/triagewall
-      # Production: mount your Suricata eve.json into the container, e.g.:
-      # - /var/log/suricata/eve.json:/var/log/suricata/eve.json:ro
+      - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+      - ${HOST_EVE_PATH:-./data/eve.json}:${EVE_PATH:-/var/log/suricata/eve.json}:ro
     restart: unless-stopped
 
   dashboard:
     build:
       context: .
       dockerfile: Dockerfile.dashboard
+    command:
+      - uvicorn
+      - triagewall.dashboard.app:app
+      - --host
+      - ${DASHBOARD_HOST:-0.0.0.0}
+      - --port
+      - ${DASHBOARD_PORT:-8084}
     environment:
-      TRIAGE_DB: /var/lib/triagewall/triage.db
-      TZ: UTC
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
+      MODE: ${MODE:-local}
+      DASHBOARD_HOST: ${DASHBOARD_HOST:-0.0.0.0}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-8084}
     volumes:
-      - triage_data:/var/lib/triagewall
+      - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
     ports:
-      - "8084:8084"
+      - "${DASHBOARD_PORT:-8084}:${DASHBOARD_PORT:-8084}"
     depends_on:
       - ingest
     restart: unless-stopped
-
-volumes:
-  triage_data:

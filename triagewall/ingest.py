@@ -21,21 +21,50 @@ import random
 from pathlib import Path
 from datetime import datetime, timezone
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_dotenv(override: bool = False) -> None:
+    """Minimal `.env` loader (stdlib-only; matches docker-compose interpolation locally)."""
+    env_path = _REPO_ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if not key:
+                continue
+            if not override and key in os.environ:
+                continue
+            os.environ[key] = val
+    except OSError:
+        return
+
+
+_load_dotenv(override=False)
+
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
 from triage import call_ollama, insert_triage_row, MODEL
 
 # --- Config ---
-DEMO_MODE = os.getenv("DEMO_MODE", "false").strip().lower() == "true"
-EVE_PATH = Path(os.getenv("EVE_PATH", "/var/log/suricata-opnsense/eve.json"))
-POSITION_PATH = Path(os.getenv("POSITION_PATH", "/var/lib/triagewall/position.json"))
+DEMO_MODE = os.environ.get("DEMO_MODE", "false").strip().lower() == "true"
+EVE_PATH = Path(os.environ.get("EVE_PATH", "/var/log/suricata/eve.json"))
+POSITION_PATH = Path(os.environ.get("POSITION_PATH", "/var/lib/triagewall/position.json"))
 DB_PATH = Path(
-    os.getenv("TRIAGE_DB")
-    or os.getenv("DB_PATH")
-    or str(Path(__file__).parent.parent / "triage.db")
+    os.environ.get("DB_PATH")
+    or os.environ.get("TRIAGE_DB")
+    or str(_REPO_ROOT / "triage.db")
 )
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))  # seconds
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))  # seconds
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -207,6 +236,12 @@ def tail_file():
     last_line_seen_ts = time.time()
     last_stall_warning_ts = 0.0
 
+    def eve_disk_stat():
+        try:
+            return os.stat(EVE_PATH)
+        except FileNotFoundError:
+            return None
+
     while not _stop:
         try:
             # Warn if we haven't seen new eve.json lines recently (rate-limited).
@@ -219,22 +254,26 @@ def tail_file():
                 )
                 last_stall_warning_ts = now
 
-            if not EVE_PATH.exists():
+            disk_stat = eve_disk_stat()
+            if disk_stat is None:
                 log.warning(f"{EVE_PATH} doesn't exist yet, waiting...")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            stat = EVE_PATH.stat()
-            current_inode = stat.st_ino
-            current_size = stat.st_size
+            current_inode = disk_stat.st_ino
+            current_size = disk_stat.st_size
 
-            # Detect truncation or rotation
-            if state["inode"] is not None and current_inode != state["inode"]:
-                log.info(f"File replaced (inode changed), reopening from start")
-                state = {"offset": 0, "inode": current_inode, "size": 0}
-            elif current_size < state["offset"]:
-                log.info(f"File shrunk (size {current_size} < offset {state['offset']}), restarting from start")
-                state = {"offset": 0, "inode": current_inode, "size": 0}
+            # Detect truncation (same path inode, but file got smaller than our saved offset)
+            if current_size < state["offset"]:
+                log.info(
+                    f"File shrunk (size {current_size} < offset {state['offset']}), restarting from start"
+                )
+                state["offset"] = 0
+
+            # If we're tracking the wrong inode on disk (rare if position.json is stale), reset.
+            if state["inode"] is not None and state["inode"] != current_inode:
+                log.info("Saved inode doesn't match current eve.json inode; resetting offset")
+                state["offset"] = 0
 
             state["inode"] = current_inode
 
@@ -243,25 +282,60 @@ def tail_file():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Read new content using readline() so f.tell() works inside the loop
-            with open(EVE_PATH, "r") as f:
+            # Read new content using readline() so f.tell() works inside the loop.
+            # Track the inode of the *open file descriptor* via os.fstat() so we can detect rotation
+            # even when the path is recreated with a new inode while we're still reading the old file.
+            f = open(EVE_PATH, "r")
+            try:
+                open_inode = os.fstat(f.fileno()).st_ino
                 f.seek(state["offset"])
                 new_lines = 0
                 processed = 0
                 while not _stop:
                     line = f.readline()
                     if not line:
+                        # EOF: decide whether we're waiting for more bytes, or the file rotated.
+                        disk = eve_disk_stat()
+                        if disk is None:
+                            # Race during rotation/rename; wait briefly and retry.
+                            time.sleep(POLL_INTERVAL)
+                            continue
+
+                        if disk.st_ino != open_inode:
+                            log.info(
+                                "Detected eve.json rotation (inode changed); reopening new file from start"
+                            )
+                            state["offset"] = 0
+                            state["inode"] = disk.st_ino
+                            save_position(state)
+
+                            f.close()
+                            f = open(EVE_PATH, "r")
+                            open_inode = os.fstat(f.fileno()).st_ino
+                            f.seek(0)
+                            continue
+
+                        # Same inode, waiting for more data.
                         break
+
                     last_line_seen_ts = time.time()
                     new_lines += 1
                     if process_line(conn, line):
                         processed += 1
-                state["offset"] = f.tell()
+
+                    state["offset"] = f.tell()
+                    state["inode"] = open_inode
+                    save_position(state)
+            finally:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
             if new_lines:
-                log.info(f"Read {new_lines} new lines, triaged {processed} alerts (offset now {state['offset']})")
-
-            save_position(state)
+                log.info(
+                    f"Read {new_lines} new lines, triaged {processed} alerts (offset now {state['offset']})"
+                )
 
         except Exception as e:
             log.error(f"Loop error: {type(e).__name__}: {e}")

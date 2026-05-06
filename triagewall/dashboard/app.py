@@ -18,8 +18,41 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
-MODE = os.getenv("MODE", "local").lower()
-DB_PATH = Path(os.getenv("TRIAGE_DB", "/var/lib/triagewall/triage.db"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _load_dotenv(override: bool = False) -> None:
+    """Minimal `.env` loader (stdlib-only)."""
+    env_path = _REPO_ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if not key:
+                continue
+            if not override and key in os.environ:
+                continue
+            os.environ[key] = val
+    except OSError:
+        return
+
+
+_load_dotenv(override=False)
+
+MODE = os.environ.get("MODE", "local").lower()
+DB_PATH = Path(
+    os.environ.get("DB_PATH")
+    or os.environ.get("TRIAGE_DB")
+    or "/var/lib/triagewall/triage.db"
+)
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="Triage Dashboard")
