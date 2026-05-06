@@ -216,20 +216,20 @@ def health():
 @app.get("/api/timeline")
 def timeline():
     """
-    Return hourly buckets for the last 24 hours using the original Suricata alert timestamp.
+    Return hourly buckets for the last 24 hours.
     """
-    # Suricata timestamps often look like "...+0000" (no colon). SQLite's datetime parser prefers "+00:00".
-    ts_expr = "replace(timestamp, '+0000', '+00:00')"
+    # Bucket by processed_at so the timeline matches when Triagewall classified
+    # alerts (consistent with the hero stat), not when Suricata first detected them.
     with db(readonly=True) as conn:
         rows = conn.execute(
-            f"""
+            """
             SELECT
-                strftime('%Y-%m-%d %H:00:00', {ts_expr}) AS hour_bucket,
+                strftime('%Y-%m-%d %H:00:00', processed_at) AS hour_bucket,
                 COUNT(*) AS total_alerts,
                 COALESCE(SUM(model_used = 'prefilter'), 0) AS prefiltered_count,
                 COALESCE(SUM(verdict = 'real'), 0) AS real_count
             FROM triage_events
-            WHERE datetime({ts_expr}) >= datetime('now', '-24 hours')
+            WHERE processed_at >= datetime('now', '-24 hours')
             GROUP BY hour_bucket
             ORDER BY hour_bucket ASC
             """
