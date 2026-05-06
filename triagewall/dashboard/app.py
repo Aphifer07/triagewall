@@ -213,6 +213,47 @@ def health():
     return payload
 
 
+@app.get("/api/timeline")
+def timeline():
+    """
+    Return hourly buckets for the last 24 hours using the original Suricata alert timestamp.
+    """
+    # Suricata timestamps often look like "...+0000" (no colon). SQLite's datetime parser prefers "+00:00".
+    ts_expr = "replace(timestamp, '+0000', '+00:00')"
+    with db(readonly=True) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                strftime('%Y-%m-%d %H:00:00', {ts_expr}) AS hour_bucket,
+                COUNT(*) AS total_alerts,
+                COALESCE(SUM(model_used = 'prefilter'), 0) AS prefiltered_count,
+                COALESCE(SUM(verdict = 'real'), 0) AS real_count
+            FROM triage_events
+            WHERE datetime({ts_expr}) >= datetime('now', '-24 hours')
+            GROUP BY hour_bucket
+            ORDER BY hour_bucket ASC
+            """
+        ).fetchall()
+
+    out = []
+    for r in rows:
+        total = int(r["total_alerts"] or 0)
+        pre = int(r["prefiltered_count"] or 0)
+        real = int(r["real_count"] or 0)
+        pct = (pre / total * 100.0) if total else 0.0
+        hour = (r["hour_bucket"] or "").replace(" ", "T")
+        out.append(
+            {
+                "timestamp": hour,
+                "total_alerts": total,
+                "prefiltered_count": pre,
+                "prefilter_percentage": pct,
+                "real_count": real,
+            }
+        )
+    return out
+
+
 # --- Static files ------------------------------------------------------------
 
 @app.get("/")

@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Triagewall — Local-LLM alert triage</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -114,6 +115,20 @@
     </div>
   </div>
 
+  <!-- Trends: 24h timeline -->
+  <div class="card rounded-lg p-6 mb-6">
+    <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
+      <div>
+        <div class="text-xs text-gray-500 uppercase tracking-widest font-semibold">Trends</div>
+        <div class="text-lg font-semibold text-gray-200 mt-1">Last 24 hours</div>
+      </div>
+      <div class="text-xs text-gray-600 mono" id="timelineMeta">Loading…</div>
+    </div>
+    <div class="h-64 md:h-80">
+      <canvas id="timelineChart"></canvas>
+    </div>
+  </div>
+
   <!-- Secondary stats -->
   <div id="stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"></div>
 
@@ -156,6 +171,110 @@ let currentFilter = { verdict: "", signature: "", model: "llm" };
 let mode = "local";
 let focusedIndex = 0;
 let currentVerdicts = [];
+let timelineChart = null;
+let _timelineCache = { at: 0, data: [] };
+
+function formatHourLabel(isoHour) {
+  // `isoHour` looks like "YYYY-MM-DDTHH:00:00"
+  const d = new Date(isoHour);
+  if (isNaN(d.getTime())) return isoHour;
+  return d.toLocaleTimeString([], { hour: 'numeric' });
+}
+
+function renderTimelineChart(points) {
+  const labels = points.map(p => formatHourLabel(p.timestamp));
+  const totals = points.map(p => p.total_alerts ?? 0);
+  const pct = points.map(p => p.prefilter_percentage ?? 0);
+
+  const el = document.getElementById("timelineChart");
+  if (!el) return;
+  const ctx = el.getContext("2d");
+
+  const data = {
+    labels,
+    datasets: [
+      {
+        type: 'bar',
+        label: 'Total alerts',
+        data: totals,
+        yAxisID: 'y',
+        backgroundColor: 'rgba(88, 166, 255, 0.22)',
+        borderColor: 'rgba(88, 166, 255, 0.55)',
+        borderWidth: 1,
+        borderRadius: 4,
+        barPercentage: 0.9,
+        categoryPercentage: 0.9,
+      },
+      {
+        type: 'line',
+        label: 'Prefilter %',
+        data: pct,
+        yAxisID: 'y1',
+        borderColor: 'rgba(126, 231, 135, 0.95)',
+        backgroundColor: 'rgba(126, 231, 135, 0.15)',
+        pointRadius: 2,
+        pointHoverRadius: 3,
+        tension: 0.25,
+      },
+    ]
+  };
+
+  const options = {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { labels: { color: '#8b949e' } },
+      tooltip: {
+        callbacks: {
+          label: (ctx) => {
+            const v = ctx.raw;
+            if (ctx.dataset.yAxisID === 'y1') return `${ctx.dataset.label}: ${Number(v).toFixed(1)}%`;
+            return `${ctx.dataset.label}: ${Number(v).toLocaleString()}`;
+          }
+        }
+      }
+    },
+    scales: {
+      x: {
+        ticks: { color: '#6e7681', maxRotation: 0, autoSkip: true },
+        grid: { color: 'rgba(48,54,61,0.45)' },
+      },
+      y: {
+        position: 'left',
+        ticks: { color: '#6e7681' },
+        grid: { color: 'rgba(48,54,61,0.45)' },
+      },
+      y1: {
+        position: 'right',
+        min: 0,
+        max: 100,
+        ticks: { color: '#6e7681', callback: (v) => `${v}%` },
+        grid: { drawOnChartArea: false },
+      },
+    }
+  };
+
+  if (timelineChart) {
+    timelineChart.data = data;
+    timelineChart.options = options;
+    timelineChart.update();
+  } else {
+    timelineChart = new Chart(ctx, { data, options });
+  }
+}
+
+async function loadTimeline() {
+  const now = Date.now();
+  // Cache for 60s to avoid extra load while verdicts poll every 5s.
+  if (_timelineCache.data?.length && (now - _timelineCache.at) < 60_000) {
+    return _timelineCache.data;
+  }
+  const res = await fetch(`${API}/api/timeline`);
+  const data = await res.json();
+  _timelineCache = { at: now, data };
+  return data;
+}
 
 function setActive(selector, dataKey, value) {
   // "All" pills (data-* === "") represent absence of filter — don't visually highlight
@@ -189,6 +308,17 @@ async function load() {
     }
   } catch (e) {
     // If health can't be fetched, don't block the main UI.
+  }
+
+  // Update trends timeline (throttled)
+  try {
+    const points = await loadTimeline();
+    renderTimelineChart(points);
+    const meta = document.getElementById("timelineMeta");
+    if (meta) meta.textContent = points?.length ? `${points.length} buckets` : `No data`;
+  } catch (e) {
+    const meta = document.getElementById("timelineMeta");
+    if (meta) meta.textContent = "Timeline unavailable";
   }
 
   const res = await fetch(`${API}/api/verdicts?${params}`);
