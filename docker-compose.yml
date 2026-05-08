@@ -21,7 +21,7 @@ services:
       DEMO_MODE: ${DEMO_MODE:-false}
     volumes:
       - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
-      - ${HOST_EVE_PATH:-./data/eve.json}:${EVE_PATH:-/var/log/suricata/eve.json}:ro
+      - ${HOST_EVE_DIR:-./data}:/var/log/suricata:ro
     restart: unless-stopped
 
   dashboard:

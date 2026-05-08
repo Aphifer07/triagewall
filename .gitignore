@@ -59,3 +59,8 @@ config/*.local.json
 # One-time bootstrap script (kept locally, not for distribution)
 bootstrap.sh
 # Backup files from in-place edits (covered by *.backup-* above)
+data/
+*.db
+*.db-shm
+*.db-wal
+position.json
