@@ -1,0 +1,14 @@
+# Ignore database files
+triage.db
+triage.db-wal
+triage.db-shm
+
+# Ignore local data mounts
+data/
+eve.json
+
+# Ignore git and python cache
+.git/
+__pycache__/
+.env
+

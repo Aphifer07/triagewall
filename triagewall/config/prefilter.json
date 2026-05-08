@@ -9,6 +9,15 @@
     },
     {
       "signature_ids": [
+        2009205,
+        2009206,
+        2009207,
+        2009208
+      ],
+      "reason": "Legacy ET MALWARE Conficker/KEYPLUG P2P UDP signatures (2009-era) match modern STUN traffic to Microsoft Azure STUN servers (20.202.0.0/16:3478) used by Teams, Xbox Live, Skype, and other Microsoft services for NAT traversal. Confirmed false positive: same UDP packet shape, different intent. The LLM consistently misclassifies these because the signature description biases toward 'malware' without port-aware context. Manual review confirms benign — port 3478 is IANA-assigned STUN."
+    },
+    {
+      "signature_ids": [
         2016151,
         2033078
       ],
@@ -36,6 +45,30 @@
         2060503
       ],
       "reason": "Discord chat service traffic - normal Discord usage from desktop/mobile clients."
+    },
+    {
+      "signature_ids": [
+        2200121
+      ],
+      "reason": "Suricata decoder event for unknown EtherType - emitted when Suricata sees layer-2 frames it can't classify (often VLAN tags, MPLS, IPv6 extensions, or vendor-specific protocols). Decoder noise, not a security signal. Confirmed across thousands of samples in homelab traffic — 100% false positive rate via LLM classification."
+    },
+    {
+      "signature_ids": [
+        2027397
+      ],
+      "reason": "Spotify P2P client traffic - normal Spotify desktop client peer-to-peer caching behavior."
+    },
+    {
+      "signature_ids": [
+        2013504
+      ],
+      "reason": "Linux APT user-agent outbound - normal package update traffic (apt update / apt upgrade) from homelab Linux servers."
+    },
+    {
+      "signature_ids": [
+        2034635
+      ],
+      "reason": "Python BaseHTTP server banner - homelab Python services exposing their default banner. Internal traffic, not an exposure risk on a private network."
     }
   ]
 }
