@@ -241,7 +241,11 @@ def timeline():
         pre = int(r["prefiltered_count"] or 0)
         real = int(r["real_count"] or 0)
         pct = (pre / total * 100.0) if total else 0.0
+        # Append 'Z' suffix so JavaScript Date() parses as UTC, then
+        # the frontend's toLocaleTimeString() can convert to user's local time.
         hour = (r["hour_bucket"] or "").replace(" ", "T")
+        if hour and not hour.endswith("Z"):
+            hour = hour + "Z"
         out.append(
             {
                 "timestamp": hour,
