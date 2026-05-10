@@ -36,27 +36,43 @@ SYSTEM_PROMPT = f"""You are a SOC analyst classifying Suricata IDS alerts.
 Network facts:
 - Internal subnets: {INTERNAL_SUBNETS}
 - Multicast addresses (224.0.0.0/4) are not endpoints
+- Common cloud providers (Microsoft, Google, AWS, Cloudflare, Apple) routinely 
+  receive legitimate traffic from internal hosts
 
-Your job: examine each alert and decide if it warrants investigation.
+Your job: examine each alert and decide if a human analyst should investigate it.
 
-For each alert, analyze:
-1. Source and destination IPs (internal vs external?)
-2. The signature category (DOS, INFO, USER_AGENTS, MALWARE, etc.)
-3. Whether the traffic pattern matches the rule's intent or is incidental
+Analysis steps:
+1. Source and destination — internal vs external? Is the source a known endpoint type 
+   (workstation, server, IoT device)?
+2. Signature category — INFO and USER_AGENTS rules describe observed behavior, not 
+   threats. MALWARE and DOS rules require evidence the traffic actually matches the 
+   rule's threat pattern, not just superficial pattern overlap.
+3. Traffic pattern — does the actual traffic (port, protocol, packet size, frequency) 
+   match the threat the rule was written to detect?
 
 Output strict JSON with this exact structure (no other text):
    {{
      "verdict": "real" | "false_positive" | "uncertain",
      "confidence": 0.0-1.0,
-     "reasoning": "1-2 sentences. State what specific elements suggest real and what suggest benign before giving the verdict."
+     "reasoning": "1-2 sentences. State the strongest evidence for and against, then commit."
    }}
 
 Verdict guidance:
-- "real" = something an analyst should actually look at
-- "false_positive" = the rule fired on traffic that does not match its intent
-- "uncertain" = genuinely ambiguous; could go either way
+- "real" = an analyst should investigate this
+- "false_positive" = the alert fired but traffic does not match a real attack
+- "uncertain" = use ONLY when evidence does not favor either verdict above 0.55 confidence. 
+  Uncertain creates manual work for the analyst — prefer to commit when evidence weakly 
+  favors one direction.
 
-Be honest about uncertainty. Do not default to false_positive when you lack context."""
+Reasoning shortcuts (apply when relevant):
+- ET INFO rules describe observed traffic, not threats. Default to false_positive unless 
+  the source/destination or traffic pattern is genuinely anomalous.
+- ET USER_AGENTS rules fire on common software User-Agents (Steam, Spotify, curl, browsers, 
+  apt). Default to false_positive when the source is a normal endpoint on the network.
+- Internal source IPs talking to known cloud providers on standard ports (53, 80, 443, 
+  3478 STUN, 5223 push notifications) are almost always legitimate.
+- ET DOS / SCAN rules need corroborating evidence (high rate, many destinations, unusual 
+  timing). A single packet or low-volume traffic does not constitute an attack."""
 
 PREFILTER_CONFIG_PATH = Path(__file__).parent / "config" / "prefilter.json"
 
@@ -100,7 +116,8 @@ def call_ollama(alert: dict) -> dict:
         "prompt": user_prompt,
         "stream": False,
         "format": "json",  # forces structured JSON output
-        "options": {"temperature": 0.2, "num_predict": 250},
+        "options": {"temperature": 0.2, "num_predict": 250, "num_ctx": 4096},
+        "keep_alive": -1,
     }
 
     req = urllib.request.Request(
