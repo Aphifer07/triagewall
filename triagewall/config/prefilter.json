@@ -8,6 +8,42 @@
       "reason": "STUN binding request/response - normal NAT traversal traffic, used by Tailscale, WebRTC, VoIP, gaming."
     },
     {
+      "signature_ids": [2019102],
+      "reason": "ET DOS Possible SSDP Amplification Scan - rule fires on internal-to-internal SSDP/UPnP discovery (Windows Network Discovery, smart TVs, IoT devices announcing themselves). True amplification attacks target external IPs at high volume; internal SSDP at normal rates is benign. Confirmed by 95+ samples on this network."
+    },
+    {
+      "signature_ids": [2000538],
+      "reason": "ET SCAN NMAP -sA - 2010-era rule that fires on TCP ACK packets matching specific flag patterns. Frequently triggered by the return half of legitimate HTTPS connections (external server's port 443 responding to internal client's ephemeral port). Not actual NMAP scan activity in most cases. Recommend leaving on prefilter unless your network expects external scan attempts."
+    },
+    {
+      "signature_ids": [2035463, 2060503, 2060504, 2060505],
+      "reason": "Discord client traffic - normal usage of Discord domains observed in TLS SNI/HTTPS. The 'Observed Discord Domain' signatures fire on every Discord connection and produce zero security signal."
+    },
+    {
+      "signature_ids": [2047866, 2027695],
+      "reason": "Public DNS-over-HTTPS providers (Google 8.8.8.8, Cloudflare 1.1.1.1). Normal DNS traffic from any modern browser or DNS-over-HTTPS-aware client. ET INFO rules track observed DoH usage, not threats."
+    },
+    {
+      "signature_ids": [2036220],
+      "reason": "Android device connectivity check - every Android phone makes these requests every few minutes to detect captive portals. ET INFO informational rule, not a threat."
+    },
+    {
+      "signature_ids": [2031071],
+      "reason": "Microsoft connectivity test - Windows checks msftncsi.com / connectivitycheck endpoints to detect internet/captive portal status. ET INFO informational rule."
+    },
+    {
+      "signature_ids": [2054168, 2054141],
+      "reason": "External IP lookup services (ipinfo.io, ip-api.com). Used by browsers, scripts, and tools that need to know their public IP. Benign except in extreme cases of unusual frequency."
+    },
+    {
+      "signature_ids": [2028651],
+      "reason": "Steam HTTP client User-Agent. Normal Steam client traffic for game updates, friends list, store browsing."
+    },
+    {
+      "signature_ids": [2027397],
+      "reason": "Spotify P2P client behavior. Normal Spotify desktop usage."
+    },
+    {
       "signature_ids": [
         2009205,
         2009206,
