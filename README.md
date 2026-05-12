@@ -1,51 +1,28 @@
 # Triagewall
 
-> ⚠️ **Pre-release.** Triagewall is actively building toward v0.1. Not yet ready for general use. **Star the repo to be notified when v0.1 ships.** First public release expected mid-2026.
+**Local-LLM Suricata alert triage for homelabs.** Reduce alert noise without sending data to the cloud. Runs entirely on your hardware. No telemetry. AGPL-3.0.
 
-**Local-LLM alert triage for self-hosted SOCs.** Point it at your Suricata `eve.json`, stop drowning in alerts. Runs entirely on your hardware. No telemetry. No cloud. AGPL-3.0.
+> **TL;DR** — `docker compose up`, point it at your Suricata `eve.json`, and Triagewall pre-filters known noise out of the box. The remaining alerts get classified by a local LLM, with a dashboard showing what to investigate. Designed for homelabs and small SOCs running Suricata on OPNsense, pfSense, or any sensor that writes Suricata-format `eve.json`.
 
-> **TL;DR** — `docker compose up`, point it at your alert sources, and Triagewall pre-filters known noise out of the box. The remaining alerts get classified by a local LLM, with a dashboard showing what to investigate. Designed for homelabs and small SOCs running Suricata on OPNsense, pfSense, or any sensor that writes Suricata-format `eve.json`.
+![Triagewall dashboard](https://raw.githubusercontent.com/Aphifer07/triagewall-site/main/dashboard.png)
 
 ---
 
 ## Why this exists
 
-If you run Suricata in a homelab, you know the problem. The ET Open ruleset generates hundreds of alerts a day, the vast majority of which are noise — TLS SNI matches, DNS lookups for normal CDNs, your own scanning, your kid's gaming traffic. The signal is in there, but you're not going to find it by reading every alert at 11 PM.
+If you run Suricata in a homelab, you know the problem. The ET Open ruleset generates thousands of alerts a day, the vast majority of which are noise — TLS SNI matches, DNS lookups for normal CDNs, your own scanning, your kid's gaming traffic. The signal is in there, but you're not going to find it by reading every alert at 11 PM.
 
 Commercial XDR products solve this with cloud-based ML and a $500/month bill. The open-source SIEM stack (Wazuh, TheHive, Cortex) gives you the data but no triage layer. Triagewall is the missing layer, designed for people who already self-host their security stack and want to keep it that way.
 
 ## What it does
 
-- **Reads Suricata `eve.json`** in real time
-- **Triages each alert** with a local LLM (Ollama, default model: `gemma4:e4b`)
-- **Pre-filters known-benign rules** with a curated SID allowlist (the "I already know what STUN traffic is, stop telling me" filter)
-- **Tracks model agreement** — every verdict can be reviewed, building a labeled dataset and measurable agreement rate (currently 99%)
-- **Surfaces what matters** in a clean web dashboard
+- **Reads Suricata `eve.json`** in real time, tracks position across restarts and log rotations
+- **Pre-filters known-benign rules** with a tunable JSON config (the "I already know what STUN traffic is, stop telling me" filter) — microsecond lookups, zero LLM cost
+- **Triages residual alerts** with a local LLM via Ollama (default: `mistral:7b`, see [Performance & accuracy](#performance--accuracy) for VRAM-based model selection)
+- **Records your feedback** — every verdict has Agree / Mark Different buttons in the dashboard, building a labeled dataset and a measurable agreement rate
+- **Surfaces what matters** in a clean web dashboard with hourly traffic trends
 
-## Performance & accuracy
-
-Measured on a homelab running OPNsense → Suricata (ET Open ruleset, alert-only) → Triagewall.
-
-| Metric | Value |
-|---|---|
-| Alerts ingested per day | ~67,000 (WAN monitoring) — ~180,000 (LAN monitoring) |
-| Pre-filtered (zero LLM cost) | 92% (WAN) — 98%+ (LAN) |
-| LLM-classified | 8% (WAN) — under 2% (LAN) |
-| Average LLM latency per alert | 2–10 seconds |
-| Hardware (reference deployment) | RTX 4060 (8GB VRAM), Ollama, gemma4:e4b |
-| Daemon RAM footprint (excluding Ollama) | ~13 MB |
-
-These are real numbers from the development environment. Yours will vary based on your network, your Suricata ruleset, and your prefilter tuning.
-
-## What it does not do
-
-- It does not block traffic. Triagewall is read-only — it triages, it doesn't act. If you want auto-blocking, that's Wazuh Active Response or your firewall, not this.
-- It does not replace a SOC analyst. It reduces a 200-alert day to a 5-alert day. The 5 alerts are still your job.
-- It does not call out to OpenAI, Anthropic, or any cloud LLM by default. If you want a cloud-burst tier for hard cases, it's an opt-in toggle — off until you flip it.
-
-## Quick start (planned for v0.1)
-
-> Not yet available. Star the repo to be notified.
+## Quick start
 
 ```bash
 git clone https://github.com/Aphifer07/triagewall.git
@@ -62,30 +39,78 @@ docker-compose up -d        # Older Docker / Compose v1
 
 # For production: edit .env to set:
 #   - DEMO_MODE=false
-#   - HOST_EVE_PATH=/path/to/your/eve.json on the host
+#   - HOST_DATA_DIR=./data (or wherever you want runtime files stored)
+#   - HOST_EVE_DIR=/var/log/suricata (directory containing your eve.json)
 #   - OLLAMA_HOST=http://your-ollama-instance:11434
+#   - OLLAMA_MODEL=mistral:7b
 # Then `docker compose up -d` again.
 ```
 
+You'll need [Ollama](https://ollama.com) running somewhere reachable on your network, with at least one model pulled (`ollama pull mistral:7b`). The Ollama instance can be on the same host or a separate GPU node.
+
+## Performance & accuracy
+
+Triagewall has been running on a homelab production network for multi-day continuous operation against live OPNsense Suricata data. Measured numbers:
+
+| Metric | Value |
+|---|---|
+| Source rate (typical) | 6,000–13,000 alerts/hour |
+| Prefilter ratio | 99%+ (after tuning ~20 SIDs) |
+| LLM latency | 1–3 seconds per call (Mistral 7B Q4 on RTX 4060) |
+| End-to-end lag | under 2 minutes at steady state |
+| Daemon RAM footprint (excluding Ollama) | ~17 MB |
+| Database growth | ~1.5 GB after 7 days |
+
+Throughput scales primarily with prefilter ratio. The two-tier design means prefiltered alerts are processed in microseconds; only LLM-classified alerts (typically 0.3–3% after tuning) are bound by Ollama latency.
+
+### Recommended models by VRAM
+
+| GPU VRAM | Recommended model | Reasoning quality |
+|---|---|---|
+| 8 GB (RTX 4060, 3060 Ti) | `mistral:7b` at `num_ctx=4096` | Good — handles long tail well |
+| 12 GB (RTX 3060, 4070) | `mistral:7b` or `llama3.1:8b` at full context | Better |
+| 24 GB+ (RTX 3090, 4090) | `gemma3:12b`, `llama3.1:70b-q4` | Best |
+
+Avoid models that exceed your VRAM. CPU partial-offload causes 10x slower, highly variable inference latency. Verify your model fits with `ollama ps` showing `100% GPU` after warmup.
+
+### How tuning works
+
+The first day of running Triagewall on a new network is mostly about populating `prefilter.json` with site-specific noise. The dashboard surfaces which signatures dominate your LLM workload; adding them to the prefilter takes seconds and gives a permanent classification with documented reasoning. After initial tuning, the LLM handles only the long tail of genuinely novel signatures.
+
+Example prefilter entry from this repo's production config:
+
+```json
+{
+  "signature_ids": [2009205, 2009206, 2009207, 2009208],
+  "reason": "Legacy ET MALWARE Conficker/KEYPLUG P2P UDP signatures (2009-era) match modern STUN traffic to Microsoft Azure STUN servers (20.202.0.0/16:3478) used by Teams, Xbox Live, Skype. Confirmed false positive — same UDP packet shape, different intent. The LLM consistently misclassifies these because the signature description biases toward 'malware' without port-aware context."
+}
+```
+
+These reason strings double as documentation of *why* a SID is suppressed on your network — useful when reviewing the prefilter months later, or when sharing tuning notes with others.
+
+## What it does not do
+
+- It does not block traffic. Triagewall is read-only — it triages, it doesn't act. If you want auto-blocking, that's Wazuh Active Response or your firewall, not this.
+- It does not replace a SOC analyst. It reduces thousands of daily alerts down to a handful for review. Those alerts are still your job.
+- It does not call out to OpenAI, Anthropic, or any cloud LLM. Ever. By design.
+- It does not work without a GPU. Ollama runs models on CPU but inference is too slow to keep up with most networks' alert rates.
+
 ## Roadmap
 
-- [x] Suricata `eve.json` ingestion
-- [x] LLM triage with feedback loop
-- [x] Web dashboard with hourly trend chart
-- [x] Curated prefilter for known-benign signatures
-- [x] Docker compose packaging
-- [x] Demo mode with anonymized sample data
-- [x] Configuration via `.env` only (no code edits)
-- [x] Health endpoint with stale-data detection
-- [ ] Discord webhook digest (v0.1)
-- [ ] Wazuh API integration (v0.2)
-- [ ] Investigation agent — correlates flagged alerts across sources (v0.2)
-- [ ] Pi-hole DNS correlation (v0.2)
-- [ ] Multi-host cluster mode (Team tier)
+See [ROADMAP.md](ROADMAP.md) for the full plan. Highlights:
+
+**v0.2 (next):**
+- Verdict feedback loop — auto-suggest prefilter additions when the user consistently overrides the LLM on a SID
+- Asset tagging — name internal hosts and include in the LLM prompt for context-aware classification
+- Time range and IP filtering on the dashboard
+- Wazuh API integration as a second alert source
+- Async LLM pipeline for higher throughput
+
+**v0.3 and beyond:** webhook notifications, CSV/JSON export, daily/weekly digests, multi-source dashboards.
 
 ## Contributing
 
-Triagewall is pre-release and the codebase is changing rapidly. Contributions are welcome but please open an issue to discuss before submitting a large PR.
+Contributions are welcome but please open an issue to discuss before submitting a large PR.
 
 - Bug reports → [Issues](https://github.com/Aphifer07/triagewall/issues)
 - Feature ideas → [Discussions](https://github.com/Aphifer07/triagewall/discussions)
@@ -102,4 +127,4 @@ Commercial licenses available for organizations that need to ship Triagewall wit
 
 ## Acknowledgments
 
-Built on the shoulders of [Wazuh](https://wazuh.com), [Suricata](https://suricata.io), [Ollama](https://ollama.com), [FastAPI](https://fastapi.tiangolo.com), and the broader self-hosted security community. Inspired by [SOCFortress CoPilot](https://github.com/socfortress/CoPilot) and various Wazuh+Suricata triage experiments published by community members — all of which solved adjacent pieces of this problem and shaped how Triagewall approached it.
+Built on the shoulders of [Suricata](https://suricata.io), [Ollama](https://ollama.com), [FastAPI](https://fastapi.tiangolo.com), and the broader self-hosted security community. Inspired by [SOCFortress CoPilot](https://github.com/socfortress/CoPilot) and various Wazuh+Suricata triage experiments published by community members — all of which solved adjacent pieces of this problem and shaped how Triagewall approached it.
