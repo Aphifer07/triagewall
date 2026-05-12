@@ -22,6 +22,23 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 - **Records your feedback** — every verdict has Agree / Mark Different buttons in the dashboard, building a labeled dataset and a measurable agreement rate
 - **Surfaces what matters** in a clean web dashboard with hourly traffic trends
 
+---
+
+## Prerequisites
+
+- **Docker Engine 20.10+** ([install guide](https://docs.docker.com/engine/install/))
+- **Docker Compose v2** (the `docker compose` plugin, not the deprecated `docker-compose` v1). On Ubuntu/Debian/Pop!_OS:
+```bash
+  sudo apt-get install docker-compose-plugin
+```
+  This requires Docker's official apt repo. If the package isn't found, follow the [Docker install guide](https://docs.docker.com/engine/install/ubuntu/) to add the repo first.
+
+  > **Note:** The older `docker-compose` (v1.x) bundled with some Linux distros crashes with `KeyError: 'ContainerConfig'` against modern Docker Engine. If you hit that error, you're on v1 — install the v2 plugin instead.
+
+- **Ollama** running locally or on another reachable network host ([install](https://ollama.com/download))
+- **At least one Ollama model:** `ollama pull mistral:7b`
+- **A GPU with 8+ GB VRAM** for the LLM (the prefilter works without one, but the residual long tail won't classify in reasonable time on CPU)
+
 ## Quick start
 
 ```bash
