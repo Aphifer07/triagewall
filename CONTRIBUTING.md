@@ -13,7 +13,7 @@ Triagewall is pre-release and changing rapidly. Contributions are welcome but pl
 Triagewall targets Python 3.11+. The current development environment runs on Debian Trixie with Python 3.13.
 
 ```bash
-git clone https://github.com/Aphifer07/triagewall.git
+git clone https://github.com/aaronphifer/triagewall.git
 cd triagewall
 python3 -m venv .venv
 source .venv/bin/activate
