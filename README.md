@@ -4,7 +4,7 @@
 
 > **TL;DR** — `docker compose up`, point it at your Suricata `eve.json`, and Triagewall pre-filters known noise out of the box. The remaining alerts get classified by a local LLM, with a dashboard showing what to investigate. Designed for homelabs and small SOCs running Suricata on OPNsense, pfSense, or any sensor that writes Suricata-format `eve.json`.
 
-![Triagewall dashboard](https://raw.githubusercontent.com/Aphifer07/triagewall-site/main/dashboard.png)
+![Triagewall dashboard](https://raw.githubusercontent.com/aaronphifer/triagewall-site/main/dashboard.png)
 
 ---
 
@@ -42,7 +42,7 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 ## Quick start
 
 ```bash
-git clone https://github.com/Aphifer07/triagewall.git
+git clone https://github.com/aaronphifer/triagewall.git
 cd triagewall
 cp .env.example .env
 
@@ -129,8 +129,8 @@ See [ROADMAP.md](ROADMAP.md) for the full plan. Highlights:
 
 Contributions are welcome but please open an issue to discuss before submitting a large PR.
 
-- Bug reports → [Issues](https://github.com/Aphifer07/triagewall/issues)
-- Feature ideas → [Discussions](https://github.com/Aphifer07/triagewall/discussions)
+- Bug reports → [Issues](https://github.com/aaronphifer/triagewall/issues)
+- Feature ideas → [Discussions](https://github.com/aaronphifer/triagewall/discussions)
 - Security disclosures → security@triagewall.io
 - General contact → hello@triagewall.io
 
