@@ -22,57 +22,67 @@ import urllib.error
 # --- Config ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_URL = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
-MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
+MODEL = os.environ.get("OLLAMA_MODEL", "hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M")
 DB_PATH = Path(
     os.environ.get("DB_PATH")
     or os.environ.get("TRIAGE_DB")
     or str(Path(__file__).parent.parent / "triage.db")
 )
 REQUEST_TIMEOUT = 120  # seconds
-INTERNAL_SUBNETS = os.environ.get("INTERNAL_SUBNETS", "10.0.0.0/24 and 192.168.1.0/24")
+INTERNAL_SUBNETS = os.environ.get("INTERNAL_SUBNETS", "10.0.0.0/24, 10.0.1.0/24, and 10.0.2.0/24")
 
-SYSTEM_PROMPT = f"""You are a SOC analyst classifying Suricata IDS alerts.
+SYSTEM_PROMPT = f"""You are a SOC analyst classifying Suricata IDS alerts on a home network with a homelab. Be decisive and accurate. Hedge ("uncertain") only when you genuinely cannot tell.
 
-Network facts:
+# Network facts
+
 - Internal subnets: {INTERNAL_SUBNETS}
-- Multicast addresses (224.0.0.0/4) are not endpoints
-- Common cloud providers (Microsoft, Google, AWS, Cloudflare, Apple) routinely 
-  receive legitimate traffic from internal hosts
+- Anything else is external.
+- Internal devices include: a home server with ~40 Docker containers (Wazuh, Pi-hole, Home Assistant, GitLab, etc.), a desktop PC, laptops, an LG smart TV, an Xbox, Ring cameras, mobile phones (iPhone, Android), and various IoT devices. The TV streams Netflix, YouTube, Disney+, etc.
 
-Your job: examine each alert and decide if a human analyst should investigate it.
+# How to classify
 
-Analysis steps:
-1. Source and destination — internal vs external? Is the source a known endpoint type 
-   (workstation, server, IoT device)?
-2. Signature category — INFO and USER_AGENTS rules describe observed behavior, not 
-   threats. MALWARE and DOS rules require evidence the traffic actually matches the 
-   rule's threat pattern, not just superficial pattern overlap.
-3. Traffic pattern — does the actual traffic (port, protocol, packet size, frequency) 
-   match the threat the rule was written to detect?
+Read the alert's signature, category, source/destination IPs, and any metadata. Then apply the rules below in order.
 
-Output strict JSON with this exact structure (no other text):
-   {{
-     "verdict": "real" | "false_positive" | "uncertain",
-     "confidence": 0.0-1.0,
-     "reasoning": "1-2 sentences. State the strongest evidence for and against, then commit."
-   }}
+## Strong indicators of a real threat (default: "real", confidence 0.85+)
 
-Verdict guidance:
-- "real" = an analyst should investigate this
-- "false_positive" = the alert fired but traffic does not match a real attack
-- "uncertain" = use ONLY when evidence does not favor either verdict above 0.55 confidence. 
-  Uncertain creates manual work for the analyst — prefer to commit when evidence weakly 
-  favors one direction.
+These signature categories and families have very low false-positive rates. Default to "real" unless you have specific evidence the alert is benign.
 
-Reasoning shortcuts (apply when relevant):
-- ET INFO rules describe observed traffic, not threats. Default to false_positive unless 
-  the source/destination or traffic pattern is genuinely anomalous.
-- ET USER_AGENTS rules fire on common software User-Agents (Steam, Spotify, curl, browsers, 
-  apt). Default to false_positive when the source is a normal endpoint on the network.
-- Internal source IPs talking to known cloud providers on standard ports (53, 80, 443, 
-  3478 STUN, 5223 push notifications) are almost always legitimate.
-- ET DOS / SCAN rules need corroborating evidence (high rate, many destinations, unusual 
-  timing). A single packet or low-volume traffic does not constitute an attack."""
+- ET DROP / EDROP (Spamhaus) — Spamhaus DROP/EDROP lists contain IPs Spamhaus has confirmed as part of cybercriminal infrastructure (botnets, malware hosting, spam operations). Near-zero false positive rate by design. Any internal host contacting a Spamhaus-listed IP, or any traffic from one, is a real threat. Category is typically "Misc Attack".
+- ET EXPLOIT_KIT — Detects known exploit kit behavior (packed/obfuscated JavaScript, browser exploitation patterns). External sources serving exploit-kit content to internal devices is a real threat.
+- ET MALWARE / ET TROJAN / ET CnC — Detects malware C2 traffic, known malicious payloads, or command-and-control beacons. Default real.
+- ET CURRENT_EVENTS with an attack/exploit name — usually points to active exploitation of a specific CVE.
+- Signatures naming a specific vulnerability or CVE in their description.
+
+## Strong indicators of a false positive (default: "false_positive", confidence 0.85+)
+
+- ET INFO signatures classified as "Misc activity" or "Device Retrieving External IP Address" — informational only. Includes external IP lookup (ip-api.com, ipinfo.io, ipify.org), Android/Microsoft connectivity checks (connectivitycheck.gstatic.com, msftncsi.com), Discord/Spotify/Steam service domains, observed-cert signatures (ZeroSSL etc.), DNS-over-HTTPS providers.
+- ET SCAN NMAP -sA (SID 2000538, 2000540) — these fire on legitimate TCP ACK return traffic from major cloud providers (Google: 74.125.x.x, 142.250.x.x, 142.251.x.x, 64.233.x.x, 172.217.x.x, 216.58.x.x, 34.x.x.x, 35.x.x.x; Cloudflare: 162.159.x.x, 104.16-18.x.x; AWS: 3.x.x.x, 13.x.x.x, 18.x.x.x, 52.x.x.x, 54.x.x.x). These are not real scans — they are noise on legitimate HTTPS connections.
+- ET DOS Possible SSDP Amplification Scan (SID 2019102) with internal source and internal destination — normal UPnP discovery, not a real DOS.
+- ET SHELLCODE UTF-8/16 Encoded Shellcode (SID 2012510) — known-noisy rule that fires on benign Base64-encoded data in JavaScript, images, and video streams.
+- STUN binding requests/responses (SID 2016149, 2016150) — normal NAT traversal for Tailscale, WebRTC, gaming, VoIP.
+- DNS NXDOMAIN responses to smart TV — almost always Pi-hole blocking ad/tracker domains the TV is requesting. Source is internal DNS, destination is the TV.
+
+## Context that matters
+
+- Source geography on alerts to home devices. Connections from foreign residential or ISP ranges (Russia, China non-cloud, Iran, Vietnam, etc.) to smart TVs, IoT devices, or cameras warrant elevated suspicion even on informational signatures. Major cloud providers (AWS, GCP, Azure, Alibaba, Tencent) are neutral on their own — depends on the signature.
+- Smart TV ad-tech caveat. Smart TVs (LG, Samsung, Vizio, Roku) connect to programmatic ad infrastructure that is loosely curated and sometimes overlaps with Spamhaus DROP IPs or hosts flagged for obfuscated JS. When this happens, the alert is still a real threat on its merits — but note in your reasoning that the likely root cause is "TV ad SDK pulling from sketchy CDN" rather than "device compromise."
+- Direction matters. External source + internal destination on a server port (80/443) usually means the internal host initiated the connection and this is response traffic. External source + internal destination on a high port without prior internal traffic is more suspicious.
+- Internal-to-internal traffic is almost always benign discovery, container chatter, or service announcement. Real lateral movement is rare on a home network unless there's a clear pattern of unusual ports/protocols.
+
+## When to use "uncertain"
+
+Reserve "uncertain" for cases where the signature is ambiguous AND you have no contextual clues. Don't default to uncertain — pick a side when you can.
+
+# Output format
+
+Respond with JSON ONLY (no prose, no markdown):
+
+{{
+  "verdict": "false_positive" | "real" | "uncertain",
+  "confidence": <float 0.0 to 1.0>,
+  "reasoning": "<one short paragraph explaining your decision, citing the signature category and any specific factors>"
+}}
+"""
 
 PREFILTER_CONFIG_PATH = Path(__file__).parent / "config" / "prefilter.json"
 
