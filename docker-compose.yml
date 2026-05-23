@@ -19,6 +19,7 @@ services:
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e4b}
 
       DEMO_MODE: ${DEMO_MODE:-false}
+      INTERNAL_SUBNETS: ${INTERNAL_SUBNETS:-10.0.0.0/24 and 192.168.1.0/24}
     volumes:
       - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
       - ${HOST_EVE_DIR:-./data}:/var/log/suricata:ro
