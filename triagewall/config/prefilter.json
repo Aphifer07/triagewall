@@ -45,6 +45,15 @@
     },
     {
       "signature_ids": [
+        2009205,
+        2009206,
+        2009207,
+        2009208
+      ],
+      "reason": "Legacy ET MALWARE Conficker/KEYPLUG P2P UDP signatures (2009-era) match modern STUN traffic to Microsoft Azure STUN servers (20.202.0.0/16:3478) used by Teams, Xbox Live, Skype, and Tailscale DERP relays. Confirmed false positive: same UDP packet shape, different intent. v0.2 Foundation-Sec with category-aware prompting still misclassifies these because the prompt's ET MALWARE default-to-real rule overrides STUN-context recognition (149 alerts tested, 100% misclassified as real). v0.3 RAG layer with signature-specific context should resolve this; until then, prefilter."
+    },
+    {
+      "signature_ids": [
         2016151,
         2033078
       ],
