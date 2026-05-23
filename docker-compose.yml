@@ -23,6 +23,7 @@ services:
     volumes:
       - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
       - ${HOST_EVE_DIR:-./data}:/var/log/suricata:ro
+      - ./triagewall/config/prefilter.json:/app/triagewall/config/prefilter.json:rw
     restart: unless-stopped
 
   dashboard:

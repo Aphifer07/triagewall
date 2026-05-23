@@ -45,15 +45,6 @@
     },
     {
       "signature_ids": [
-        2009205,
-        2009206,
-        2009207,
-        2009208
-      ],
-      "reason": "Legacy ET MALWARE Conficker/KEYPLUG P2P UDP signatures (2009-era) match modern STUN traffic to Microsoft Azure STUN servers (20.202.0.0/16:3478) used by Teams, Xbox Live, Skype, and other Microsoft services for NAT traversal. Confirmed false positive: same UDP packet shape, different intent. The LLM consistently misclassifies these because the signature description biases toward 'malware' without port-aware context. Manual review confirms benign — port 3478 is IANA-assigned STUN."
-    },
-    {
-      "signature_ids": [
         2016151,
         2033078
       ],
