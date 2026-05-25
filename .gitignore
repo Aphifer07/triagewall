@@ -33,3 +33,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+position.json
+**/position.json
