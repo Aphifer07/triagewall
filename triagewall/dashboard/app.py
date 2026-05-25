@@ -68,8 +68,10 @@ def db(readonly: bool = False):
     """
     if readonly:
         conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=10000")
     else:
         conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=10000")
     conn.row_factory = sqlite3.Row
     return conn
 

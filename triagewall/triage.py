@@ -238,6 +238,7 @@ def main(fixture_path: str) -> None:
         sys.exit(1)
 
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=10000")
     alerts = []
     with open(fixture_path) as f:
         for line in f:

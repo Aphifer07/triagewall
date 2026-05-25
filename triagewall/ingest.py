@@ -91,6 +91,7 @@ def ensure_db_initialized():
     schema_path = Path(__file__).parent / "schema.sql"
     schema_sql = schema_path.read_text()
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=10000")
     try:
         conn.executescript(schema_sql)
         conn.commit()
@@ -209,6 +210,7 @@ def demo_loop():
 
     log.info(f"Demo fixtures loaded: {len(demo_lines)} alerts")
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=10000")
 
     try:
         while not _stop:
@@ -241,6 +243,7 @@ def tail_file():
 
     state = load_position()
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=10000")
     last_line_seen_ts = time.time()
     last_stall_warning_ts = 0.0
 
