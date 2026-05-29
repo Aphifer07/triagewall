@@ -31,6 +31,8 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 
 See [docs/experiments/](docs/experiments/) for full evaluation methodology and results.
 
+See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for trust boundaries, what's defended, and known limitations.
+
 ---
 
 ## Prerequisites

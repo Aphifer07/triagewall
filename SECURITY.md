@@ -1,5 +1,7 @@
 # Security Policy
 
+For the full threat model — trust assumptions, attacker model, and known limitations — see [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+
 ## Reporting a vulnerability
 
 If you've discovered a security issue in Triagewall, please report it privately rather than opening a public issue.
