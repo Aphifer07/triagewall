@@ -20,7 +20,7 @@ source .venv/bin/activate
 pip install -r requirements.txt  # (planned for v0.1)
 ```
 
-Triagewall expects an Ollama instance reachable at the address in your `.env` file. The default model is `gemma4:e4b`. Other models work but the prompt and JSON-output expectations are tuned for that model class.
+Triagewall expects an Ollama instance reachable at the address in your `.env` file. The default model is `hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M`. Other models work but the prompt and JSON-output expectations are tuned for that model class.
 
 ## Running tests
 
