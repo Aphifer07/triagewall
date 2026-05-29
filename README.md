@@ -22,11 +22,11 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 - **Records your feedback** — every verdict has Agree / Mark Different buttons in the dashboard, building a labeled dataset and a measurable agreement rate
 - **Surfaces what matters** in a clean web dashboard with hourly traffic trends
 
-### New in v0.2-alpha (2026-05)
+### New in v0.2 (2026-05)
 
-- **Production model swap** from Mistral 7B to Cisco's [Foundation-Sec-8B-Instruct](https://huggingface.co/fdtn-ai/Foundation-Sec-8B-Instruct), a security-domain-tuned model. Validated against a 265-alert human-labeled gold set: Cohen's κ improved 0.480 → 0.687, true-positive recall improved 17% → 83%.
+- **Production model swap** from Mistral 7B to Cisco's [Foundation-Sec-8B-Instruct](https://huggingface.co/fdtn-ai/Foundation-Sec-8B-Instruct), a security-domain-tuned model. Validated against a human-labeled gold set: revising the prompt moved Foundation-Sec Q5_K_M from Cohen's κ=0.210 to κ=0.687 and from 0% to 83% true-positive recall, beating Mistral 7B (κ=0.480) on the same gold set — the model's security specialization was latent and the prompt had to elicit it.
 - **Revised system prompt** with explicit category priors (ET DROP, ET EXPLOIT_KIT, ET MALWARE), threat-intel context (Spamhaus, geographic priors), and operational context (smart TV ad-tech, cloud IP ranges). Required to unlock Foundation-Sec's specialized training — see [the experiment writeup](docs/experiments/2026-05-22-prompt-revision.md) for the full methodology.
-- **Prompt injection hardening (Phase 1)** — canary token detection and strict response schema validation. Phase 2 (field isolation) tracked for v0.2.1.
+- **Prompt injection hardening (Phase 1)** — canary token detection and strict response schema validation.
 - **Operational improvements** — SQLite WAL mode (prevents dashboard lock contention), prefilter as mounted config volume (no rebuild required for SID changes), benchmark harness for reproducible model evaluation.
 
 See [docs/experiments/](docs/experiments/) for full evaluation methodology and results.
@@ -107,7 +107,7 @@ Triagewall has been benchmarked on Foundation-Sec-8B-Instruct across multiple qu
 
 *Q8_0 does not fit on 8 GB VRAM. Attempted runs produced ~25% JSON parse failures due to CPU offload. Avoid unless you have ≥16 GB headroom.*
 
-**Mistral 7B** (the v0.1 default) achieved Cohen's κ = 0.556 with 50% true-positive recall on the same gold set with the same prompt. Foundation-Sec's security-domain training meaningfully outperforms general-purpose models on this task once given an appropriately tuned prompt.
+**Mistral 7B** (the v0.1 default) achieved Cohen's κ = 0.480 with 16.7% (1/6) true-positive recall on the same gold set with the same prompt. Foundation-Sec's security-domain training meaningfully outperforms general-purpose models on this task once given an appropriately tuned prompt.
 
 Avoid models that exceed your VRAM. CPU partial-offload causes 10x slower, highly variable inference latency. Verify your model fits with `ollama ps` showing `100% GPU` after warmup. **Also avoid running other GPU-heavy applications (LM Studio, browser GPU acceleration, gaming) concurrently** — VRAM contention silently drops Ollama to CPU and degrades classification latency without obvious indicators.
 
@@ -157,15 +157,15 @@ This is the default deployment model and isn't a Triagewall limitation specifica
 
 See [ROADMAP.md](ROADMAP.md) for the full plan. Highlights:
 
-**v0.2-alpha (shipped):** Prompt revision, Foundation-Sec-8B model swap, benchmark harness, 265-alert gold set, prompt injection hardening Phase 1, SQLite WAL mode, mounted prefilter volume.
+**v0.2 (shipped, May 2026):** Two-phase prompt injection hardening — Phase 1 (canary token detection, strict response-schema validation) and Phase 2 (field isolation: 16 attacker-controlled fields base64-encapsulated with boundary markers, closing a URL-injection vulnerability). Plus Foundation-Sec-8B model swap, benchmark harness, 265-alert gold set, SQLite WAL mode, and mounted prefilter volume. See the [writeup](https://triagewall.io/posts/prompt-injection-phase-2).
 
-**v0.2 (next, June 2026):** Prompt injection hardening Phase 2 (field isolation), documentation polish, architecture diagram, SQLite busy-timeout patches.
+**v0.2.1 (next, June 2026):** Garak injection gate (pre-release adversarial scanning of the full pipeline), prompt iteration so URL injection produces an explicit "real + flagged" verdict, architecture diagram.
 
-**v0.3 (Jul–Aug 2026):** Wazuh integration — pull Wazuh alerts through the same LLM triage pipeline. Multi-sensor pattern proven.
+**v0.3 (Jul–Aug 2026):** Wazuh integration — pull Wazuh alerts through the same LLM triage pipeline. Source-aware prompts, multi-sensor schema, gold-set change validation (regressions block + notify, never silent).
 
-**v0.4 (Sep–Oct 2026):** Awareness layer — daily digest, coverage gap detection ("you have 12 active devices but only 3 running endpoint agents"), cross-sensor narrative correlation, asset criticality tagging.
+**v0.4 (Sep–Oct 2026):** Awareness layer — daily plain-English digest, coverage gap detection ("12 active devices but only 3 running endpoint agents"), cross-sensor correlation, assisted prefilter suggestions (you approve), asset criticality tagging.
 
-**v0.5:** Vulnerability summarization layer wrapping Wazuh vulnerability detection and/or OpenVAS with LLM-driven prioritization and remediation guidance.
+**v0.5 (late 2026):** Vulnerability summarization wrapping Wazuh vulnerability detection and/or OpenVAS with LLM-driven prioritization and remediation guidance.
 
 **v1.0 (early 2027):** Positioned as a homelab security awareness platform — the tool that fights the "out of sight, out of mind" problem by surfacing what matters across all your sensors without requiring you to remember to check dashboards.
 
