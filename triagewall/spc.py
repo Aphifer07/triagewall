@@ -43,7 +43,9 @@ MIN_SIGMA = 1.0                # floor: a perfectly stable baseline (sigma=0)
                                # must still flag gross deviations. Without this,
                                # a device with very regular behavior (sigma~0,
                                # e.g. IoT beacons) could never trip 3-sigma.
-MIN_SAMPLES = 24               # need >= this many hourly buckets before alerting
+MIN_SAMPLES = 10               # alert_rate needs >= this many hourly buckets
+                               # (a rate baseline requires real history). Quiet
+                               # IPs with few buckets stay learning for rate.
 MIN_AGE_HOURS = 24             # and >= this much wall-clock history
 RATE_BUCKET = "%Y-%m-%dT%H"    # hourly bucket key (truncate timestamp to hour)
 
@@ -191,6 +193,12 @@ def observe(conn, event):
         first_seen, sample_count, state = row
         conn.execute("UPDATE spc_ip_state SET last_seen = ? WHERE ip = ?", (now, ip))
 
+    # Age gate, computed once. novel_sid uses AGE alone (an IP established for
+    # >= MIN_AGE_HOURS that fires a never-before-seen SID is meaningful even if
+    # it has too little volume for a rate baseline). alert_rate additionally
+    # needs sample volume (below).
+    age_ok = _age_hours(first_seen, now) >= MIN_AGE_HOURS
+
     # --- feature: novel_sid (boolean trigger) ---
     if sig_id is not None:
         seen = conn.execute(
@@ -203,10 +211,12 @@ def observe(conn, event):
                 "VALUES (?, ?, ?)",
                 (ip, sig_id, now),
             )
-            # Only an anomaly once the IP is out of learning (it has a baseline
-            # of what it normally does). A brand-new IP triggers many "novel"
-            # SIDs by definition; that's not signal.
-            if state == "active":
+            # Gate on AGE, not sample volume: a quiet container that's been on
+            # the network for a day+ but suddenly trips a new signature is a
+            # high-value signal precisely because it's normally silent. A
+            # brand-new IP (age < MIN_AGE_HOURS) triggers many "novel" SIDs by
+            # definition, so it's still suppressed during its first day.
+            if age_ok:
                 anomalies.append({
                     "ip": ip, "feature": "novel_sid", "value": float(sig_id),
                     "mean": 0.0, "sigma": 0.0, "z": 0.0,
@@ -229,8 +239,8 @@ def observe(conn, event):
         (ip, bucket),
     ).fetchone()[0]
 
-    # cold-start gate: enough completed buckets AND enough wall-clock age
-    age_ok = _age_hours(first_seen, now) >= MIN_AGE_HOURS
+    # cold-start gate for alert_rate: enough completed buckets AND enough age.
+    # (age_ok computed earlier, above the novel_sid check.)
     samples_ok = n_buckets >= MIN_SAMPLES
     if state == "learning" and age_ok and samples_ok:
         conn.execute("UPDATE spc_ip_state SET state = 'active' WHERE ip = ?", (ip,))
