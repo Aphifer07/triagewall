@@ -51,7 +51,8 @@ DEFAULT_DB = os.environ.get(
 def main():
     ap = argparse.ArgumentParser(description="Backfill SPC baselines from history")
     ap.add_argument("--db", default=DEFAULT_DB, help="path to triage.db")
-    ap.add_argument("--days", type=int, default=14, help="window of history to replay")
+    ap.add_argument("--rows", type=int, default=1500000,
+                    help="replay the most recent N rows (by id, indexed/fast)")
     ap.add_argument("--dry-run", action="store_true", help="count only, no writes")
     ap.add_argument("--reset", action="store_true",
                     help="DROP spc_* tables first (clean re-run)")
@@ -75,14 +76,22 @@ def main():
 
     spc.ensure_spc_schema(conn)
 
-    # Pull the window of history, oldest first (chronological replay is required
-    # so rolling baselines build in the right order).
-    where = f"timestamp >= datetime('now', '-{int(args.days)} days')"
+    # Use the INDEXED primary key (id) to slice recent history, NOT a timestamp
+    # scan. timestamp is stored as text and the datetime() comparison won't use
+    # the index, forcing a full scan of a multi-GB table (minutes). id is the
+    # autoincrement PK -> chronological AND indexed -> fast range scan.
+    max_id = conn.execute("SELECT MAX(id) FROM triage_events").fetchone()[0]
+    if max_id is None:
+        print("triage_events is empty.")
+        conn.close()
+        return
+    min_id = max(1, max_id - int(args.rows) + 1)
     total = conn.execute(
-        f"SELECT COUNT(*) FROM triage_events WHERE {where} AND raw_alert IS NOT NULL"
+        "SELECT COUNT(*) FROM triage_events "
+        "WHERE id >= ? AND raw_alert IS NOT NULL", (min_id,)
     ).fetchone()[0]
     print(f"DB: {db_path}")
-    print(f"Window: last {args.days} days")
+    print(f"Replaying most recent ~{args.rows:,} rows (id {min_id:,}..{max_id:,})")
     print(f"Rows to replay: {total:,}")
 
     if args.dry_run:
@@ -95,11 +104,11 @@ def main():
         conn.close()
         return
 
-    # Read with a separate cursor so we can stream without loading all rows.
+    # Stream by id ascending (chronological) using the PK index.
     read_cur = conn.cursor()
     read_cur.execute(
-        f"SELECT raw_alert FROM triage_events "
-        f"WHERE {where} AND raw_alert IS NOT NULL ORDER BY timestamp ASC"
+        "SELECT raw_alert FROM triage_events "
+        "WHERE id >= ? AND raw_alert IS NOT NULL ORDER BY id ASC", (min_id,)
     )
 
     processed = 0
