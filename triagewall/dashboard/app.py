@@ -215,11 +215,22 @@ def health():
     return payload
 
 
+
+# --- lightweight TTL cache for expensive polling endpoints ---------------
+import time as _time
+_timeline_cache = {"data": None, "ts": 0.0}
+_TIMELINE_TTL = 60.0  # seconds; hourly buckets don't change faster than this
+
 @app.get("/api/timeline")
 def timeline():
     """
-    Return hourly buckets for the last 24 hours.
+    Return hourly buckets for the last 24 hours. Cached for _TIMELINE_TTL
+    seconds so concurrent polls from multiple clients share one query result
+    instead of each re-aggregating against the live (write-busy) DB.
     """
+    now = _time.time()
+    if _timeline_cache["data"] is not None and (now - _timeline_cache["ts"]) < _TIMELINE_TTL:
+        return _timeline_cache["data"]
     # Bucket by processed_at so the timeline matches when Triagewall classified
     # alerts (consistent with the hero stat), not when Suricata first detected them.
     with db(readonly=True) as conn:
@@ -257,6 +268,8 @@ def timeline():
                 "real_count": real,
             }
         )
+    _timeline_cache["data"] = out
+    _timeline_cache["ts"] = now
     return out
 
 

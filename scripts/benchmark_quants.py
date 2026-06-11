@@ -34,7 +34,7 @@ from pathlib import Path
 # --- Constants matching production triage.py ---
 
 INTERNAL_SUBNETS = "10.0.0.0/24, 10.0.1.0/24, and 10.0.2.0/24"
-REQUEST_TIMEOUT = 180  # seconds
+REQUEST_TIMEOUT = 600  # seconds
 
 SYSTEM_PROMPT = f"""You are a SOC analyst classifying Suricata IDS alerts on a home network with a homelab. Be decisive and accurate. Hedge ("uncertain") only when you genuinely cannot tell.
 
