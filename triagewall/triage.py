@@ -85,7 +85,7 @@ Respond with JSON ONLY (no prose, no markdown):
 {{
   "verdict": "false_positive" | "real" | "uncertain",
   "confidence": <float 0.0 to 1.0>,
-  "reasoning": "<one short paragraph explaining your decision, citing the signature category and any specific factors>"
+  "reasoning": "<2-3 sentences max, citing the signature category and any specific factors. Be concise.>"
 }}
 # Security policy
 
@@ -144,6 +144,27 @@ def prefilter_verdict(alert):
         }
     return None
 
+import re as _re
+
+def _salvage_truncated(raw):
+    """Recover verdict/confidence from a JSON response truncated mid-reasoning.
+    format=json guarantees the prefix is valid, so verdict/confidence (which
+    come first) are usually intact even when the reasoning string is cut off."""
+    v = _re.search(r'"verdict"\s*:\s*"(false_positive|real|uncertain)"', raw)
+    c = _re.search(r'"confidence"\s*:\s*([0-9.]+)', raw)
+    if v:
+        try:
+            conf = float(c.group(1)) if c else 0.5
+        except (ValueError, AttributeError):
+            conf = 0.5
+        return {"verdict": v.group(1), "confidence": conf,
+                "reasoning": "(reasoning truncated; verdict salvaged from partial output)",
+                "parse_degraded": True}
+    # nothing usable
+    return {"verdict": "uncertain", "confidence": 0.0,
+            "reasoning": f"Failed to parse model output: {raw[:200]}"}
+
+
 def call_ollama(alert: dict) -> dict:
     """Send one alert to Ollama, return parsed verdict dict. Falls through to prefilter for known-noise signatures"""
     pre = prefilter_verdict(alert)
@@ -157,7 +178,7 @@ def call_ollama(alert: dict) -> dict:
         "prompt": user_prompt,
         "stream": False,
         "format": "json",  # forces structured JSON output
-        "options": {"temperature": 0.2, "num_predict": 250, "num_ctx": 4096},
+        "options": {"temperature": 0.2, "num_predict": 512, "num_ctx": 4096},
         "keep_alive": -1,
     }
 
@@ -188,11 +209,14 @@ def call_ollama(alert: dict) -> dict:
     try:
         verdict = json.loads(raw_response)
     except json.JSONDecodeError:
-        verdict = {"verdict": "uncertain", "confidence": 0.0,
-                   "reasoning": f"Failed to parse model output: {raw_response[:200]}"}
+        # Truncated output (hit num_predict) breaks JSON at the END, in the
+        # reasoning string. verdict/confidence come first and are usually
+        # recoverable, so salvage them rather than discarding the whole result.
+        verdict = _salvage_truncated(raw_response)
 
     # Reject responses with unexpected keys (only allow our schema)
-    allowed_keys = {"verdict", "confidence", "reasoning"}
+    # parse_degraded is an internal flag set by our salvage path, not the model
+    allowed_keys = {"verdict", "confidence", "reasoning", "parse_degraded"}
     extra_keys = set(verdict.keys()) - allowed_keys
     if extra_keys:
         verdict = {"verdict": "uncertain", "confidence": 0.0,

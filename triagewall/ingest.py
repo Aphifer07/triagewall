@@ -12,6 +12,7 @@ Stop with Ctrl-C or systemd.
 """
 import os
 import sys
+import spc
 import time
 import json
 import sqlite3
@@ -180,6 +181,12 @@ def process_line(conn, line):
         verdict = call_ollama(event)
         if not insert_with_retry(conn, event, verdict):
             return False
+        # SPC behavioral baselining — independent observer, never fatal
+        try:
+            spc.observe(conn, event)
+            conn.commit()
+        except Exception as e:
+            log.warning(f"SPC observe failed (non-fatal): {type(e).__name__}: {e}")
         log.info(
             f"[{verdict['verdict']:>15}] {verdict['confidence']:.2f}  {sig[:80]}"
         )
@@ -211,6 +218,7 @@ def demo_loop():
     log.info(f"Demo fixtures loaded: {len(demo_lines)} alerts")
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("PRAGMA busy_timeout=10000")
+    spc.ensure_spc_schema(conn)
 
     try:
         while not _stop:
@@ -244,6 +252,7 @@ def tail_file():
     state = load_position()
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("PRAGMA busy_timeout=10000")
+    spc.ensure_spc_schema(conn)
     last_line_seen_ts = time.time()
     last_stall_warning_ts = 0.0
 
