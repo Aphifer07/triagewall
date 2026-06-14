@@ -28,6 +28,12 @@
   .badge-uncertain { background: rgba(210,153,34,.15); color: #d29922; }
   .badge-prefilter { background: rgba(110,118,129,.2); color: #8b949e; border: 1px solid #30363d; }
   .badge-llm { background: rgba(88,166,255,.15); color: #58a6ff; }
+  .badge-spc { background: rgba(163,113,247,.15); color: #a371f7; border: 1px solid rgba(163,113,247,.3); }
+  .spc-panel { border-left: 3px solid #a371f7; }
+  .spc-row { border-bottom: 1px solid #21262d; }
+  .spc-row:last-child { border-bottom: none; }
+  .spc-feature-rate { color: #d29922; }
+  .spc-feature-novel { color: #a371f7; }
   .reasoning { font-size: 0.875rem; color: #8b949e; line-height: 1.55; }
   .demo-banner { background: #7c2d12; color: #fff; }
   .focused { outline: 2px solid #d29922; outline-offset: -2px; }
@@ -131,6 +137,19 @@
 
   <!-- Secondary stats -->
   <div id="stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"></div>
+
+  <!-- SPC behavioral anomalies (independent signal) -->
+  <div id="spcPanel" class="card spc-panel rounded-lg p-6 mb-6 hidden">
+    <div class="flex items-end justify-between flex-wrap gap-3 mb-3">
+      <div>
+        <div class="text-xs text-gray-500 uppercase tracking-widest font-semibold">Behavioral anomalies</div>
+        <div class="text-lg font-semibold text-gray-200 mt-1">Statistical baseline deviations</div>
+        <div class="text-xs text-gray-600 mt-1">Independent of LLM verdicts — an attacker can rewrite alert text, not their behavior.</div>
+      </div>
+      <div class="text-xs mono" id="spcMeta"></div>
+    </div>
+    <div id="spcList" class="space-y-0"></div>
+  </div>
 
   <!-- Filters -->
   <div class="flex flex-wrap gap-2 mb-4 items-center">
@@ -332,6 +351,7 @@ async function load() {
   renderHero(data.stats);
   renderStats(data.stats);
   renderVerdicts(data.verdicts);
+  loadSpc();
   document.getElementById("freshness").textContent = `Live · Updated ${new Date().toLocaleTimeString()}`;
 }
 
@@ -344,6 +364,61 @@ function renderHero(s) {
   document.getElementById("heroDetail").textContent =
     `${p24.toLocaleString()} of ${t24.toLocaleString()} alerts auto-classified · ${l24.toLocaleString()} sent to LLM`;
   document.getElementById("lifetimeTotal").textContent = (s.total ?? 0).toLocaleString();
+}
+
+async function loadSpc() {
+  try {
+    const res = await fetch(`${API}/api/spc-anomalies`);
+    const data = await res.json();
+    renderSpc(data);
+  } catch (e) {
+    // SPC panel is best-effort; never block the main UI.
+  }
+}
+
+function renderSpc(data) {
+  const panel = document.getElementById("spcPanel");
+  if (!data || data.available === false) {
+    panel.classList.add("hidden");
+    return;
+  }
+  const list = data.anomalies || [];
+  if (!list.length) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+
+  const meta = document.getElementById("spcMeta");
+  if (meta) {
+    const n = data.count_24h ?? 0;
+    meta.textContent = n > 0 ? `${n} in last 24h` : `${list.length} total`;
+    meta.className = "text-xs mono " + (n > 0 ? "text-yellow-500" : "text-gray-600");
+  }
+
+  document.getElementById("spcList").innerHTML = list.map(a => {
+    const ts = a.detected_at
+      ? new Date(a.detected_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+      : '';
+    const isRate = a.feature === 'alert_rate';
+    const featureLabel = isRate
+      ? `<span class="spc-feature-rate font-semibold">rate spike</span>`
+      : `<span class="spc-feature-novel font-semibold">novel signature</span>`;
+    const sid = a.signature_id != null ? `<span class="text-gray-500 mono">SID ${a.signature_id}</span>` : '';
+    return `
+      <div class="spc-row py-3 flex items-start gap-3">
+        <span class="badge badge-spc mt-0.5">SPC</span>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap text-sm">
+            ${featureLabel}
+            <span class="text-gray-300 mono">${escapeHtml(a.ip ?? '?')}</span>
+            ${sid}
+            <span class="text-xs text-gray-600 mono ml-auto">${ts}</span>
+          </div>
+          <div class="text-xs text-gray-500 mt-1">${escapeHtml(a.note ?? '')}</div>
+        </div>
+      </div>`;
+  }).join("");
 }
 
 function renderStats(s) {

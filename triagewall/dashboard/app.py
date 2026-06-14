@@ -220,6 +220,8 @@ def health():
 import time as _time
 _timeline_cache = {"data": None, "ts": 0.0}
 _TIMELINE_TTL = 60.0  # seconds; hourly buckets don't change faster than this
+_spc_cache = {"data": None, "ts": 0.0}
+_SPC_TTL = 30.0  # seconds; anomalies arrive ~1-2/day, no need to re-query often
 
 @app.get("/api/timeline")
 def timeline():
@@ -270,6 +272,72 @@ def timeline():
         )
     _timeline_cache["data"] = out
     _timeline_cache["ts"] = now
+    return out
+
+
+@app.get("/api/spc-anomalies")
+def spc_anomalies():
+    """
+    Recent SPC behavioral-baselining anomalies — an INDEPENDENT detection signal.
+
+    These are surfaced regardless of any LLM verdict: an SPC anomaly means a host
+    deviated from its own behavioral baseline (a rate spike, or a never-before-seen
+    signature), which prompt injection cannot fake by rewriting alert text. The
+    panel is intentionally not joined to or filtered by the verdict list, so a
+    high-confidence LLM "false positive" can never suppress a behavioral anomaly.
+
+    Cached briefly since anomalies arrive on the order of 1-2 per day.
+    """
+    now = _time.time()
+    if _spc_cache["data"] is not None and (now - _spc_cache["ts"]) < _SPC_TTL:
+        return _spc_cache["data"]
+
+    out = {"anomalies": [], "available": True}
+    with db(readonly=True) as conn:
+        # The spc_anomalies table only exists once the SPC engine has run. Guard
+        # so the dashboard degrades gracefully on installs without SPC.
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='spc_anomalies'"
+        ).fetchone()
+        if not exists:
+            out["available"] = False
+            _spc_cache["data"] = out
+            _spc_cache["ts"] = now
+            return out
+
+        rows = conn.execute(
+            """
+            SELECT detected_at, feature, ip, signature_id, z, note
+            FROM spc_anomalies
+            ORDER BY id DESC
+            LIMIT 50
+            """
+        ).fetchall()
+
+        # Also surface a count for the last 24h, so the panel can show recency.
+        last24 = conn.execute(
+            "SELECT COUNT(*) FROM spc_anomalies "
+            "WHERE detected_at >= datetime('now', '-24 hours')"
+        ).fetchone()[0]
+
+    for r in rows:
+        dt = r["detected_at"] or ""
+        # Normalize to a JS-parseable UTC timestamp like the timeline endpoint.
+        ts = dt.replace(" ", "T")
+        if ts and not (ts.endswith("Z") or "+" in ts):
+            ts = ts + "Z"
+        out["anomalies"].append({
+            "detected_at": ts,
+            "feature": r["feature"],
+            "ip": r["ip"],
+            "signature_id": r["signature_id"],
+            "z": r["z"],
+            "note": r["note"],
+        })
+    out["count_24h"] = int(last24 or 0)
+
+    _spc_cache["data"] = out
+    _spc_cache["ts"] = now
     return out
 
 
