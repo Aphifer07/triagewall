@@ -130,26 +130,37 @@ def list_verdicts(verdict: str = None, signature: str = None, model: str = None,
             params + [limit],
         ).fetchall()
 
-        stats = conn.execute(
-            """SELECT
-                COUNT(*) AS total,
-                SUM(verdict = 'real') AS real_,
-                SUM(verdict = 'false_positive') AS fp,
-                SUM(verdict = 'uncertain') AS unc,
-                SUM(human_verdict IS NOT NULL) AS reviewed,
-                SUM(agreed = 1) AS agreed,
-                SUM(agreed = 0) AS disagreed,
-                SUM(model_used = 'prefilter') AS prefilter_count,
-                SUM(model_used != 'prefilter') AS llm_count,
-                SUM(processed_at >= datetime('now', '-24 hours')) AS today_total,
-                SUM(model_used = 'prefilter' AND processed_at >= datetime('now', '-24 hours')) AS today_prefilter,
-                SUM(model_used != 'prefilter' AND processed_at >= datetime('now', '-24 hours')) AS today_llm
-                FROM triage_events"""
-        ).fetchone()
+    # The stats aggregate below scans the full table (no WHERE), which is
+    # expensive at scale. Cache it briefly so high-frequency polls from multiple
+    # clients don't each trigger a full-table scan against the live (write-busy) DB.
+    _now = _time.time()
+    if _stats_cache["data"] is not None and (_now - _stats_cache["ts"]) < _STATS_TTL:
+        stats_dict = _stats_cache["data"]
+    else:
+        with db(readonly=True) as conn:
+            stats = conn.execute(
+                """SELECT
+                    COUNT(*) AS total,
+                    SUM(verdict = 'real') AS real_,
+                    SUM(verdict = 'false_positive') AS fp,
+                    SUM(verdict = 'uncertain') AS unc,
+                    SUM(human_verdict IS NOT NULL) AS reviewed,
+                    SUM(agreed = 1) AS agreed,
+                    SUM(agreed = 0) AS disagreed,
+                    SUM(model_used = 'prefilter') AS prefilter_count,
+                    SUM(model_used != 'prefilter') AS llm_count,
+                    SUM(processed_at >= datetime('now', '-24 hours')) AS today_total,
+                    SUM(model_used = 'prefilter' AND processed_at >= datetime('now', '-24 hours')) AS today_prefilter,
+                    SUM(model_used != 'prefilter' AND processed_at >= datetime('now', '-24 hours')) AS today_llm
+                    FROM triage_events"""
+            ).fetchone()
+        stats_dict = dict(stats)
+        _stats_cache["data"] = stats_dict
+        _stats_cache["ts"] = _now
 
     return {
         "mode": MODE,
-        "stats": dict(stats),
+        "stats": stats_dict,
         "verdicts": [row_to_dict(r) for r in rows],
     }
 
@@ -222,6 +233,9 @@ _timeline_cache = {"data": None, "ts": 0.0}
 _TIMELINE_TTL = 60.0  # seconds; hourly buckets don't change faster than this
 _spc_cache = {"data": None, "ts": 0.0}
 _SPC_TTL = 30.0  # seconds; anomalies arrive ~1-2/day, no need to re-query often
+_stats_cache = {"data": None, "ts": 0.0}
+_STATS_TTL = 30.0  # seconds; the all-time aggregate is a full-table scan, so cache
+                   # it rather than recomputing on every poll from every client.
 
 @app.get("/api/timeline")
 def timeline():
