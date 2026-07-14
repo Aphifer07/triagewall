@@ -424,14 +424,16 @@ function renderSpc(data) {
 function renderStats(s) {
   const agreePct = s.reviewed ? Math.round((s.agreed / s.reviewed) * 100) : null;
   const cards = [
-    { label: "Real", val: (s.real_ ?? 0).toLocaleString(), cls: "v-real" },
-    { label: "False Positive", val: (s.fp ?? 0).toLocaleString(), cls: "v-false_positive" },
-    { label: "Uncertain", val: (s.unc ?? 0).toLocaleString(), cls: "v-uncertain" },
+    { label: "Real · 24h", val: (s.real_ ?? 0).toLocaleString(), cls: "v-real" },
+    { label: "False Positive · 24h", val: (s.fp ?? 0).toLocaleString(), cls: "v-false_positive" },
+    { label: "Uncertain · 24h", val: (s.unc ?? 0).toLocaleString(), cls: "v-uncertain" },
     {
-      label: "Agreement",
+      label: "Agreement · 24h",
       val: agreePct === null ? "—" : `${agreePct}%`,
       cls: "",
-      sub: s.reviewed ? `${(s.reviewed ?? 0).toLocaleString()} reviewed` : null
+      sub: s.reviewed
+        ? `${(s.reviewed ?? 0).toLocaleString()} recent alerts reviewed`
+        : null
     },
   ];
   document.getElementById("stats").innerHTML = cards.map(c => `

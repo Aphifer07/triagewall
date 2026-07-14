@@ -6,7 +6,7 @@ MODE=local  → full data, feedback enabled
 MODE=demo   → IPs masked, feedback disabled, read-only
 
 Run:
-    uvicorn app:app --host 0.0.0.0 --port 8084
+    uvicorn triagewall.dashboard.app:app --host 0.0.0.0 --port 8084
 """
 import os
 import re
@@ -14,9 +14,10 @@ import json
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from triagewall.dashboard.stats import get_dashboard_stats
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -101,7 +102,12 @@ def row_to_dict(row):
 # --- API endpoints -----------------------------------------------------------
 
 @app.get("/api/verdicts")
-def list_verdicts(verdict: str = None, signature: str = None, model: str = None, limit: int = 100):
+def list_verdicts(
+    verdict: str = None,
+    signature: str = None,
+    model: str = None,
+    limit: int = Query(default=100, ge=1, le=500),
+):
     """Return a paginated list of verdicts plus summary stats."""
     where, params = [], []
     if verdict in ("real", "false_positive", "uncertain"):
@@ -130,31 +136,19 @@ def list_verdicts(verdict: str = None, signature: str = None, model: str = None,
             params + [limit],
         ).fetchall()
 
-    # The stats aggregate below scans the full table (no WHERE), which is
-    # expensive at scale. Cache it briefly so high-frequency polls from multiple
-    # clients don't each trigger a full-table scan against the live (write-busy) DB.
+    # Cache the bounded 24-hour aggregate so concurrent dashboard polls share
+    # one result. The query itself remains safe after cache expiry because it
+    # uses idx_triage_processed to seek to the cutoff.
     _now = _time.time()
-    if _stats_cache["data"] is not None and (_now - _stats_cache["ts"]) < _STATS_TTL:
+    if (
+        _stats_cache["data"] is not None
+        and (_now - _stats_cache["ts"]) < _STATS_TTL
+    ):
         stats_dict = _stats_cache["data"]
     else:
         with db(readonly=True) as conn:
-            stats = conn.execute(
-                """SELECT
-                    COUNT(*) AS total,
-                    SUM(verdict = 'real') AS real_,
-                    SUM(verdict = 'false_positive') AS fp,
-                    SUM(verdict = 'uncertain') AS unc,
-                    SUM(human_verdict IS NOT NULL) AS reviewed,
-                    SUM(agreed = 1) AS agreed,
-                    SUM(agreed = 0) AS disagreed,
-                    SUM(model_used = 'prefilter') AS prefilter_count,
-                    SUM(model_used != 'prefilter') AS llm_count,
-                    SUM(processed_at >= datetime('now', '-24 hours')) AS today_total,
-                    SUM(model_used = 'prefilter' AND processed_at >= datetime('now', '-24 hours')) AS today_prefilter,
-                    SUM(model_used != 'prefilter' AND processed_at >= datetime('now', '-24 hours')) AS today_llm
-                    FROM triage_events"""
-            ).fetchone()
-        stats_dict = dict(stats)
+            stats_dict = get_dashboard_stats(conn)
+
         _stats_cache["data"] = stats_dict
         _stats_cache["ts"] = _now
 
@@ -234,8 +228,7 @@ _TIMELINE_TTL = 60.0  # seconds; hourly buckets don't change faster than this
 _spc_cache = {"data": None, "ts": 0.0}
 _SPC_TTL = 30.0  # seconds; anomalies arrive ~1-2/day, no need to re-query often
 _stats_cache = {"data": None, "ts": 0.0}
-_STATS_TTL = 30.0  # seconds; the all-time aggregate is a full-table scan, so cache
-                   # it rather than recomputing on every poll from every client.
+_STATS_TTL = 30.0  # seconds; share one bounded aggregate across concurrent polls
 
 @app.get("/api/timeline")
 def timeline():
