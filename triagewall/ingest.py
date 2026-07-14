@@ -85,12 +85,12 @@ signal.signal(signal.SIGINT, _handle_signal)
 
 
 def ensure_db_initialized():
-    if DB_PATH.exists():
-        return
-
+    """Create the database if needed and apply idempotent schema updates."""
     os.makedirs(DB_PATH.parent, exist_ok=True)
+
     schema_path = Path(__file__).parent / "schema.sql"
     schema_sql = schema_path.read_text()
+
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("PRAGMA busy_timeout=10000")
     try:
@@ -98,7 +98,8 @@ def ensure_db_initialized():
         conn.commit()
     finally:
         conn.close()
-    log.info("Initialized new database from schema.sql")
+
+    log.info("Ensured database schema and indexes from schema.sql")
 
 
 def load_position():
