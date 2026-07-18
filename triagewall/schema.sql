@@ -39,3 +39,12 @@ CREATE INDEX IF NOT EXISTS idx_triage_timestamp ON triage_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_triage_signature_id ON triage_events(signature_id);
 CREATE INDEX IF NOT EXISTS idx_triage_verdict ON triage_events(verdict);
 CREATE INDEX IF NOT EXISTS idx_triage_processed ON triage_events(processed_at);
+
+-- Complete input records that cannot be triaged are retained before the
+-- ingest checkpoint advances, so malformed or unsupported input is not lost.
+CREATE TABLE IF NOT EXISTS ingest_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_line TEXT NOT NULL,
+    error TEXT NOT NULL,
+    failed_at TEXT NOT NULL
+);

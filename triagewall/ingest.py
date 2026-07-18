@@ -117,6 +117,26 @@ def save_position(state):
     POSITION_PATH.write_text(json.dumps(state))
 
 
+def _line_is_complete(line):
+    """A JSON-Lines record is complete only after its newline is present."""
+    return bool(line) and line.endswith(("\n", "\r"))
+
+
+def quarantine_line(conn, line, error):
+    """Durably retain an unprocessable complete record before checkpointing."""
+    conn.rollback()
+    conn.execute(
+        "INSERT INTO ingest_failures (raw_line, error, failed_at) VALUES (?, ?, ?)",
+        (
+            line.rstrip("\r\n"),
+            str(error)[:1000],
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    log.error(f"Quarantined unprocessable eve.json record: {error}")
+
+
 def is_duplicate(conn, alert):
     """Check if we've already triaged this alert (flow_id + sig_id + timestamp)."""
     flow_id = alert.get("flow_id")
@@ -153,7 +173,8 @@ def insert_with_retry(conn, event, verdict, max_retries=3, base_backoff_ms=100):
                     time.sleep(sleep_time)
                 else:
                     logging.error(
-                        f"Failed to insert alert after {max_retries} attempts. Dropping event: {event.get('flow_id')}"
+                        f"Failed to insert alert after {max_retries} attempts; "
+                        f"quarantining event: {event.get('flow_id')}"
                     )
                     return False
             else:
@@ -162,15 +183,25 @@ def insert_with_retry(conn, event, verdict, max_retries=3, base_backoff_ms=100):
 
 def process_line(conn, line):
     """Parse one line, triage if it's an alert, return True if we did work."""
-    line = line.strip()
+    raw_line = line.rstrip("\r\n")
+    line = raw_line.strip()
     if not line:
         return False
     try:
         event = json.loads(line)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        quarantine_line(conn, raw_line, f"invalid JSON: {e}")
+        return False
+
+    if not isinstance(event, dict):
+        quarantine_line(conn, raw_line, "top-level JSON value must be an object")
         return False
 
     if event.get("event_type") != "alert":
+        return False
+
+    if not isinstance(event.get("alert"), dict):
+        quarantine_line(conn, raw_line, "alert event metadata must be an object")
         return False
 
     if is_duplicate(conn, event):
@@ -181,6 +212,7 @@ def process_line(conn, line):
     try:
         verdict = call_ollama(event)
         if not insert_with_retry(conn, event, verdict):
+            quarantine_line(conn, raw_line, "failed to persist triage result")
             return False
         # SPC behavioral baselining — independent observer, never fatal
         try:
@@ -193,7 +225,11 @@ def process_line(conn, line):
         )
         return True
     except Exception as e:
-        log.error(f"Failed to triage alert ({sig}): {type(e).__name__}: {e}")
+        quarantine_line(
+            conn,
+            raw_line,
+            f"failed to triage alert ({sig}): {type(e).__name__}: {e}",
+        )
         return False
 
 
@@ -337,6 +373,13 @@ def tail_file():
                             continue
 
                         # Same inode, waiting for more data.
+                        break
+
+                    if not _line_is_complete(line):
+                        # An append-in-place writer may expose a partial JSON
+                        # record at EOF. Leave the checkpoint unchanged so the
+                        # completed record is reread on the next poll.
+                        log.debug("Waiting for newline to complete eve.json record")
                         break
 
                     last_line_seen_ts = time.time()

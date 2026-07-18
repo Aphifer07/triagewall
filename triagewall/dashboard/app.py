@@ -9,14 +9,16 @@ Run:
     uvicorn triagewall.dashboard.app:app --host 0.0.0.0 --port 8084
 """
 import os
-import re
 import json
+import ipaddress
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, Body, Query
+from urllib.parse import urlsplit
+from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from triagewall.dashboard.stats import get_dashboard_stats
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -56,14 +58,59 @@ DB_PATH = Path(
     or "/var/lib/triagewall/triage.db"
 )
 STATIC_DIR = Path(__file__).parent / "static"
+TRUSTED_HOSTS = {
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("TRUSTED_HOSTS", "localhost").split(",")
+    if host.strip()
+}
 
 app = FastAPI(title="Triage Dashboard")
 
 # --- Helpers -----------------------------------------------------------------
 
+def _host_is_allowed(host_header):
+    """Allow localhost, IP literals, and explicitly configured DNS names."""
+    if not isinstance(host_header, str) or host_header != host_header.strip():
+        return False
+    try:
+        parsed = urlsplit(f"//{host_header}")
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if port is not None and not 1 <= port <= 65535:
+        return False
+    if not hostname:
+        return False
+    hostname = hostname.lower().rstrip(".")
+    if hostname in TRUSTED_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        return False
+
+
+@app.middleware("http")
+async def enforce_trusted_host(request: Request, call_next):
+    if not _host_is_allowed(request.headers.get("host", "")):
+        return PlainTextResponse("Invalid host header", status_code=400)
+    return await call_next(request)
+
+
+@contextmanager
 def db(readonly: bool = False):
     """
-    Return a SQLite connection.
+    Yield a SQLite connection and always close it after the request operation.
     - readonly=True → open in read-only mode for polling endpoints
     - readonly=False → standard read-write connection (used for feedback)
     """
@@ -74,18 +121,24 @@ def db(readonly: bool = False):
         conn = sqlite3.connect(DB_PATH, timeout=30.0)
         conn.execute("PRAGMA busy_timeout=10000")
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def mask_ip(ip):
     """Mask the last two octets of internal IPs in demo mode."""
     if not ip or MODE != "demo":
         return ip
-    # RFC1918 ranges we care about: 10.0.0.0/8, 192.168.0.0/16
-    m = re.match(r"^(10|192\.168)\.(\d+)\.(\d+)\.(\d+)$", ip)
-    if m:
-        prefix = m.group(1)
-        return f"{prefix}.x.x.x" if prefix == "10" else f"192.168.x.x"
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if address in ipaddress.ip_network("10.0.0.0/8"):
+        return "10.x.x.x"
+    if address in ipaddress.ip_network("192.168.0.0/16"):
+        return "192.168.x.x"
     return ip
 
 
@@ -94,8 +147,10 @@ def row_to_dict(row):
     if MODE == "demo":
         d["src_ip"] = mask_ip(d.get("src_ip"))
         d["dest_ip"] = mask_ip(d.get("dest_ip"))
-        # Don't leak the raw alert JSON in demo mode
+        # Demo responses contain no stored alert/model/analyst free text.
         d["raw_alert"] = None
+        d["reasoning"] = None
+        d["human_notes"] = None
     return d
 
 
@@ -336,10 +391,10 @@ def spc_anomalies():
         out["anomalies"].append({
             "detected_at": ts,
             "feature": r["feature"],
-            "ip": r["ip"],
+            "ip": mask_ip(r["ip"]),
             "signature_id": r["signature_id"],
             "z": r["z"],
-            "note": r["note"],
+            "note": None if MODE == "demo" else r["note"],
         })
     out["count_24h"] = int(last24 or 0)
 
