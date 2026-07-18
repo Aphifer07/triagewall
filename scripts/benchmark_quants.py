@@ -237,6 +237,13 @@ def safe_filename(model_name):
     return model_name.replace("/", "_").replace(":", "_").replace(".", "_")
 
 
+def sanitize_csv_cell(value):
+    """Neutralize spreadsheet formula prefixes in attacker/model text."""
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r", "\n")):
+        return "'" + value
+    return value
+
+
 def load_existing(csv_path):
     """For resumability — return set of alert IDs already in the CSV."""
     if not csv_path.exists():
@@ -295,7 +302,9 @@ def benchmark_model(model, alerts, ollama_url, out_dir, skip_existing=True):
                 "total_duration_ns": body.get("total_duration", 0) or 0,
                 "tokens_per_sec": round(tps, 2),
                 "error": err or "",
-                "reasoning": (verdict["reasoning"] if verdict else "")[:500],
+                "reasoning": sanitize_csv_cell(
+                    (verdict["reasoning"] if verdict else "")[:500]
+                ),
             }
             writer.writerow(row)
             f.flush()

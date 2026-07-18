@@ -144,25 +144,24 @@ def prefilter_verdict(alert):
         }
     return None
 
-import re as _re
-
-def _salvage_truncated(raw):
-    """Recover verdict/confidence from a JSON response truncated mid-reasoning.
-    format=json guarantees the prefix is valid, so verdict/confidence (which
-    come first) are usually intact even when the reasoning string is cut off."""
-    v = _re.search(r'"verdict"\s*:\s*"(false_positive|real|uncertain)"', raw)
-    c = _re.search(r'"confidence"\s*:\s*([0-9.]+)', raw)
-    if v:
-        try:
-            conf = float(c.group(1)) if c else 0.5
-        except (ValueError, AttributeError):
-            conf = 0.5
-        return {"verdict": v.group(1), "confidence": conf,
-                "reasoning": "(reasoning truncated; verdict salvaged from partial output)",
-                "parse_degraded": True}
-    # nothing usable
+def _invalid_model_response(reason):
+    """Fail closed when model output is not exactly the expected JSON schema."""
     return {"verdict": "uncertain", "confidence": 0.0,
-            "reasoning": f"Failed to parse model output: {raw[:200]}"}
+            "reasoning": reason, "model_used": MODEL}
+
+
+def _contains_canary(value):
+    """Scan decoded JSON strings (including keys) for the process canary."""
+    if isinstance(value, str):
+        return CANARY_TOKEN in value
+    if isinstance(value, dict):
+        return any(
+            _contains_canary(key) or _contains_canary(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_canary(item) for item in value)
+    return False
 
 
 def call_ollama(alert: dict) -> dict:
@@ -190,10 +189,20 @@ def call_ollama(alert: dict) -> dict:
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
         body = json.loads(resp.read().decode("utf-8"))
 
-    raw_response = body.get("response", "").strip()
+    if not isinstance(body, dict) or not isinstance(body.get("response"), str):
+        return _invalid_model_response("Ollama returned an invalid response envelope.")
+    raw_response = body["response"].strip()
 
-    # Security check: canary token leakage indicates prompt injection
-    if CANARY_TOKEN in raw_response:
+    # Parse the entire response before trusting any field. Invalid/truncated
+    # JSON must never be regex-salvaged into an accepted verdict.
+    try:
+        verdict = json.loads(raw_response)
+    except json.JSONDecodeError:
+        return _invalid_model_response("Failed to parse complete model JSON output.")
+
+    # Security check: scan both the transport representation and decoded JSON,
+    # since JSON escapes can hide a literal-token match before decoding.
+    if CANARY_TOKEN in raw_response or _contains_canary(verdict):
         sid = alert.get("alert", {}).get("signature_id", "?")
         sig = alert.get("alert", {}).get("signature", "?")
         src = alert.get("src_ip", "?")
@@ -205,35 +214,30 @@ def call_ollama(alert: dict) -> dict:
             "model_used": MODEL,
         }
 
-    # Parse JSON response
-    try:
-        verdict = json.loads(raw_response)
-    except json.JSONDecodeError:
-        # Truncated output (hit num_predict) breaks JSON at the END, in the
-        # reasoning string. verdict/confidence come first and are usually
-        # recoverable, so salvage them rather than discarding the whole result.
-        verdict = _salvage_truncated(raw_response)
+    if not isinstance(verdict, dict):
+        return _invalid_model_response("Model response must be a JSON object.")
 
-    # Reject responses with unexpected keys (only allow our schema)
-    # parse_degraded is an internal flag set by our salvage path, not the model
-    allowed_keys = {"verdict", "confidence", "reasoning", "parse_degraded"}
-    extra_keys = set(verdict.keys()) - allowed_keys
-    if extra_keys:
-        verdict = {"verdict": "uncertain", "confidence": 0.0,
-                   "reasoning": f"Response contained unexpected keys: {extra_keys}. Possible prompt injection."}
+    required_keys = {"verdict", "confidence", "reasoning"}
+    if set(verdict) != required_keys:
+        return _invalid_model_response(
+            "Model response did not match the required response schema."
+        )
 
     # Normalize/validate verdict enum
     if verdict.get("verdict") not in ("false_positive", "real", "uncertain"):
-        verdict["verdict"] = "uncertain"
+        return _invalid_model_response("Model response contained an invalid verdict.")
 
     # Clamp confidence
     try:
-        verdict["confidence"] = max(0.0, min(1.0, float(verdict.get("confidence", 0.0))))
+        if isinstance(verdict.get("confidence"), bool):
+            raise TypeError("boolean confidence")
+        verdict["confidence"] = max(0.0, min(1.0, float(verdict["confidence"])))
     except (TypeError, ValueError):
-        verdict["confidence"] = 0.0
+        return _invalid_model_response("Model response contained invalid confidence.")
 
-    # Truncate reasoning
-    verdict["reasoning"] = str(verdict.get("reasoning", ""))[:1000]
+    if not isinstance(verdict.get("reasoning"), str):
+        return _invalid_model_response("Model response contained invalid reasoning.")
+    verdict["reasoning"] = verdict["reasoning"][:1000]
 
     return verdict
 

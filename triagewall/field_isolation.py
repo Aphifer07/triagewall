@@ -126,10 +126,10 @@ TRUSTED_PATHS = {
     "tls.ja3s.hash": ("string",),
     "tls.ja3s.string": ("string",),
     "tls.ja4": ("string",),
-    "tls.client_alpns": ("string",),
+    # client_alpns is intentionally not trusted: its string elements originate
+    # on the wire and must be isolated individually.
 
-    # --- HTTP structured fields. hostname/url/user_agent/content_type wrap. ---
-    "http.http_method": ("string",),
+    # --- HTTP structured fields. hostname/url/user_agent/content_type/method wrap. ---
     "http.length": ("number",),
     "http.protocol": ("string",),
     "http.status": ("number",),
@@ -197,7 +197,18 @@ def _walk(obj, path: str = ""):
                     result[key] = _wrap_value(new_path, value)
         return result
     if isinstance(obj, list):
-        return [_walk(item, path) for item in obj]
+        result = []
+        for index, item in enumerate(obj):
+            item_path = f"{path}.{index}" if path else str(index)
+            if isinstance(item, (dict, list)):
+                result.append(_walk(item, item_path))
+            else:
+                norm = _normalize_path(item_path)
+                if _is_trusted(norm, item):
+                    result.append(item)
+                else:
+                    result.append(_wrap_value(item_path, item))
+        return result
     return obj
 
 

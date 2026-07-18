@@ -45,6 +45,7 @@ services:
       MODE: ${MODE:-local}
       DASHBOARD_HOST: ${DASHBOARD_HOST:-0.0.0.0}
       DASHBOARD_PORT: ${DASHBOARD_PORT:-8084}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost}
     volumes:
       - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
     ports:
