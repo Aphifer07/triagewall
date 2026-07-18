@@ -123,12 +123,16 @@ class IngestDurabilityTests(unittest.TestCase):
     def test_unterminated_record_is_not_complete_until_newline_arrives(self):
         stream = io.StringIO('{"event_type":"alert"}')
         line = stream.readline()
-        self.assertFalse(ingest._line_is_complete(line))
+        with patch.object(ingest.time, "sleep") as sleep:
+            self.assertFalse(ingest._line_is_complete_or_wait(line))
+            sleep.assert_called_once_with(ingest.POLL_INTERVAL)
 
         stream.seek(0, io.SEEK_END)
         stream.write("\n")
         stream.seek(0)
-        self.assertTrue(ingest._line_is_complete(stream.readline()))
+        with patch.object(ingest.time, "sleep") as sleep:
+            self.assertTrue(ingest._line_is_complete_or_wait(stream.readline()))
+            sleep.assert_not_called()
 
 
 class DashboardBoundaryTests(unittest.TestCase):
