@@ -122,6 +122,15 @@ def _line_is_complete(line):
     return bool(line) and line.endswith(("\n", "\r"))
 
 
+def _line_is_complete_or_wait(line):
+    """Return whether a record is complete, backing off before retrying if not."""
+    if _line_is_complete(line):
+        return True
+    log.debug("Waiting for newline to complete eve.json record")
+    time.sleep(POLL_INTERVAL)
+    return False
+
+
 def quarantine_line(conn, line, error):
     """Durably retain an unprocessable complete record before checkpointing."""
     conn.rollback()
@@ -375,11 +384,10 @@ def tail_file():
                         # Same inode, waiting for more data.
                         break
 
-                    if not _line_is_complete(line):
+                    if not _line_is_complete_or_wait(line):
                         # An append-in-place writer may expose a partial JSON
                         # record at EOF. Leave the checkpoint unchanged so the
                         # completed record is reread on the next poll.
-                        log.debug("Waiting for newline to complete eve.json record")
                         break
 
                     last_line_seen_ts = time.time()
