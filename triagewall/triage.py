@@ -22,6 +22,7 @@ import urllib.error
 from asset_inventory import canonical_json, load_configured_inventory
 from field_isolation import format_alert_for_llm
 from database import connect_database
+from prefilter import PrefilterPolicy
 from time_utils import format_utc_timestamp, utc_now_iso
 # --- Config ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -121,18 +122,20 @@ Trusted Suricata metadata (signature_id, category, severity, proto, src_ip, dest
 PREFILTER_CONFIG_PATH = Path(__file__).parent / "config" / "prefilter.json"
 
 def load_prefilter():
-    """Load the prefilter config. Returns dict mapping signature_id -> reason string."""
+    """Load and validate the prefilter policy once at process startup."""
     if not PREFILTER_CONFIG_PATH.exists():
-        return {}
-    config = json.loads(PREFILTER_CONFIG_PATH.read_text())
-    sid_to_reason = {}
-    for rule in config.get("auto_false_positive", []):
-        for sid in rule.get("signature_ids", []):
-            sid_to_reason[sid] = rule.get("reason", "Auto-classified as false_positive")
-    return sid_to_reason
+        return PrefilterPolicy.empty()
+    return PrefilterPolicy.load(PREFILTER_CONFIG_PATH)
 
-PREFILTER_SIDS = load_prefilter()
-print(f"[triage] Loaded prefilter for SIDs: {sorted(PREFILTER_SIDS.keys())}", flush=True)
+PREFILTER_POLICY = load_prefilter()
+# Retain the public SID collection for existing integrations and diagnostics.
+PREFILTER_SIDS = PREFILTER_POLICY.signature_ids
+PREFILTER_SCOPED_RULES = sum(rule.match is not None for rule in PREFILTER_POLICY.rules)
+print(
+    f"[triage] Loaded prefilter: rules={len(PREFILTER_POLICY.rules)} "
+    f"scoped={PREFILTER_SCOPED_RULES} SIDs={sorted(PREFILTER_SIDS)}",
+    flush=True,
+)
 
 ASSET_INVENTORY = load_configured_inventory()
 print(
@@ -149,15 +152,12 @@ def get_asset_context(alert):
 
 def prefilter_verdict(alert, asset_context=None):
     """Return a verdict dict if the alert matches a prefilter rule, else None."""
-    # The context is intentionally accepted at this boundary for future policy
-    # work, but v0.3 does not change any existing prefilter decision.
-    del asset_context
-    sid = alert.get("alert", {}).get("signature_id")
-    if sid in PREFILTER_SIDS:
+    reason = PREFILTER_POLICY.match_reason(alert, asset_context)
+    if reason is not None:
         return {
             "verdict": "false_positive",
             "confidence": 0.99,
-            "reasoning": PREFILTER_SIDS[sid],
+            "reasoning": reason,
             "model_used": "prefilter",
         }
     return None

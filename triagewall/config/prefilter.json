@@ -1,4 +1,10 @@
 {
+  "version": 1,
+  "internal_cidrs": [
+    "10.0.0.0/24",
+    "10.0.1.0/24",
+    "10.0.2.0/24"
+  ],
   "auto_false_positive": [
     {
       "signature_ids": [
@@ -9,11 +15,23 @@
     },
     {
       "signature_ids": [2019102],
-      "reason": "ET DOS Possible SSDP Amplification Scan - rule fires on internal-to-internal SSDP/UPnP discovery (Windows Network Discovery, smart TVs, IoT devices announcing themselves). True amplification attacks target external IPs at high volume; internal SSDP at normal rates is benign. Confirmed by 95+ samples on this network."
+      "reason": "ET DOS Possible SSDP Amplification Scan - internal UDP discovery to port 1900 is normal SSDP/UPnP traffic, not an external amplification attack.",
+      "match": {
+        "network_directions": ["internal_to_internal"],
+        "flow_directions": ["to_server"],
+        "protocols": ["udp"],
+        "destination_ports": [1900]
+      }
     },
     {
       "signature_ids": [2000538],
-      "reason": "ET SCAN NMAP -sA - 2010-era rule that fires on TCP ACK packets matching specific flag patterns. Frequently triggered by the return half of legitimate HTTPS connections (external server's port 443 responding to internal client's ephemeral port). Not actual NMAP scan activity in most cases. Recommend leaving on prefilter unless your network expects external scan attempts."
+      "reason": "ET SCAN NMAP -sA - scoped to inbound TCP response traffic from source port 443 to an internal client, the common false-positive shape for the return half of HTTPS connections.",
+      "match": {
+        "network_directions": ["external_to_internal"],
+        "flow_directions": ["to_client"],
+        "protocols": ["tcp"],
+        "source_ports": [443]
+      }
     },
     {
       "signature_ids": [2035463, 2060503, 2060504, 2060505],

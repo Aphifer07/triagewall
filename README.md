@@ -124,18 +124,46 @@ Avoid models that exceed your VRAM. CPU partial-offload causes 10x slower, highl
 
 How tuning works
 
-The first day of running Triagewall on a new network is mostly about populating `prefilter.json` with site-specific noise. The dashboard surfaces which signatures dominate your LLM workload; adding them to the prefilter takes seconds and gives a permanent classification with documented reasoning. After initial tuning, the LLM handles only the long tail of genuinely novel signatures.
+The first day of running Triagewall on a new network is mostly about populating `prefilter.json` with site-specific noise. The dashboard surfaces which signatures dominate your LLM workload; adding carefully scoped rules to the prefilter reduces repeat model work while retaining documented reasoning. Triagewall validates and loads this file once at ingest startup, so restart ingest after changing it. Invalid configuration fails startup instead of silently widening a suppression.
 
-Example prefilter entry from this repo's production config:
+The versioned policy declares the networks considered internal and supports optional match conditions for network direction, Suricata flow direction, protocol, source/destination ports, source/destination CIDRs, and source/destination asset inventory fields. Every condition in `match` must pass; multiple values within one condition are alternatives. If required alert or asset context is missing or malformed, the rule does not suppress the alert and normal LLM triage continues.
 
-```
+Example scoped entries:
+
+```json
 {
-  "signature_ids": [2009205, 2009206, 2009207, 2009208],
-  "reason": "Legacy ET MALWARE Conficker/KEYPLUG P2P UDP signatures (2009-era) match modern STUN traffic to Microsoft Azure STUN servers (20.202.0.0/16:3478) used by Teams, Xbox Live, Skype, and Tailscale DERP relays. Confirmed false positive — same UDP packet shape, different intent. Empirically validated: 149 alerts processed without prefilter, v0.2 Foundation-Sec misclassified 100% as 'real' due to ET MALWARE category prior. The LLM lacks per-signature historical context that this signature now fires on modern legitimate STUN traffic. Resolved via prefilter pending v0.3 RAG layer."
+  "version": 1,
+  "internal_cidrs": ["10.0.0.0/24", "10.0.1.0/24"],
+  "auto_false_positive": [
+    {
+      "signature_ids": [2019102],
+      "reason": "Internal UDP discovery to port 1900 is normal SSDP/UPnP traffic.",
+      "match": {
+        "network_directions": ["internal_to_internal"],
+        "flow_directions": ["to_server"],
+        "protocols": ["udp"],
+        "destination_ports": [1900]
+      }
+    },
+    {
+      "signature_ids": [2000538],
+      "reason": "Inbound HTTPS response traffic to an internal client.",
+      "match": {
+        "network_directions": ["external_to_internal"],
+        "flow_directions": ["to_client"],
+        "protocols": ["tcp"],
+        "source_ports": [443],
+        "destination_asset": {
+          "matched": true,
+          "criticalities": ["low", "medium", "high", "critical"]
+        }
+      }
+    }
+  ]
 }
 ```
 
-These reason strings double as documentation of *why* a SID is suppressed on your network — useful when reviewing the prefilter months later, or when sharing tuning notes with others.
+Asset selectors support `matched`, `hostnames`, `roles`, `criticalities`, and `internet_facing`. The shipped NMAP-ACK rule does not require an inventory match so a validated empty inventory remains usable; the asset selector above illustrates how an operator can make it stricter. Rules without `match` remain supported for backward compatibility and still suppress globally by SID, so migrate them deliberately as you gather reliable context. Reason strings double as documentation of *why* a rule is suppressed on your network.
 
 ## Network visibility (be honest about what your IDS sees)
 
