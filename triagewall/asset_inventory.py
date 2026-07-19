@@ -13,6 +13,9 @@ from typing import Any
 
 
 MAX_INVENTORY_BYTES = 1024 * 1024
+MAX_IPS_PER_ASSET = 64
+MAX_EXPOSED_PORTS_PER_ASSET = 64
+MAX_ASSET_CONTEXT_BYTES = 2048
 INVENTORY_VERSION = 1
 CRITICALITIES = {"low", "medium", "high", "critical"}
 PROTOCOLS = {"tcp", "udp"}
@@ -90,6 +93,10 @@ def _validate_asset(value: Any, index: int) -> dict[str, Any]:
     raw_ips = value["ips"]
     if not isinstance(raw_ips, list) or not raw_ips:
         raise AssetInventoryError(f"{location}.ips must be a non-empty array")
+    if len(raw_ips) > MAX_IPS_PER_ASSET:
+        raise AssetInventoryError(
+            f"{location}.ips exceeds the {MAX_IPS_PER_ASSET}-address limit"
+        )
     normalized_ips = []
     local_ips = set()
     for ip_index, raw_ip in enumerate(raw_ips):
@@ -118,6 +125,11 @@ def _validate_asset(value: Any, index: int) -> dict[str, Any]:
     raw_ports = value["exposed_ports"]
     if not isinstance(raw_ports, list):
         raise AssetInventoryError(f"{location}.exposed_ports must be an array")
+    if len(raw_ports) > MAX_EXPOSED_PORTS_PER_ASSET:
+        raise AssetInventoryError(
+            f"{location}.exposed_ports exceeds the "
+            f"{MAX_EXPOSED_PORTS_PER_ASSET}-entry limit"
+        )
     ports = []
     port_pairs = set()
     for port_index, raw_port in enumerate(raw_ports):
@@ -130,7 +142,7 @@ def _validate_asset(value: Any, index: int) -> dict[str, Any]:
         port_pairs.add(pair)
         ports.append(port)
 
-    return {
+    asset = {
         "hostname": hostname,
         "role": role,
         "ips": sorted(normalized_ips, key=_ip_sort_key),
@@ -138,6 +150,21 @@ def _validate_asset(value: Any, index: int) -> dict[str, Any]:
         "internet_facing": internet_facing,
         "exposed_ports": sorted(ports, key=lambda item: (item["protocol"], item["port"])),
     }
+    snapshot_for_size = {
+        **asset,
+        "inventory_revision": "sha256:" + ("0" * 64),
+    }
+    worst_case_context = {
+        "source": snapshot_for_size,
+        "destination": snapshot_for_size,
+    }
+    context_bytes = len(canonical_json(worst_case_context).encode("utf-8"))
+    if context_bytes > MAX_ASSET_CONTEXT_BYTES:
+        raise AssetInventoryError(
+            f"{location} exceeds the {MAX_ASSET_CONTEXT_BYTES}-byte "
+            "two-sided prompt context limit"
+        )
+    return asset
 
 
 @dataclass(frozen=True)
