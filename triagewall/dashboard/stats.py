@@ -1,7 +1,9 @@
 """Bounded statistics queries for the dashboard."""
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
+
+from triagewall.time_utils import format_utc_timestamp, utc_now
 
 
 STATS_WINDOW_HOURS = 24
@@ -35,12 +37,12 @@ SELECT COALESCE(
 
 def get_dashboard_stats(conn: sqlite3.Connection) -> dict[str, int]:
     """Return 24-hour dashboard statistics and the lifetime event total."""
-    cutoff = datetime.now(timezone.utc) - timedelta(
+    cutoff = utc_now() - timedelta(
         hours=STATS_WINDOW_HOURS
     )
     window = conn.execute(
         WINDOW_STATS_SQL,
-        (cutoff.isoformat(),),
+        (format_utc_timestamp(cutoff),),
     ).fetchone()
     lifetime = conn.execute(LIFETIME_TOTAL_SQL).fetchone()
 

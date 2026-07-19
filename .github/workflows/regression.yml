@@ -41,6 +41,7 @@ jobs:
           tests.test_dashboard_stats
           tests.test_ingest_checkpoint
           tests.test_security_regressions
+          tests.test_timestamps
 
       - name: Run SPC regressions
         run: PYTHONPATH=. python tests/test_spc.py

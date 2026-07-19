@@ -15,12 +15,12 @@ import json
 import secrets
 import sqlite3
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 import urllib.request
 import urllib.error
 from field_isolation import format_alert_for_llm
 from database import connect_database
+from time_utils import format_utc_timestamp, utc_now_iso
 # --- Config ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_URL = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
@@ -253,7 +253,7 @@ def insert_triage_row(conn: sqlite3.Connection, alert: dict, verdict: dict) -> N
             raw_alert, verdict, confidence, reasoning, model_used, processed_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            alert.get("timestamp"),
+            format_utc_timestamp(alert.get("timestamp")),
             alert.get("flow_id"),
             alert.get("src_ip"),
             alert.get("src_port"),
@@ -272,7 +272,7 @@ def insert_triage_row(conn: sqlite3.Connection, alert: dict, verdict: dict) -> N
             verdict["confidence"],
             verdict["reasoning"],
             verdict.get("model_used", MODEL),
-            datetime.now(timezone.utc).isoformat(),
+            utc_now_iso(),
         ),
     )
     conn.commit()

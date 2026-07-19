@@ -28,7 +28,15 @@ sqlite3 connection from the caller so it shares the ingest transaction context.
 import ipaddress
 import logging
 import math
-from datetime import datetime, timezone
+
+try:
+    from .time_utils import (
+        format_utc_timestamp,
+        parse_utc_timestamp,
+        utc_now_iso,
+    )
+except ImportError:  # Direct script-style import used by ingest.py.
+    from time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -123,16 +131,15 @@ def extract(event):
 # --- helpers ---
 
 def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_iso()
 
 
 def _bucket_key(ts_iso):
     """Truncate an ISO timestamp to the hour bucket. Falls back to now."""
     try:
-        # Suricata timestamps look like 2026-06-05T14:38:55.230939+0000
-        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        dt = parse_utc_timestamp(ts_iso)
     except (ValueError, AttributeError, TypeError):
-        dt = datetime.now(timezone.utc)
+        dt = parse_utc_timestamp(_now_iso())
     return dt.strftime(RATE_BUCKET)
 
 
@@ -169,7 +176,10 @@ def observe(conn, event):
         return None
     ip = feat["ip"]
     sig_id = feat["signature_id"]
-    ts = feat["timestamp"] or _now_iso()
+    try:
+        ts = format_utc_timestamp(feat["timestamp"])
+    except (TypeError, ValueError):
+        ts = _now_iso()
     bucket = _bucket_key(ts)
     # Drive all time reasoning off the EVENT timestamp, not the wall clock, so
     # SPC behaves identically on live and on replayed/backfilled data.
@@ -289,8 +299,8 @@ def observe(conn, event):
 
 def _age_hours(first_seen_iso, now_iso):
     try:
-        a = datetime.fromisoformat(first_seen_iso.replace("Z", "+00:00"))
-        b = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        a = parse_utc_timestamp(first_seen_iso)
+        b = parse_utc_timestamp(now_iso)
         return (b - a).total_seconds() / 3600.0
     except (ValueError, AttributeError, TypeError):
         return 0.0
