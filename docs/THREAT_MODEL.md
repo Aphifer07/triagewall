@@ -154,8 +154,9 @@ stall the LLM tier. Field-size capping is planned for v0.2.1.
 - The host running Triagewall is trusted and not already compromised.
 - The network segment between ingest, Ollama, SQLite, and the dashboard is
   trusted.
-- Suricata's ruleset and the prefilter config are trusted inputs, controlled by
-  the operator.
+- Suricata's ruleset, the prefilter config, and the mounted asset inventory are
+  trusted inputs controlled by the operator. Asset context is supplied only in
+  the LLM system prompt, and demo API responses redact it on both traffic sides.
 - The operator is a single trusted user; there is no multi-user authorization
   model.
 - The deployment is not exposed to the public internet.

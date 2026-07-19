@@ -59,7 +59,60 @@ def create_existing_database_without_indexes(db_path: Path) -> None:
         conn.close()
 
 
+def create_legacy_database_without_asset_columns(db_path: Path) -> None:
+    """Create the pre-v0.3 schema with a historical verdict row."""
+    schema_sql = (PROJECT_ROOT / "triagewall" / "schema.sql").read_text()
+    schema_sql = schema_sql.replace(
+        "    src_asset_snapshot_id INTEGER,\n"
+        "    dest_asset_snapshot_id INTEGER,\n",
+        "",
+    )
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(schema_sql)
+        conn.execute(
+            """INSERT INTO triage_events
+               (timestamp, signature_id, signature, raw_alert, verdict)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("2026-01-01T00:00:00Z", 42, "Historical", "{}", "uncertain"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class DatabaseStartupTests(unittest.TestCase):
+    def test_existing_database_receives_idempotent_asset_metadata_migration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "triage.db"
+            create_legacy_database_without_asset_columns(db_path)
+
+            with patch.object(ingest, "DB_PATH", db_path):
+                ingest.ensure_db_initialized()
+                ingest.ensure_db_initialized()
+
+            conn = sqlite3.connect(db_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info('triage_events')")
+                }
+                historical = conn.execute(
+                    """SELECT src_asset_snapshot_id, dest_asset_snapshot_id
+                       FROM triage_events WHERE signature_id = 42"""
+                ).fetchone()
+                snapshot_table = conn.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type = 'table' AND name = 'asset_snapshots'"""
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertIn("src_asset_snapshot_id", columns)
+            self.assertIn("dest_asset_snapshot_id", columns)
+            self.assertEqual(historical, (None, None))
+            self.assertEqual(snapshot_table, ("asset_snapshots",))
+
     def test_existing_database_receives_indexes_without_data_loss(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "triage.db"

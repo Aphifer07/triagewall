@@ -55,7 +55,7 @@ _load_dotenv(override=False)
 
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
-from triage import call_ollama, insert_triage_row, MODEL
+from triage import call_ollama, get_asset_context, insert_triage_row, MODEL
 
 # --- Config ---
 DEMO_MODE = os.environ.get("DEMO_MODE", "false").strip().lower() == "true"
@@ -113,6 +113,17 @@ def ensure_db_initialized():
     conn = connect_database(DB_PATH)
     try:
         conn.executescript(schema_sql)
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info('triage_events')")
+        }
+        for column_name in (
+            "src_asset_snapshot_id",
+            "dest_asset_snapshot_id",
+        ):
+            if column_name not in existing_columns:
+                conn.execute(
+                    f"ALTER TABLE triage_events ADD COLUMN {column_name} INTEGER"
+                )
         conn.commit()
     finally:
         conn.close()
@@ -181,14 +192,26 @@ def is_duplicate(conn, alert):
     return row is not None
 
 
-def insert_with_retry(conn, event, verdict, max_retries=3, base_backoff_ms=100):
+def insert_with_retry(
+    conn,
+    event,
+    verdict,
+    asset_context=None,
+    max_retries=3,
+    base_backoff_ms=100,
+):
     """
     Insert a triage row with simple exponential backoff on SQLite 'database is locked' errors.
     Returns True on success, False if we give up after max_retries.
     """
     for attempt in range(max_retries):
         try:
-            insert_triage_row(conn, event, verdict)
+            insert_triage_row(
+                conn,
+                event,
+                verdict,
+                asset_context=asset_context,
+            )
             conn.commit()
             return True
         except sqlite3.OperationalError as e:
@@ -245,8 +268,14 @@ def process_line(conn, line):
 
     sig = event.get("alert", {}).get("signature", "?")
     try:
-        verdict = call_ollama(event)
-        if not insert_with_retry(conn, event, verdict):
+        asset_context = get_asset_context(event)
+        verdict = call_ollama(event, asset_context=asset_context)
+        if not insert_with_retry(
+            conn,
+            event,
+            verdict,
+            asset_context=asset_context,
+        ):
             log.error(
                 f"Failed to persist alert ({sig}); retrying without advancing checkpoint"
             )

@@ -146,6 +146,22 @@ def mask_ip(ip):
 
 def row_to_dict(row):
     d = dict(row)
+    src_asset_json = d.pop("src_asset_json", None)
+    dest_asset_json = d.pop("dest_asset_json", None)
+
+    def parse_snapshot(value):
+        if not isinstance(value, str):
+            return None
+        try:
+            snapshot = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return snapshot if isinstance(snapshot, dict) else None
+
+    d["asset_context"] = {
+        "source": parse_snapshot(src_asset_json),
+        "destination": parse_snapshot(dest_asset_json),
+    }
     for field in ("timestamp", "processed_at", "reviewed_at"):
         if d.get(field):
             try:
@@ -159,6 +175,7 @@ def row_to_dict(row):
         d["raw_alert"] = None
         d["reasoning"] = None
         d["human_notes"] = None
+        d["asset_context"] = {"source": None, "destination": None}
     return d
 
 
@@ -174,27 +191,37 @@ def list_verdicts(
     """Return a paginated list of verdicts plus summary stats."""
     where, params = [], []
     if verdict in ("real", "false_positive", "uncertain"):
-        where.append("verdict = ?")
+        where.append("events.verdict = ?")
         params.append(verdict)
     if signature:
-        where.append("signature LIKE ?")
+        where.append("events.signature LIKE ?")
         params.append(f"%{signature}%")
     if model == "llm":
-        where.append("model_used != 'prefilter'")
+        where.append("events.model_used != 'prefilter'")
     elif model == "prefilter":
-        where.append("model_used = 'prefilter'")
+        where.append("events.model_used = 'prefilter'")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     # Use a read-only connection for the high-frequency polling endpoint to reduce
     # lock contention with the ingest daemon.
     with db(readonly=True) as conn:
         rows = conn.execute(
-            f"""SELECT id, timestamp, src_ip, src_port, dest_ip, dest_port, proto,
-                       signature_id, signature, category, severity,
-                       verdict, confidence, reasoning, model_used, processed_at,
-                       human_verdict, human_notes, agreed, reviewed_at
-                FROM triage_events {where_sql}
-                ORDER BY processed_at DESC NULLS LAST, id DESC
+            f"""SELECT events.id, events.timestamp, events.src_ip, events.src_port,
+                       events.dest_ip, events.dest_port, events.proto,
+                       events.signature_id, events.signature, events.category,
+                       events.severity, events.verdict, events.confidence,
+                       events.reasoning, events.model_used, events.processed_at,
+                       events.human_verdict, events.human_notes, events.agreed,
+                       events.reviewed_at,
+                       src_snapshot.asset_json AS src_asset_json,
+                       dest_snapshot.asset_json AS dest_asset_json
+                FROM triage_events AS events
+                LEFT JOIN asset_snapshots AS src_snapshot
+                  ON src_snapshot.id = events.src_asset_snapshot_id
+                LEFT JOIN asset_snapshots AS dest_snapshot
+                  ON dest_snapshot.id = events.dest_asset_snapshot_id
+                {where_sql}
+                ORDER BY events.processed_at DESC NULLS LAST, events.id DESC
                 LIMIT ?""",
             params + [limit],
         ).fetchall()

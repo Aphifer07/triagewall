@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS triage_events (
     reasoning TEXT,
     model_used TEXT,
     processed_at TEXT,
+    src_asset_snapshot_id INTEGER,
+    dest_asset_snapshot_id INTEGER,
     
     -- Human feedback
     human_verdict TEXT,
@@ -47,4 +49,13 @@ CREATE TABLE IF NOT EXISTS ingest_failures (
     raw_line TEXT NOT NULL,
     error TEXT NOT NULL,
     failed_at TEXT NOT NULL
+);
+
+-- Canonical operator context used for a verdict. Each JSON document contains
+-- the full inventory revision so later inventory edits cannot rewrite history.
+CREATE TABLE IF NOT EXISTS asset_snapshots (
+    id INTEGER PRIMARY KEY,
+    snapshot_hash TEXT NOT NULL UNIQUE,
+    asset_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );

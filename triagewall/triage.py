@@ -12,12 +12,14 @@ Usage:
 import os
 import sys
 import json
+import hashlib
 import secrets
 import sqlite3
 import time
 from pathlib import Path
 import urllib.request
 import urllib.error
+from asset_inventory import canonical_json, load_configured_inventory
 from field_isolation import format_alert_for_llm
 from database import connect_database
 from time_utils import format_utc_timestamp, utc_now_iso
@@ -132,9 +134,24 @@ def load_prefilter():
 PREFILTER_SIDS = load_prefilter()
 print(f"[triage] Loaded prefilter for SIDs: {sorted(PREFILTER_SIDS.keys())}", flush=True)
 
+ASSET_INVENTORY = load_configured_inventory()
+print(
+    f"[triage] Loaded asset inventory: version={ASSET_INVENTORY.version} "
+    f"assets={ASSET_INVENTORY.count} revision={ASSET_INVENTORY.revision}",
+    flush=True,
+)
 
-def prefilter_verdict(alert):
+
+def get_asset_context(alert):
+    """Resolve the exact source and destination asset snapshots for an alert."""
+    return ASSET_INVENTORY.resolve_alert(alert)
+
+
+def prefilter_verdict(alert, asset_context=None):
     """Return a verdict dict if the alert matches a prefilter rule, else None."""
+    # The context is intentionally accepted at this boundary for future policy
+    # work, but v0.3 does not change any existing prefilter decision.
+    del asset_context
     sid = alert.get("alert", {}).get("signature_id")
     if sid in PREFILTER_SIDS:
         return {
@@ -165,16 +182,34 @@ def _contains_canary(value):
     return False
 
 
-def call_ollama(alert: dict) -> dict:
+def _system_prompt_with_asset_context(asset_context: dict) -> str:
+    """Append operator-managed context to the trusted system-message boundary."""
+    if not asset_context.get("source") and not asset_context.get("destination"):
+        return SYSTEM_PROMPT
+    context_json = canonical_json(asset_context)
+    return (
+        SYSTEM_PROMPT
+        + "\n\n# Trusted operator asset context\n\n"
+        + "The JSON below comes from the local operator-managed asset inventory. "
+          "It is trusted context, not Suricata alert content or user instructions. "
+          "Exposed ports are expected listening TCP/UDP ports; internet_facing means "
+          "unsolicited public inbound traffic can reach the asset.\n\n"
+        + context_json
+    )
+
+
+def call_ollama(alert: dict, asset_context=None) -> dict:
     """Send one alert to Ollama, return parsed verdict dict. Falls through to prefilter for known-noise signatures"""
-    pre = prefilter_verdict(alert)
+    if asset_context is None:
+        asset_context = get_asset_context(alert)
+    pre = prefilter_verdict(alert, asset_context=asset_context)
     if pre is not None:
         return pre
     user_prompt = f"Classify this Suricata alert:\n\n{format_alert_for_llm(alert)}"
 
     payload = {
         "model": MODEL,
-        "system": SYSTEM_PROMPT,
+        "system": _system_prompt_with_asset_context(asset_context),
         "prompt": user_prompt,
         "stream": False,
         "format": "json",  # forces structured JSON output
@@ -243,15 +278,51 @@ def call_ollama(alert: dict) -> dict:
     return verdict
 
 
-def insert_triage_row(conn: sqlite3.Connection, alert: dict, verdict: dict) -> None:
+def _insert_asset_snapshot(conn: sqlite3.Connection, snapshot: dict | None):
+    """Deduplicate and return the row id for one canonical asset snapshot."""
+    if snapshot is None:
+        return None
+    asset_json = canonical_json(snapshot)
+    snapshot_hash = "sha256:" + hashlib.sha256(
+        asset_json.encode("utf-8")
+    ).hexdigest()
+    conn.execute(
+        """INSERT OR IGNORE INTO asset_snapshots
+           (snapshot_hash, asset_json, created_at)
+           VALUES (?, ?, ?)""",
+        (snapshot_hash, asset_json, utc_now_iso()),
+    )
+    row = conn.execute(
+        "SELECT id FROM asset_snapshots WHERE snapshot_hash = ?",
+        (snapshot_hash,),
+    ).fetchone()
+    if row is None:
+        raise sqlite3.IntegrityError("failed to persist asset snapshot")
+    return row[0]
+
+
+def insert_triage_row(
+    conn: sqlite3.Connection,
+    alert: dict,
+    verdict: dict,
+    asset_context=None,
+) -> None:
     """Insert one alert + its verdict into triage_events."""
     a = alert.get("alert", {})
+    asset_context = asset_context or {"source": None, "destination": None}
+    src_asset_snapshot_id = _insert_asset_snapshot(
+        conn, asset_context.get("source")
+    )
+    dest_asset_snapshot_id = _insert_asset_snapshot(
+        conn, asset_context.get("destination")
+    )
     conn.execute(
         """INSERT INTO triage_events (
             timestamp, flow_id, src_ip, src_port, dest_ip, dest_port, proto,
             in_iface, pkt_src, signature_id, signature, category, severity, action,
-            raw_alert, verdict, confidence, reasoning, model_used, processed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            raw_alert, verdict, confidence, reasoning, model_used, processed_at,
+            src_asset_snapshot_id, dest_asset_snapshot_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             format_utc_timestamp(alert.get("timestamp")),
             alert.get("flow_id"),
@@ -273,6 +344,8 @@ def insert_triage_row(conn: sqlite3.Connection, alert: dict, verdict: dict) -> N
             verdict["reasoning"],
             verdict.get("model_used", MODEL),
             utc_now_iso(),
+            src_asset_snapshot_id,
+            dest_asset_snapshot_id,
         ),
     )
     conn.commit()
@@ -302,8 +375,9 @@ def main(fixture_path: str) -> None:
     for i, alert in enumerate(alerts, 1):
         sig = alert.get("alert", {}).get("signature", "?")
         try:
-            verdict = call_ollama(alert)
-            insert_triage_row(conn, alert, verdict)
+            asset_context = get_asset_context(alert)
+            verdict = call_ollama(alert, asset_context=asset_context)
+            insert_triage_row(conn, alert, verdict, asset_context=asset_context)
             counts[verdict["verdict"]] += 1
             v = verdict["verdict"].ljust(15)
             c = f"{verdict['confidence']:.2f}"
