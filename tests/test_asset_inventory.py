@@ -250,8 +250,9 @@ class PromptBoundaryTests(unittest.TestCase):
             payload["prompt"],
         )
 
-    def test_prefilter_receives_context_without_changing_its_decision(self):
-        sid = next(iter(triage.PREFILTER_SIDS))
+    def test_unscoped_prefilter_rule_receives_asset_context(self):
+        sid = 2016149
+        self.assertIn(sid, triage.PREFILTER_SIDS)
         alert = {"alert": {"signature_id": sid}}
         context = {"source": {"hostname": "example-host"}, "destination": None}
 

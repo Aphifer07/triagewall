@@ -14,7 +14,9 @@ model reflects that.
 ## What Triagewall is
 
 A two-tier triage layer that sits between a Suricata IDS alert stream and a
-human. A prefilter classifies known-noise signatures by ID; everything else
+human. A prefilter classifies known-noise signatures using validated SID and
+optional direction, CIDR, protocol, port, and asset-context conditions;
+everything else
 goes to a local LLM that returns a verdict (`real`, `false_positive`,
 `uncertain`) with a confidence score and reasoning. Results land in SQLite and
 surface on a local web dashboard.
@@ -30,7 +32,7 @@ point.
 ```
 [ Suricata on OPNsense ]  --(eve.json, rsync/SSH or mount)-->  [ ingest daemon ]
                                                                       |
-                                                  prefilter (trusted SID lookup)
+                                                  prefilter (trusted scoped policy)
                                                                       |
                                                        (miss) --> [ local Ollama LLM ]
                                                                       |
@@ -113,14 +115,14 @@ sufficiently clever adversary may find inputs that survive encoding. The right
 mental model is "raised the bar and keep iterating," not "solved." Breaking it
 is explicitly invited; that is how the next hardening phase gets written.
 
-**The prefilter is a deliberate detection gap.** Signatures in
+**The prefilter is a deliberate detection gap.** Alerts that match a rule in
 `prefilter.json` are auto-classified as `false_positive` and never reach the
-LLM. This is what makes the volume manageable (99%+ of alerts), but it means an
-attacker who knows which SIDs are prefiltered (the config is in the public repo)
-could craft traffic that fires *only* prefiltered signatures to avoid LLM
-review. The prefilter trades detection coverage for volume reduction; this is an
-accepted tradeoff for a homelab, not a hidden flaw. Tune your own prefilter
-accordingly and don't prefilter SIDs you actually care about.
+LLM. Versioned rules can narrow that decision by network/flow direction, CIDR,
+protocol, port, and trusted asset context; missing or malformed required context
+does not match. Legacy rules without a `match` block still suppress globally by
+SID. An attacker who knows a rule's full conditions could craft matching traffic
+to avoid LLM review, so the prefilter still trades detection coverage for volume
+reduction. Tune it conservatively and do not suppress patterns you care about.
 
 **False negatives are expected.** The LLM misses things. On the v0.2-alpha gold
 set, true-positive recall was 5/6 — one real threat in six was misclassified.
