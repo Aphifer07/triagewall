@@ -44,6 +44,9 @@ jobs:
       - name: Run SPC regressions
         run: PYTHONPATH=. python tests/test_spc.py
 
+      - name: Run dashboard polling regressions
+        run: node --test tests/test_dashboard_polling.js
+
       - name: Compile Python sources
         run: python -m compileall -q triagewall tests scripts
 

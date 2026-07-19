@@ -184,6 +184,7 @@
   </div>
 </div>
 
+<script src="/static/polling.js"></script>
 <script>
 const API = "";
 let currentFilter = { verdict: "", signature: "", model: "llm" };
@@ -351,7 +352,6 @@ async function load() {
   renderHero(data.stats);
   renderStats(data.stats);
   renderVerdicts(data.verdicts);
-  loadSpc();
   document.getElementById("freshness").textContent = `Live · Updated ${new Date().toLocaleTimeString()}`;
 }
 
@@ -599,8 +599,7 @@ document.addEventListener("keydown", e => {
   }
 });
 
-load();
-setInterval(load, 30000);
+startIndependentPolling({ loadMain: load, loadSpc });
 </script>
 </body>
 </html>
