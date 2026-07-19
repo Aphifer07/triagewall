@@ -20,6 +20,7 @@ from pathlib import Path
 import urllib.request
 import urllib.error
 from field_isolation import format_alert_for_llm
+from database import connect_database
 # --- Config ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_URL = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
@@ -282,8 +283,7 @@ def main(fixture_path: str) -> None:
         print(f"ERROR: {DB_PATH} not found. Run schema setup first.", file=sys.stderr)
         sys.exit(1)
 
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn = connect_database(DB_PATH)
     alerts = []
     with open(fixture_path) as f:
         for line in f:

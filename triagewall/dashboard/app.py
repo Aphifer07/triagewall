@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from triagewall.dashboard.stats import get_dashboard_stats
+from triagewall.database import connect_database
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -114,12 +115,7 @@ def db(readonly: bool = False):
     - readonly=True → open in read-only mode for polling endpoints
     - readonly=False → standard read-write connection (used for feedback)
     """
-    if readonly:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30.0)
-        conn.execute("PRAGMA busy_timeout=10000")
-    else:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0)
-        conn.execute("PRAGMA busy_timeout=10000")
+    conn = connect_database(DB_PATH, readonly=readonly)
     conn.row_factory = sqlite3.Row
     try:
         yield conn

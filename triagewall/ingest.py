@@ -22,6 +22,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
+from database import connect_database
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -109,8 +110,7 @@ def ensure_db_initialized():
     schema_path = Path(__file__).parent / "schema.sql"
     schema_sql = schema_path.read_text()
 
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn = connect_database(DB_PATH)
     try:
         conn.executescript(schema_sql)
         conn.commit()
@@ -291,8 +291,7 @@ def demo_loop():
     ensure_db_initialized()
 
     log.info(f"Demo fixtures loaded: {len(demo_lines)} alerts")
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn = connect_database(DB_PATH)
     spc.ensure_spc_schema(conn)
 
     try:
@@ -325,8 +324,7 @@ def tail_file():
     log.info(f"  poll:     every {POLL_INTERVAL}s")
 
     state = load_position()
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn = connect_database(DB_PATH)
     spc.ensure_spc_schema(conn)
     last_line_seen_ts = time.time()
     last_stall_warning_ts = 0.0

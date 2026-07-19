@@ -28,19 +28,14 @@ the spc_* tables first (see --reset).
 import argparse
 import json
 import os
-import sqlite3
 import sys
 import time
 from pathlib import Path
 
-# import the spc module from the same package dir
-sys.path.insert(0, str(Path(__file__).resolve().parent / "triagewall"))
-try:
-    import spc
-except ImportError:
-    # fallback if run from repo root with package layout
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from triagewall import spc
+# Import project modules when this script is run directly from any directory.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from triagewall import spc
+from triagewall.database import connect_database
 
 
 DEFAULT_DB = os.environ.get(
@@ -65,8 +60,7 @@ def main():
         print(f"ERROR: DB not found at {db_path}", file=sys.stderr)
         sys.exit(1)
 
-    conn = sqlite3.connect(str(db_path), timeout=30.0)
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn = connect_database(db_path)
 
     if args.reset:
         print("Dropping spc_* tables for clean re-run...")
