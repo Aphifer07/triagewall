@@ -17,7 +17,7 @@ jobs:
   regression:
     name: Regression suite
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -62,4 +62,9 @@ jobs:
         run: python -m compileall -q triagewall tests scripts
 
       - name: Validate Docker Compose
-        run: docker compose config --quiet
+        run: |
+          docker compose config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh config --quiet
+
+      - name: Build Docker services
+        run: docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh build

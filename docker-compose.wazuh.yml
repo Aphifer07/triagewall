@@ -1,0 +1,49 @@
+services:
+  wazuh-ingest:
+    profiles: ["wazuh"]
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command:
+      - python3
+      - triagewall/wazuh_ingest.py
+    environment:
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
+      POLL_INTERVAL: ${WAZUH_POLL_INTERVAL:-10}
+
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://localhost:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M}
+      INTERNAL_SUBNETS: ${INTERNAL_SUBNETS:-10.0.0.0/24 and 192.168.1.0/24}
+      ASSET_INVENTORY_PATH: /app/triagewall/config/assets.json
+
+      WAZUH_ALERTS_PATH: /var/ossec/logs/alerts/alerts.json
+      WAZUH_POSITION_PATH: ${WAZUH_POSITION_PATH:-/var/lib/triagewall/wazuh-position.json}
+      WAZUH_SOURCE_ID: ${WAZUH_SOURCE_ID:-wazuh-local}
+      WAZUH_MIN_LEVEL: ${WAZUH_MIN_LEVEL:-8}
+      WAZUH_START_MODE: ${WAZUH_START_MODE:-end}
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+      - ${HOST_ASSET_INVENTORY:-./triagewall/config/assets.example.json}:/app/triagewall/config/assets.json:ro
+      - type: volume
+        source: wazuh_logs
+        target: /var/ossec/logs/alerts
+        read_only: true
+        volume:
+          subpath: alerts
+    group_add:
+      - "${WAZUH_LOGS_GID:-999}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  wazuh_logs:
+    external: true
+    name: ${WAZUH_LOGS_VOLUME:-wazuh_logs}
