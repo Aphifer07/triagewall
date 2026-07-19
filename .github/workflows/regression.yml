@@ -50,6 +50,7 @@ jobs:
           tests.test_runtime_dependencies
           tests.test_security_regressions
           tests.test_timestamps
+          tests.test_wazuh_ingest
 
       - name: Run SPC regressions
         run: PYTHONPATH=. python tests/test_spc.py
