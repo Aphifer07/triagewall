@@ -64,6 +64,73 @@ class IngestCheckpointTests(unittest.TestCase):
             0,
         )
 
+    def test_persistence_integrity_error_is_quarantined_and_checkpointable(self):
+        raw = json.dumps({
+            "event_type": "alert",
+            "alert": {"signature_id": 3, "signature": "Missing timestamp"},
+        })
+        verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
+        with patch.object(ingest, "call_ollama", return_value=verdict):
+            result = ingest.process_line(self.conn, raw)
+
+        self.assertFalse(result)
+        self.assertTrue(result.checkpoint)
+        failure = self.conn.execute(
+            "SELECT raw_line, error FROM ingest_failures"
+        ).fetchone()
+        self.assertEqual(failure[0], raw)
+        self.assertIn("IntegrityError", failure[1])
+
+    def test_tail_loop_checkpoints_invalid_record_and_processes_next_alert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            db_path = temp_path / "triage.db"
+            position_path = temp_path / "position.json"
+            invalid = json.dumps({
+                "event_type": "alert",
+                "alert": {"signature_id": 4, "signature": "Missing timestamp"},
+            }) + "\n"
+            valid = json.dumps({
+                "event_type": "alert",
+                "timestamp": "2026-07-19T00:00:00+00:00",
+                "alert": {"signature_id": 5, "signature": "Process after invalid"},
+            }) + "\n"
+            eve_path.write_text(invalid + valid)
+            position_path.write_text(json.dumps({"offset": 0, "inode": None, "size": 0}))
+            verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
+            calls = []
+
+            def return_verdict(event):
+                calls.append(event["alert"]["signature_id"])
+                if len(calls) == 2:
+                    ingest._stop = True
+                return verdict
+
+            ingest._stop = False
+            try:
+                with patch.object(ingest, "EVE_PATH", eve_path), patch.object(
+                    ingest, "DB_PATH", db_path
+                ), patch.object(ingest, "POSITION_PATH", position_path), patch.object(
+                    ingest, "call_ollama", side_effect=return_verdict
+                ):
+                    ingest.tail_file()
+            finally:
+                ingest._stop = False
+
+            saved = json.loads(position_path.read_text())
+            conn = sqlite3.connect(db_path)
+            try:
+                failures = conn.execute("SELECT COUNT(*) FROM ingest_failures").fetchone()[0]
+                events = conn.execute("SELECT COUNT(*) FROM triage_events").fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(calls, [4, 5])
+            self.assertEqual(failures, 1)
+            self.assertEqual(events, 1)
+            self.assertEqual(saved["offset"], eve_path.stat().st_size)
+
     def test_intentional_skip_remains_checkpointable(self):
         result = ingest.process_line(
             self.conn,
