@@ -19,6 +19,7 @@ import sqlite3
 import signal
 import logging
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -72,6 +73,23 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("ingest")
+
+
+@dataclass(frozen=True)
+class LineResult:
+    """Outcome of processing one complete input record."""
+
+    processed: bool
+    checkpoint: bool
+
+    def __bool__(self):
+        """Preserve the historical truthy result for successfully triaged alerts."""
+        return self.processed
+
+
+PROCESSED_LINE = LineResult(processed=True, checkpoint=True)
+CHECKPOINT_LINE = LineResult(processed=False, checkpoint=True)
+RETRY_LINE = LineResult(processed=False, checkpoint=False)
 
 # Graceful shutdown
 _stop = False
@@ -173,6 +191,7 @@ def insert_with_retry(conn, event, verdict, max_retries=3, base_backoff_ms=100):
             conn.commit()
             return True
         except sqlite3.OperationalError as e:
+            conn.rollback()
             if "locked" in str(e).lower():
                 if attempt < max_retries - 1:
                     sleep_time = (base_backoff_ms * (2**attempt)) / 1000.0
@@ -183,7 +202,7 @@ def insert_with_retry(conn, event, verdict, max_retries=3, base_backoff_ms=100):
                 else:
                     logging.error(
                         f"Failed to insert alert after {max_retries} attempts; "
-                        f"quarantining event: {event.get('flow_id')}"
+                        f"will retry without checkpointing event: {event.get('flow_id')}"
                     )
                     return False
             else:
@@ -191,38 +210,40 @@ def insert_with_retry(conn, event, verdict, max_retries=3, base_backoff_ms=100):
 
 
 def process_line(conn, line):
-    """Parse one line, triage if it's an alert, return True if we did work."""
+    """Parse one line and return whether it was processed and may be checkpointed."""
     raw_line = line.rstrip("\r\n")
     line = raw_line.strip()
     if not line:
-        return False
+        return CHECKPOINT_LINE
     try:
         event = json.loads(line)
     except json.JSONDecodeError as e:
         quarantine_line(conn, raw_line, f"invalid JSON: {e}")
-        return False
+        return CHECKPOINT_LINE
 
     if not isinstance(event, dict):
         quarantine_line(conn, raw_line, "top-level JSON value must be an object")
-        return False
+        return CHECKPOINT_LINE
 
     if event.get("event_type") != "alert":
-        return False
+        return CHECKPOINT_LINE
 
     if not isinstance(event.get("alert"), dict):
         quarantine_line(conn, raw_line, "alert event metadata must be an object")
-        return False
+        return CHECKPOINT_LINE
 
     if is_duplicate(conn, event):
         log.debug(f"Skipping duplicate alert flow_id={event.get('flow_id')}")
-        return False
+        return CHECKPOINT_LINE
 
     sig = event.get("alert", {}).get("signature", "?")
     try:
         verdict = call_ollama(event)
         if not insert_with_retry(conn, event, verdict):
-            quarantine_line(conn, raw_line, "failed to persist triage result")
-            return False
+            log.error(
+                f"Failed to persist alert ({sig}); retrying without advancing checkpoint"
+            )
+            return RETRY_LINE
         # SPC behavioral baselining — independent observer, never fatal
         try:
             spc.observe(conn, event)
@@ -232,14 +253,14 @@ def process_line(conn, line):
         log.info(
             f"[{verdict['verdict']:>15}] {verdict['confidence']:.2f}  {sig[:80]}"
         )
-        return True
+        return PROCESSED_LINE
     except Exception as e:
-        quarantine_line(
-            conn,
-            raw_line,
-            f"failed to triage alert ({sig}): {type(e).__name__}: {e}",
+        conn.rollback()
+        log.error(
+            f"Failed to triage alert ({sig}): {type(e).__name__}: {e}; "
+            "retrying without advancing checkpoint"
         )
-        return False
+        return RETRY_LINE
 
 
 def demo_loop():
@@ -391,8 +412,15 @@ def tail_file():
                         break
 
                     last_line_seen_ts = time.time()
+                    result = process_line(conn, line)
+                    if not result.checkpoint:
+                        # Retryable processing failures must block later records
+                        # from moving the durable checkpoint past this alert.
+                        time.sleep(POLL_INTERVAL)
+                        break
+
                     new_lines += 1
-                    if process_line(conn, line):
+                    if result:
                         processed += 1
 
                     state["offset"] = f.tell()

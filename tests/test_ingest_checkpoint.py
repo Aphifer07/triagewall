@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Regression coverage for retryable ingest checkpoint failures."""
+
+import json
+import sqlite3
+import sys
+import tempfile
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "triagewall"))
+
+import ingest
+import triage
+
+
+class IngestCheckpointTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript((PROJECT_ROOT / "triagewall" / "schema.sql").read_text())
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_model_failure_is_retryable_and_not_checkpointable(self):
+        raw = json.dumps({
+            "event_type": "alert",
+            "alert": {"signature_id": 1, "signature": "Retry me"},
+        })
+        with patch.object(
+            triage.urllib.request,
+            "urlopen",
+            side_effect=urllib.error.URLError("offline"),
+        ), patch.object(triage, "OLLAMA_URL", "http://ollama.test/api/generate"):
+            result = ingest.process_line(self.conn, raw)
+
+        self.assertFalse(result)
+        self.assertFalse(result.checkpoint)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM ingest_failures").fetchone()[0],
+            0,
+        )
+
+    def test_persistence_failure_is_retryable_and_not_checkpointable(self):
+        raw = json.dumps({
+            "event_type": "alert",
+            "alert": {"signature_id": 2, "signature": "Persist me"},
+        })
+        verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
+        with patch.object(ingest, "call_ollama", return_value=verdict), patch.object(
+            ingest, "insert_with_retry", return_value=False
+        ):
+            result = ingest.process_line(self.conn, raw)
+
+        self.assertFalse(result)
+        self.assertFalse(result.checkpoint)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM ingest_failures").fetchone()[0],
+            0,
+        )
+
+    def test_intentional_skip_remains_checkpointable(self):
+        result = ingest.process_line(
+            self.conn,
+            json.dumps({"event_type": "flow", "flow_id": 7}),
+        )
+        self.assertFalse(result)
+        self.assertTrue(result.checkpoint)
+
+    def test_permanently_invalid_input_remains_quarantined_and_checkpointable(self):
+        raw = '[{"event_type":"alert"}]'
+        result = ingest.process_line(self.conn, raw)
+
+        self.assertFalse(result)
+        self.assertTrue(result.checkpoint)
+        self.assertEqual(
+            self.conn.execute("SELECT raw_line FROM ingest_failures").fetchone()[0],
+            raw,
+        )
+
+    def test_tail_loop_does_not_advance_past_retryable_failure(self):
+        class RetryResult:
+            processed = False
+            checkpoint = False
+
+            def __bool__(self):
+                return self.processed
+
+        class SuccessResult:
+            processed = True
+            checkpoint = True
+
+            def __bool__(self):
+                return self.processed
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            db_path = temp_path / "triage.db"
+            position_path = temp_path / "position.json"
+            first = '{"event_type":"alert","alert":{"signature_id":1}}\n'
+            second = '{"event_type":"alert","alert":{"signature_id":2}}\n'
+            eve_path.write_text(first + second)
+            position_path.write_text(json.dumps({"offset": 0, "inode": None, "size": 0}))
+            calls = []
+
+            def process_once(conn, line):
+                calls.append(line)
+                if len(calls) == 1:
+                    return RetryResult()
+                ingest._stop = True
+                return SuccessResult()
+
+            def stop_after_backoff(_seconds):
+                ingest._stop = True
+
+            ingest._stop = False
+            try:
+                with patch.object(ingest, "EVE_PATH", eve_path), patch.object(
+                    ingest, "DB_PATH", db_path
+                ), patch.object(ingest, "POSITION_PATH", position_path), patch.object(
+                    ingest, "process_line", side_effect=process_once
+                ), patch.object(ingest.time, "sleep", side_effect=stop_after_backoff):
+                    ingest.tail_file()
+            finally:
+                ingest._stop = False
+
+            saved = json.loads(position_path.read_text())
+            self.assertEqual(calls, [first])
+            self.assertEqual(saved["offset"], 0)
+
+    def test_tail_loop_retries_same_record_then_checkpoints_success(self):
+        class RetryResult:
+            processed = False
+            checkpoint = False
+
+            def __bool__(self):
+                return self.processed
+
+        class SuccessResult:
+            processed = True
+            checkpoint = True
+
+            def __bool__(self):
+                return self.processed
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            db_path = temp_path / "triage.db"
+            position_path = temp_path / "position.json"
+            first = '{"event_type":"alert","alert":{"signature_id":1}}\n'
+            second = '{"event_type":"alert","alert":{"signature_id":2}}\n'
+            eve_path.write_text(first + second)
+            with eve_path.open("r") as handle:
+                handle.readline()
+                expected_offset = handle.tell()
+            position_path.write_text(json.dumps({"offset": 0, "inode": None, "size": 0}))
+            calls = []
+
+            def fail_then_succeed(conn, line):
+                calls.append(line)
+                if len(calls) == 1:
+                    return RetryResult()
+                ingest._stop = True
+                return SuccessResult()
+
+            ingest._stop = False
+            try:
+                with patch.object(ingest, "EVE_PATH", eve_path), patch.object(
+                    ingest, "DB_PATH", db_path
+                ), patch.object(ingest, "POSITION_PATH", position_path), patch.object(
+                    ingest, "process_line", side_effect=fail_then_succeed
+                ), patch.object(ingest.time, "sleep"):
+                    ingest.tail_file()
+            finally:
+                ingest._stop = False
+
+            saved = json.loads(position_path.read_text())
+            self.assertEqual(calls, [first, first])
+            self.assertEqual(saved["offset"], expected_offset)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
