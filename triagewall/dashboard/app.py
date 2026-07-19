@@ -14,13 +14,19 @@ import ipaddress
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import timedelta
 from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from triagewall.dashboard.stats import get_dashboard_stats
 from triagewall.database import connect_database
+from triagewall.time_utils import (
+    format_utc_timestamp,
+    parse_utc_timestamp,
+    utc_now,
+    utc_now_iso,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -140,6 +146,12 @@ def mask_ip(ip):
 
 def row_to_dict(row):
     d = dict(row)
+    for field in ("timestamp", "processed_at", "reviewed_at"):
+        if d.get(field):
+            try:
+                d[field] = format_utc_timestamp(d[field])
+            except (TypeError, ValueError):
+                d[field] = None
     if MODE == "demo":
         d["src_ip"] = mask_ip(d.get("src_ip"))
         d["dest_ip"] = mask_ip(d.get("dest_ip"))
@@ -232,7 +244,7 @@ def submit_feedback(event_id: int, payload: dict = Body(...)):
             """UPDATE triage_events
                SET human_verdict = ?, human_notes = ?, agreed = ?, reviewed_at = ?
                WHERE id = ?""",
-            (human_verdict, notes, agreed, datetime.now(timezone.utc).isoformat(), event_id),
+            (human_verdict, notes, agreed, utc_now_iso(), event_id),
         )
         conn.commit()
     return {"ok": True, "agreed": bool(agreed)}
@@ -252,13 +264,11 @@ def health():
             # If schema/table doesn't exist yet, treat as stale.
             last_processed_at = None
 
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     age_seconds = 10**9
     if last_processed_at:
         try:
-            dt = datetime.fromisoformat(str(last_processed_at))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+            dt = parse_utc_timestamp(str(last_processed_at))
             age_seconds = int((now - dt).total_seconds())
         except Exception:
             age_seconds = 10**9
@@ -293,19 +303,21 @@ def timeline():
         return _timeline_cache["data"]
     # Bucket by processed_at so the timeline matches when Triagewall classified
     # alerts (consistent with the hero stat), not when Suricata first detected them.
+    cutoff = format_utc_timestamp(utc_now() - timedelta(hours=24))
     with db(readonly=True) as conn:
         rows = conn.execute(
             """
             SELECT
-                strftime('%Y-%m-%d %H:00:00', processed_at) AS hour_bucket,
+                strftime('%Y-%m-%dT%H:00:00.000000Z', processed_at) AS hour_bucket,
                 COUNT(*) AS total_alerts,
                 COALESCE(SUM(model_used = 'prefilter'), 0) AS prefiltered_count,
                 COALESCE(SUM(verdict = 'real'), 0) AS real_count
             FROM triage_events
-            WHERE processed_at >= datetime('now', '-24 hours')
+            WHERE processed_at >= ?
             GROUP BY hour_bucket
             ORDER BY hour_bucket ASC
-            """
+            """,
+            (cutoff,),
         ).fetchall()
 
     out = []
@@ -314,11 +326,7 @@ def timeline():
         pre = int(r["prefiltered_count"] or 0)
         real = int(r["real_count"] or 0)
         pct = (pre / total * 100.0) if total else 0.0
-        # Append 'Z' suffix so JavaScript Date() parses as UTC, then
-        # the frontend's toLocaleTimeString() can convert to user's local time.
-        hour = (r["hour_bucket"] or "").replace(" ", "T")
-        if hour and not hour.endswith("Z"):
-            hour = hour + "Z"
+        hour = r["hour_bucket"] or ""
         out.append(
             {
                 "timestamp": hour,
@@ -373,17 +381,18 @@ def spc_anomalies():
         ).fetchall()
 
         # Also surface a count for the last 24h, so the panel can show recency.
+        cutoff = format_utc_timestamp(utc_now() - timedelta(hours=24))
         last24 = conn.execute(
             "SELECT COUNT(*) FROM spc_anomalies "
-            "WHERE detected_at >= datetime('now', '-24 hours')"
+            "WHERE detected_at >= ?",
+            (cutoff,),
         ).fetchone()[0]
 
     for r in rows:
-        dt = r["detected_at"] or ""
-        # Normalize to a JS-parseable UTC timestamp like the timeline endpoint.
-        ts = dt.replace(" ", "T")
-        if ts and not (ts.endswith("Z") or "+" in ts):
-            ts = ts + "Z"
+        try:
+            ts = format_utc_timestamp(r["detected_at"])
+        except (TypeError, ValueError):
+            ts = None
         out["anomalies"].append({
             "detected_at": ts,
             "feature": r["feature"],

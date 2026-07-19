@@ -21,8 +21,8 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, timezone
 from database import connect_database
+from time_utils import format_utc_timestamp, utc_now_iso
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -157,7 +157,7 @@ def quarantine_line(conn, line, error):
         (
             line.rstrip("\r\n"),
             str(error)[:1000],
-            datetime.now(timezone.utc).isoformat(),
+            utc_now_iso(),
         ),
     )
     conn.commit()
@@ -168,14 +168,15 @@ def is_duplicate(conn, alert):
     """Check if we've already triaged this alert (flow_id + sig_id + timestamp)."""
     flow_id = alert.get("flow_id")
     sig_id = alert.get("alert", {}).get("signature_id")
-    ts = alert.get("timestamp")
-    if not (flow_id and sig_id and ts):
+    raw_ts = alert.get("timestamp")
+    if not (flow_id and sig_id and raw_ts):
         return False
+    canonical_ts = format_utc_timestamp(raw_ts)
     row = conn.execute(
         """SELECT 1 FROM triage_events
-           WHERE flow_id = ? AND signature_id = ? AND timestamp = ?
+           WHERE flow_id = ? AND signature_id = ? AND timestamp IN (?, ?)
            LIMIT 1""",
-        (flow_id, sig_id, ts),
+        (flow_id, sig_id, raw_ts, canonical_ts),
     ).fetchone()
     return row is not None
 
@@ -230,6 +231,12 @@ def process_line(conn, line):
 
     if not isinstance(event.get("alert"), dict):
         quarantine_line(conn, raw_line, "alert event metadata must be an object")
+        return CHECKPOINT_LINE
+
+    try:
+        format_utc_timestamp(event.get("timestamp"))
+    except (TypeError, ValueError) as e:
+        quarantine_line(conn, raw_line, f"invalid alert timestamp: {e}")
         return CHECKPOINT_LINE
 
     if is_duplicate(conn, event):

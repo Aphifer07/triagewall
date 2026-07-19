@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ import triage
 from scripts import benchmark_quants
 from fastapi.testclient import TestClient
 from triagewall.dashboard import app as dashboard
+from triagewall.time_utils import format_utc_timestamp
 
 
 class _OllamaResponse:
@@ -145,6 +147,9 @@ class DashboardBoundaryTests(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "triage.db"
         conn = sqlite3.connect(self.db_path)
         conn.executescript((PROJECT_ROOT / "triagewall" / "schema.sql").read_text())
+        self.event_time = datetime.now(timezone.utc).replace(microsecond=123456)
+        suricata_event_time = self.event_time.strftime("%Y-%m-%dT%H:%M:%S.%f+0000")
+        legacy_processed_at = self.event_time.isoformat()
         conn.execute(
             """
             INSERT INTO triage_events (
@@ -153,8 +158,8 @@ class DashboardBoundaryTests(unittest.TestCase):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "2026-07-18T12:00:00+00:00", 1, "Test", "{}", "real",
-                0.9, "private model reasoning", "test", "2026-07-18T12:00:00+00:00",
+                suricata_event_time, 1, "Test", "{}", "real",
+                0.9, "private model reasoning", "test", legacy_processed_at,
                 "private analyst note",
             ),
         )
@@ -168,7 +173,7 @@ class DashboardBoundaryTests(unittest.TestCase):
         )
         conn.execute(
             "INSERT INTO spc_anomalies VALUES (1, ?, ?, ?, ?, ?, ?)",
-            ("2026-07-18T12:00:00+00:00", "novel_sid", "192.168.1.44", 1, 4.2,
+            (suricata_event_time, "novel_sid", "192.168.1.44", 1, 4.2,
              "192.168.1.44 triggered a private rule"),
         )
         conn.commit()
@@ -180,6 +185,7 @@ class DashboardBoundaryTests(unittest.TestCase):
         dashboard.MODE = "local"
         dashboard._stats_cache.update(data=None, ts=0.0)
         dashboard._spc_cache.update(data=None, ts=0.0)
+        dashboard._timeline_cache.update(data=None, ts=0.0)
         self.client = TestClient(dashboard.app)
 
     def tearDown(self):
@@ -187,6 +193,7 @@ class DashboardBoundaryTests(unittest.TestCase):
         dashboard.MODE = self.old_mode
         dashboard._stats_cache.update(data=None, ts=0.0)
         dashboard._spc_cache.update(data=None, ts=0.0)
+        dashboard._timeline_cache.update(data=None, ts=0.0)
         self.temp_dir.cleanup()
 
     def test_rebinding_style_host_is_rejected_for_read_and_write_routes(self):
@@ -262,6 +269,46 @@ class DashboardBoundaryTests(unittest.TestCase):
         ).json()["anomalies"][0]
         self.assertEqual(anomaly["ip"], "192.168.x.x")
         self.assertIsNone(anomaly["note"])
+
+    def test_api_timestamps_are_canonical_utc(self):
+        expected = format_utc_timestamp(self.event_time)
+
+        verdict = self.client.get(
+            "/api/verdicts", headers={"host": "localhost"}
+        ).json()["verdicts"][0]
+        anomaly = self.client.get(
+            "/api/spc-anomalies", headers={"host": "localhost"}
+        ).json()["anomalies"][0]
+        timeline = self.client.get(
+            "/api/timeline", headers={"host": "localhost"}
+        ).json()
+
+        self.assertEqual(verdict["timestamp"], expected)
+        self.assertEqual(verdict["processed_at"], expected)
+        self.assertEqual(anomaly["detected_at"], expected)
+        self.assertTrue(timeline)
+        self.assertRegex(
+            timeline[0]["timestamp"],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:00:00\.000000Z$",
+        )
+
+        feedback = self.client.post(
+            "/api/feedback/1",
+            headers={"host": "localhost"},
+            json={"human_verdict": "real"},
+        )
+        self.assertEqual(feedback.status_code, 200)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            reviewed_at = conn.execute(
+                "SELECT reviewed_at FROM triage_events WHERE id = 1"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertRegex(
+            reviewed_at,
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$",
+        )
 
 
 class BenchmarkExportTests(unittest.TestCase):

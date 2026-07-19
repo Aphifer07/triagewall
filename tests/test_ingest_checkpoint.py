@@ -30,6 +30,7 @@ class IngestCheckpointTests(unittest.TestCase):
     def test_model_failure_is_retryable_and_not_checkpointable(self):
         raw = json.dumps({
             "event_type": "alert",
+            "timestamp": "2026-07-19T00:00:00Z",
             "alert": {"signature_id": 1, "signature": "Retry me"},
         })
         with patch.object(
@@ -49,6 +50,7 @@ class IngestCheckpointTests(unittest.TestCase):
     def test_persistence_failure_is_retryable_and_not_checkpointable(self):
         raw = json.dumps({
             "event_type": "alert",
+            "timestamp": "2026-07-19T00:00:00Z",
             "alert": {"signature_id": 2, "signature": "Persist me"},
         })
         verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
@@ -64,13 +66,12 @@ class IngestCheckpointTests(unittest.TestCase):
             0,
         )
 
-    def test_persistence_integrity_error_is_quarantined_and_checkpointable(self):
+    def test_missing_timestamp_is_quarantined_before_triage(self):
         raw = json.dumps({
             "event_type": "alert",
             "alert": {"signature_id": 3, "signature": "Missing timestamp"},
         })
-        verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
-        with patch.object(ingest, "call_ollama", return_value=verdict):
+        with patch.object(ingest, "call_ollama") as call_ollama:
             result = ingest.process_line(self.conn, raw)
 
         self.assertFalse(result)
@@ -79,7 +80,8 @@ class IngestCheckpointTests(unittest.TestCase):
             "SELECT raw_line, error FROM ingest_failures"
         ).fetchone()
         self.assertEqual(failure[0], raw)
-        self.assertIn("IntegrityError", failure[1])
+        self.assertIn("invalid alert timestamp", failure[1])
+        call_ollama.assert_not_called()
 
     def test_tail_loop_checkpoints_invalid_record_and_processes_next_alert(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -103,8 +105,7 @@ class IngestCheckpointTests(unittest.TestCase):
 
             def return_verdict(event):
                 calls.append(event["alert"]["signature_id"])
-                if len(calls) == 2:
-                    ingest._stop = True
+                ingest._stop = True
                 return verdict
 
             ingest._stop = False
@@ -126,7 +127,7 @@ class IngestCheckpointTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            self.assertEqual(calls, [4, 5])
+            self.assertEqual(calls, [5])
             self.assertEqual(failures, 1)
             self.assertEqual(events, 1)
             self.assertEqual(saved["offset"], eve_path.stat().st_size)
