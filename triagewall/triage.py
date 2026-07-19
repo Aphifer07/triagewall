@@ -23,6 +23,7 @@ from asset_inventory import canonical_json, load_configured_inventory
 from field_isolation import format_alert_for_llm
 from database import connect_database
 from prefilter import PrefilterPolicy
+from sensor_event import SensorEvent, normalize_suricata_event
 from time_utils import format_utc_timestamp, utc_now_iso
 # --- Config ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -303,12 +304,16 @@ def _insert_asset_snapshot(conn: sqlite3.Connection, snapshot: dict | None):
 
 def insert_triage_row(
     conn: sqlite3.Connection,
-    alert: dict,
+    alert: dict | SensorEvent,
     verdict: dict,
     asset_context=None,
 ) -> None:
     """Insert one alert + its verdict into triage_events."""
-    a = alert.get("alert", {})
+    event = (
+        alert
+        if isinstance(alert, SensorEvent)
+        else normalize_suricata_event(alert)
+    )
     asset_context = asset_context or {"source": None, "destination": None}
     src_asset_snapshot_id = _insert_asset_snapshot(
         conn, asset_context.get("source")
@@ -316,7 +321,7 @@ def insert_triage_row(
     dest_asset_snapshot_id = _insert_asset_snapshot(
         conn, asset_context.get("destination")
     )
-    conn.execute(
+    cursor = conn.execute(
         """INSERT INTO triage_events (
             timestamp, flow_id, src_ip, src_port, dest_ip, dest_port, proto,
             in_iface, pkt_src, signature_id, signature, category, severity, action,
@@ -324,21 +329,21 @@ def insert_triage_row(
             src_asset_snapshot_id, dest_asset_snapshot_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            format_utc_timestamp(alert.get("timestamp")),
-            alert.get("flow_id"),
-            alert.get("src_ip"),
-            alert.get("src_port"),
-            alert.get("dest_ip"),
-            alert.get("dest_port"),
-            alert.get("proto"),
-            alert.get("in_iface"),
-            alert.get("pkt_src"),
-            a.get("signature_id"),
-            a.get("signature"),
-            a.get("category"),
-            a.get("severity"),
-            a.get("action"),
-            json.dumps(alert),
+            format_utc_timestamp(event.timestamp),
+            event.flow_id,
+            event.src_ip,
+            event.src_port,
+            event.dest_ip,
+            event.dest_port,
+            event.proto,
+            event.in_iface,
+            event.pkt_src,
+            event.signature_id,
+            event.signature,
+            event.category,
+            event.severity,
+            event.action,
+            json.dumps(event.raw_event),
             verdict["verdict"],
             verdict["confidence"],
             verdict["reasoning"],
@@ -346,6 +351,20 @@ def insert_triage_row(
             utc_now_iso(),
             src_asset_snapshot_id,
             dest_asset_snapshot_id,
+        ),
+    )
+    conn.execute(
+        """INSERT INTO sensor_event_context (
+               triage_event_id, source_type, source_instance, source_event_id,
+               agent_id, agent_name
+           ) VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            cursor.lastrowid,
+            event.sensor.source,
+            event.sensor.instance,
+            event.sensor.event_id,
+            event.sensor.agent_id,
+            event.sensor.agent_name,
         ),
     )
     conn.commit()

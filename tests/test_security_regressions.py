@@ -261,6 +261,15 @@ class DashboardBoundaryTests(unittest.TestCase):
         self.assertIsNone(row["reasoning"])
         self.assertIsNone(row["human_notes"])
         self.assertIsNone(row["raw_alert"])
+        self.assertEqual(
+            row["sensor_context"],
+            {
+                "source": "suricata",
+                "instance": None,
+                "event_id": None,
+                "agent": None,
+            },
+        )
 
     def test_demo_spc_masks_ip_and_removes_note(self):
         dashboard.MODE = "demo"

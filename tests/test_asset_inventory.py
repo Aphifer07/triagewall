@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "triagewall"))
 
 import triage
+from sensor_event import SensorContext, SensorEvent
 from asset_inventory import (
     MAX_ASSET_CONTEXT_BYTES,
     MAX_EXPOSED_PORTS_PER_ASSET,
@@ -357,6 +358,69 @@ class PersistenceAndApiTests(unittest.TestCase):
             0,
         )
 
+    def test_sensor_context_is_transactional_and_deduplicates_source_events(self):
+        raw = self.alert(10)
+        event = SensorEvent(
+            timestamp=raw["timestamp"],
+            signature_id=87702,
+            signature="Multiple firewall blocks",
+            severity=10,
+            raw_event=raw,
+            sensor=SensorContext(
+                source="wazuh",
+                instance="test-manager",
+                event_id="123.456",
+                agent_id="000",
+                agent_name="test-manager",
+            ),
+        )
+        triage.insert_triage_row(self.conn, event, self.verdict("test-model"))
+
+        context = self.conn.execute(
+            """SELECT source_type, source_instance, source_event_id,
+                      agent_id, agent_name
+               FROM sensor_event_context"""
+        ).fetchone()
+        self.assertEqual(
+            context,
+            ("wazuh", "test-manager", "123.456", "000", "test-manager"),
+        )
+        api_context = self.client.get(
+            "/api/verdicts", headers={"host": "localhost"}
+        ).json()["verdicts"][0]["sensor_context"]
+        self.assertEqual(
+            api_context,
+            {
+                "source": "wazuh",
+                "instance": "test-manager",
+                "event_id": "123.456",
+                "agent": {"id": "000", "name": "test-manager"},
+            },
+        )
+
+        dashboard.MODE = "demo"
+        demo_context = self.client.get(
+            "/api/verdicts", headers={"host": "localhost"}
+        ).json()["verdicts"][0]["sensor_context"]
+        self.assertEqual(
+            demo_context,
+            {
+                "source": "wazuh",
+                "instance": None,
+                "event_id": None,
+                "agent": None,
+            },
+        )
+        dashboard.MODE = "local"
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            triage.insert_triage_row(self.conn, event, self.verdict("test-model"))
+        self.conn.rollback()
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM triage_events").fetchone()[0],
+            1,
+        )
+
     def test_api_returns_snapshots_historical_nulls_and_demo_redaction(self):
         inventory = load_document(populated_document())
         triage.insert_triage_row(
@@ -378,6 +442,18 @@ class PersistenceAndApiTests(unittest.TestCase):
         snapshot = by_model["test-model"]["asset_context"]["source"]
         self.assertEqual(snapshot["hostname"], "example-host")
         self.assertEqual(snapshot["inventory_revision"], inventory.revision)
+        self.assertTrue(
+            all(
+                row["sensor_context"]
+                == {
+                    "source": "suricata",
+                    "instance": None,
+                    "event_id": None,
+                    "agent": None,
+                }
+                for row in by_model.values()
+            )
+        )
 
         dashboard.MODE = "demo"
         demo = self.client.get(
@@ -386,6 +462,18 @@ class PersistenceAndApiTests(unittest.TestCase):
         self.assertTrue(
             all(
                 row["asset_context"] == {"source": None, "destination": None}
+                for row in demo
+            )
+        )
+        self.assertTrue(
+            all(
+                row["sensor_context"]
+                == {
+                    "source": "suricata",
+                    "instance": None,
+                    "event_id": None,
+                    "agent": None,
+                }
                 for row in demo
             )
         )

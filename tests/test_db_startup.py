@@ -4,6 +4,7 @@
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -62,9 +63,14 @@ def create_existing_database_without_indexes(db_path: Path) -> None:
 def create_legacy_database_without_asset_columns(db_path: Path) -> None:
     """Create the pre-v0.3 schema with a historical verdict row."""
     schema_sql = (PROJECT_ROOT / "triagewall" / "schema.sql").read_text()
+    schema_sql = schema_sql.split("\n-- Source provenance", 1)[0]
     schema_sql = schema_sql.replace(
         "    src_asset_snapshot_id INTEGER,\n"
         "    dest_asset_snapshot_id INTEGER,\n",
+        "",
+    )
+    schema_sql = schema_sql.replace(
+        "    source_type TEXT NOT NULL DEFAULT 'suricata',\n",
         "",
     )
     conn = sqlite3.connect(db_path)
@@ -82,6 +88,41 @@ def create_legacy_database_without_asset_columns(db_path: Path) -> None:
 
 
 class DatabaseStartupTests(unittest.TestCase):
+    def test_concurrent_startup_creates_sensor_schema_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "triage.db"
+            errors = []
+
+            def initialize():
+                try:
+                    with patch.object(ingest, "DB_PATH", db_path):
+                        ingest.ensure_db_initialized()
+                except Exception as exc:  # pragma: no cover - assertion reports it
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=initialize) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+
+            self.assertEqual(errors, [])
+            conn = sqlite3.connect(db_path)
+            try:
+                context_table = conn.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type = 'table' AND name = 'sensor_event_context'"""
+                ).fetchone()
+                failure_columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info('ingest_failures')")
+                }
+            finally:
+                conn.close()
+
+            self.assertEqual(context_table, ("sensor_event_context",))
+            self.assertIn("source_type", failure_columns)
+
     def test_existing_database_receives_idempotent_asset_metadata_migration(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "triage.db"
@@ -105,6 +146,14 @@ class DatabaseStartupTests(unittest.TestCase):
                     """SELECT name FROM sqlite_master
                        WHERE type = 'table' AND name = 'asset_snapshots'"""
                 ).fetchone()
+                sensor_table = conn.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type = 'table' AND name = 'sensor_event_context'"""
+                ).fetchone()
+                failure_columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info('ingest_failures')")
+                }
             finally:
                 conn.close()
 
@@ -112,6 +161,8 @@ class DatabaseStartupTests(unittest.TestCase):
             self.assertIn("dest_asset_snapshot_id", columns)
             self.assertEqual(historical, (None, None))
             self.assertEqual(snapshot_table, ("asset_snapshots",))
+            self.assertEqual(sensor_table, ("sensor_event_context",))
+            self.assertIn("source_type", failure_columns)
 
     def test_existing_database_receives_indexes_without_data_loss(self):
         with tempfile.TemporaryDirectory() as temp_dir:
