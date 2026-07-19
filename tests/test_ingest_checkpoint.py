@@ -54,13 +54,29 @@ class IngestCheckpointTests(unittest.TestCase):
             "alert": {"signature_id": 2, "signature": "Persist me"},
         })
         verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
-        with patch.object(ingest, "call_ollama", return_value=verdict), patch.object(
+        context = {
+            "source": {"hostname": "example-host"},
+            "destination": None,
+        }
+        with patch.object(
+            ingest, "get_asset_context", return_value=context
+        ), patch.object(
+            ingest, "call_ollama", return_value=verdict
+        ) as call_ollama, patch.object(
             ingest, "insert_with_retry", return_value=False
-        ):
+        ) as insert_with_retry:
             result = ingest.process_line(self.conn, raw)
 
         self.assertFalse(result)
         self.assertFalse(result.checkpoint)
+        event = json.loads(raw)
+        call_ollama.assert_called_once_with(event, asset_context=context)
+        insert_with_retry.assert_called_once_with(
+            self.conn,
+            event,
+            verdict,
+            asset_context=context,
+        )
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM ingest_failures").fetchone()[0],
             0,
@@ -103,7 +119,11 @@ class IngestCheckpointTests(unittest.TestCase):
             verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
             calls = []
 
-            def return_verdict(event):
+            def return_verdict(event, asset_context=None):
+                self.assertEqual(
+                    asset_context,
+                    {"source": None, "destination": None},
+                )
                 calls.append(event["alert"]["signature_id"])
                 ingest._stop = True
                 return verdict

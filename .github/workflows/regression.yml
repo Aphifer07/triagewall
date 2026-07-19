@@ -41,6 +41,7 @@ jobs:
       - name: Run unit and security regressions
         run: >-
           python -m unittest
+          tests.test_asset_inventory
           tests.test_database
           tests.test_db_startup
           tests.test_dashboard_stats

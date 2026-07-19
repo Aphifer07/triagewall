@@ -73,10 +73,18 @@ docker-compose up -d        # Older Docker / Compose v1
 #   - OLLAMA_MODEL=hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M
 #   - INTERNAL_SUBNETS=10.0.0.0/24, 10.0.1.0/24, and 10.0.2.0/24
 #     (your internal network ranges, used for traffic-direction context in the LLM prompt)
+#   - HOST_ASSET_INVENTORY=./data/assets.json
+#     (optional private exact-IP inventory; the tracked default is valid and empty)
 # Then `docker compose up -d` again.
 ```
 
 You'll need [Ollama](https://ollama.com) running somewhere reachable on your network, with at least one compatible model pulled. The Ollama instance can be on the same host or a separate GPU node.
+
+The asset inventory follows the versioned contract in
+[`triagewall/config/assets.example.json`](triagewall/config/assets.example.json).
+Keep populated copies outside Git and mount one with `HOST_ASSET_INVENTORY`.
+Inventory changes are validated and loaded when the ingest container starts;
+missing, malformed, oversized, or ambiguous inventories fail startup.
 
 ## Performance & accuracy
 
