@@ -30,6 +30,8 @@ ASSET_FIELDS = {
     "exposed_ports",
 }
 PORT_FIELDS = {"protocol", "port"}
+ASSET_SNAPSHOT_FIELDS = ASSET_FIELDS | {"inventory_revision"}
+INVENTORY_REVISION_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class AssetInventoryError(ValueError):
@@ -165,6 +167,25 @@ def _validate_asset(value: Any, index: int) -> dict[str, Any]:
             "two-sided prompt context limit"
         )
     return asset
+
+
+def is_valid_asset_snapshot(value: Any) -> bool:
+    """Return whether a value has the complete validated snapshot contract."""
+    if not isinstance(value, dict):
+        return False
+    try:
+        _require_exact_fields(value, ASSET_SNAPSHOT_FIELDS, "asset snapshot")
+        _validate_asset(
+            {field: value[field] for field in ASSET_FIELDS},
+            0,
+        )
+    except AssetInventoryError:
+        return False
+    revision = value["inventory_revision"]
+    return (
+        isinstance(revision, str)
+        and INVENTORY_REVISION_RE.fullmatch(revision) is not None
+    )
 
 
 @dataclass(frozen=True)

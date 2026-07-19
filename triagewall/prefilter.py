@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import re
 
+from asset_inventory import is_valid_asset_snapshot
+
 
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_RULES = 512
@@ -113,9 +115,9 @@ class AssetSelector:
     internet_facing: bool | None = None
 
     def matches(self, asset):
-        if asset is not None and not isinstance(asset, dict):
+        if asset is not None and not is_valid_asset_snapshot(asset):
             return False
-        is_matched = isinstance(asset, dict)
+        is_matched = asset is not None
         if self.matched is not None and is_matched != self.matched:
             return False
         if not is_matched:
@@ -135,7 +137,10 @@ class AssetSelector:
                 return False
         if self.criticalities and asset.get("criticality") not in self.criticalities:
             return False
-        if self.internet_facing is not None and asset.get("internet_facing") is not self.internet_facing:
+        if (
+            self.internet_facing is not None
+            and asset.get("internet_facing") is not self.internet_facing
+        ):
             return False
         return True
 

@@ -109,8 +109,11 @@ class PolicyMatchingTests(unittest.TestCase):
             "destination": {
                 "hostname": "omv1",
                 "role": "container-host",
+                "ips": ["10.0.0.77"],
                 "criticality": "critical",
                 "internet_facing": False,
+                "exposed_ports": [{"protocol": "tcp", "port": 443}],
+                "inventory_revision": "sha256:" + ("a" * 64),
             },
         }
 
@@ -122,6 +125,9 @@ class PolicyMatchingTests(unittest.TestCase):
         }))
         self.assertIsNone(policy.match_reason(alert(), {
             **context, "destination": ["malformed"]
+        }))
+        self.assertIsNone(policy.match_reason(alert(), {
+            **context, "destination": {}
         }))
 
     def test_first_matching_rule_for_duplicate_sid_wins(self):
