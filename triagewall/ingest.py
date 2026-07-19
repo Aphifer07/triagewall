@@ -254,6 +254,14 @@ def process_line(conn, line):
             f"[{verdict['verdict']:>15}] {verdict['confidence']:.2f}  {sig[:80]}"
         )
         return PROCESSED_LINE
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
+        quarantine_line(
+            conn,
+            raw_line,
+            f"invalid alert data: {type(e).__name__}: {e}",
+        )
+        return CHECKPOINT_LINE
     except Exception as e:
         conn.rollback()
         log.error(
