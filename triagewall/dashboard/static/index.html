@@ -29,6 +29,7 @@
   .badge-prefilter { background: rgba(110,118,129,.2); color: #8b949e; border: 1px solid #30363d; }
   .badge-llm { background: rgba(88,166,255,.15); color: #58a6ff; }
   .badge-spc { background: rgba(163,113,247,.15); color: #a371f7; border: 1px solid rgba(163,113,247,.3); }
+  .badge-sensor { background: rgba(121,192,255,.1); color: #79c0ff; border: 1px solid rgba(121,192,255,.25); }
   .spc-panel { border-left: 3px solid #a371f7; }
   .spc-row { border-bottom: 1px solid #21262d; }
   .spc-row:last-child { border-bottom: none; }
@@ -461,9 +462,18 @@ function renderVerdicts(list) {
   document.getElementById("verdicts").innerHTML = list.map((v, i) => {
     const conf = (v.confidence * 100).toFixed(0);
     const isPrefilter = v.model_used === "prefilter";
-    const sourceBadge = isPrefilter
+    const classificationBadge = isPrefilter
       ? `<span class="badge badge-prefilter">prefilter</span>`
       : `<span class="badge badge-llm mono">${escapeHtml(v.model_used ?? 'llm')}</span>`;
+    const sensor = v.sensor_context?.source ?? 'suricata';
+    const sensorBadge = `<span class="badge badge-sensor">${escapeHtml(sensor)}</span>`;
+    const ruleLabel = sensor === 'wazuh' ? 'Rule' : 'SID';
+    const agent = v.sensor_context?.agent;
+    const networkContext = v.src_ip || v.dest_ip
+      ? `${escapeHtml(v.src_ip ?? '?')}:${escapeHtml(v.src_port ?? '?')} → ${escapeHtml(v.dest_ip ?? '?')}:${escapeHtml(v.dest_port ?? '?')} <span class="text-gray-600">${escapeHtml(v.proto ?? '')}</span>`
+      : agent?.name
+        ? `Agent ${escapeHtml(agent.name)}`
+        : '?';
 
     const reviewed = v.human_verdict
       ? `<div class="text-xs mt-2 ${v.agreed ? 'text-green-400' : 'text-red-400'}">
@@ -492,15 +502,15 @@ function renderVerdicts(list) {
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-2 flex-wrap">
             <span class="badge badge-${v.verdict}">${v.verdict.replace('_', ' ')}</span>
-            ${sourceBadge}
+            ${classificationBadge}
+            ${sensorBadge}
             <span class="text-xs text-gray-500 mono">${conf}%</span>
-            <span class="text-xs text-gray-500 mono">SID ${v.signature_id ?? '?'}</span>
+            <span class="text-xs text-gray-500 mono">${ruleLabel} ${v.signature_id ?? '?'}</span>
             <span class="text-xs text-gray-600 mono ml-auto">${ts}</span>
           </div>
           <div class="font-semibold text-gray-200 mt-2 leading-snug">${escapeHtml(v.signature ?? '?')}</div>
           <div class="text-xs text-gray-500 mt-1.5 mono">
-            ${v.src_ip ?? '?'}:${v.src_port ?? '?'} → ${v.dest_ip ?? '?'}:${v.dest_port ?? '?'}
-            <span class="text-gray-600">${v.proto ?? ''}</span>
+            ${networkContext}
           </div>
           <div class="reasoning mt-2.5">${escapeHtml(v.reasoning ?? '')}</div>
           ${reviewed}

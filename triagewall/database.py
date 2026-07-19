@@ -26,6 +26,7 @@ def connect_database(
 
     try:
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys=ON")
         if not readonly:
             journal_mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if str(journal_mode).lower() != "wal":

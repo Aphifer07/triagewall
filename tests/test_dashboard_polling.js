@@ -77,3 +77,19 @@ test("dashboard wires SPC outside the verdict-loading function", () => {
     /startIndependentPolling\(\{ loadMain: load, loadSpc \}\);/,
   );
 });
+
+test("dashboard renders source-aware labels and escapes agent names", () => {
+  const indexPath = path.join(
+    __dirname,
+    "..",
+    "triagewall",
+    "dashboard",
+    "static",
+    "index.html",
+  );
+  const html = fs.readFileSync(indexPath, "utf8");
+
+  assert.match(html, /sensor === 'wazuh' \? 'Rule' : 'SID'/);
+  assert.match(html, /Agent \$\{escapeHtml\(agent\.name\)\}/);
+  assert.match(html, /badge badge-sensor/);
+});

@@ -46,6 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_triage_processed ON triage_events(processed_at);
 -- ingest checkpoint advances, so malformed or unsupported input is not lost.
 CREATE TABLE IF NOT EXISTS ingest_failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL DEFAULT 'suricata',
     raw_line TEXT NOT NULL,
     error TEXT NOT NULL,
     failed_at TEXT NOT NULL
@@ -58,4 +59,17 @@ CREATE TABLE IF NOT EXISTS asset_snapshots (
     snapshot_hash TEXT NOT NULL UNIQUE,
     asset_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+-- Source provenance is kept in a companion table so existing triage_events
+-- databases do not require a backfill or table rewrite.
+CREATE TABLE IF NOT EXISTS sensor_event_context (
+    triage_event_id INTEGER PRIMARY KEY,
+    source_type TEXT NOT NULL,
+    source_instance TEXT,
+    source_event_id TEXT,
+    agent_id TEXT,
+    agent_name TEXT,
+    FOREIGN KEY (triage_event_id) REFERENCES triage_events(id) ON DELETE CASCADE,
+    UNIQUE (source_type, source_instance, source_event_id)
 );

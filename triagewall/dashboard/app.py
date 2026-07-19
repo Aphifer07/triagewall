@@ -148,6 +148,11 @@ def row_to_dict(row):
     d = dict(row)
     src_asset_json = d.pop("src_asset_json", None)
     dest_asset_json = d.pop("dest_asset_json", None)
+    sensor_source = d.pop("sensor_source", None) or "suricata"
+    sensor_instance = d.pop("sensor_instance", None)
+    sensor_event_id = d.pop("sensor_event_id", None)
+    sensor_agent_id = d.pop("sensor_agent_id", None)
+    sensor_agent_name = d.pop("sensor_agent_name", None)
 
     def parse_snapshot(value):
         if not isinstance(value, str):
@@ -161,6 +166,15 @@ def row_to_dict(row):
     d["asset_context"] = {
         "source": parse_snapshot(src_asset_json),
         "destination": parse_snapshot(dest_asset_json),
+    }
+    agent = None
+    if sensor_agent_id is not None or sensor_agent_name is not None:
+        agent = {"id": sensor_agent_id, "name": sensor_agent_name}
+    d["sensor_context"] = {
+        "source": sensor_source,
+        "instance": sensor_instance,
+        "event_id": sensor_event_id,
+        "agent": agent,
     }
     for field in ("timestamp", "processed_at", "reviewed_at"):
         if d.get(field):
@@ -176,6 +190,12 @@ def row_to_dict(row):
         d["reasoning"] = None
         d["human_notes"] = None
         d["asset_context"] = {"source": None, "destination": None}
+        d["sensor_context"] = {
+            "source": sensor_source,
+            "instance": None,
+            "event_id": None,
+            "agent": None,
+        }
     return d
 
 
@@ -214,12 +234,19 @@ def list_verdicts(
                        events.human_verdict, events.human_notes, events.agreed,
                        events.reviewed_at,
                        src_snapshot.asset_json AS src_asset_json,
-                       dest_snapshot.asset_json AS dest_asset_json
+                       dest_snapshot.asset_json AS dest_asset_json,
+                       sensor.source_type AS sensor_source,
+                       sensor.source_instance AS sensor_instance,
+                       sensor.source_event_id AS sensor_event_id,
+                       sensor.agent_id AS sensor_agent_id,
+                       sensor.agent_name AS sensor_agent_name
                 FROM triage_events AS events
                 LEFT JOIN asset_snapshots AS src_snapshot
                   ON src_snapshot.id = events.src_asset_snapshot_id
                 LEFT JOIN asset_snapshots AS dest_snapshot
                   ON dest_snapshot.id = events.dest_asset_snapshot_id
+                LEFT JOIN sensor_event_context AS sensor
+                  ON sensor.triage_event_id = events.id
                 {where_sql}
                 ORDER BY events.processed_at DESC NULLS LAST, events.id DESC
                 LIMIT ?""",

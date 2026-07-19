@@ -110,23 +110,42 @@ def ensure_db_initialized():
     schema_path = Path(__file__).parent / "schema.sql"
     schema_sql = schema_path.read_text()
 
-    conn = connect_database(DB_PATH)
-    try:
-        conn.executescript(schema_sql)
-        existing_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info('triage_events')")
-        }
-        for column_name in (
-            "src_asset_snapshot_id",
-            "dest_asset_snapshot_id",
-        ):
-            if column_name not in existing_columns:
+    for attempt in range(5):
+        conn = None
+        try:
+            conn = connect_database(DB_PATH)
+            conn.executescript(schema_sql)
+            conn.execute("BEGIN IMMEDIATE")
+            event_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info('triage_events')")
+            }
+            for column_name in (
+                "src_asset_snapshot_id",
+                "dest_asset_snapshot_id",
+            ):
+                if column_name not in event_columns:
+                    conn.execute(
+                        f"ALTER TABLE triage_events ADD COLUMN {column_name} INTEGER"
+                    )
+            failure_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info('ingest_failures')")
+            }
+            if "source_type" not in failure_columns:
                 conn.execute(
-                    f"ALTER TABLE triage_events ADD COLUMN {column_name} INTEGER"
+                    "ALTER TABLE ingest_failures ADD COLUMN source_type TEXT "
+                    "NOT NULL DEFAULT 'suricata'"
                 )
-        conn.commit()
-    finally:
-        conn.close()
+            conn.commit()
+            break
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.rollback()
+            if "locked" not in str(exc).lower() or attempt == 4:
+                raise
+            time.sleep(0.1 * (2**attempt))
+        finally:
+            if conn is not None:
+                conn.close()
 
     log.info("Ensured database schema and indexes from schema.sql")
 
@@ -160,12 +179,14 @@ def _line_is_complete_or_wait(line):
     return False
 
 
-def quarantine_line(conn, line, error):
+def quarantine_line(conn, line, error, source_type="suricata"):
     """Durably retain an unprocessable complete record before checkpointing."""
     conn.rollback()
     conn.execute(
-        "INSERT INTO ingest_failures (raw_line, error, failed_at) VALUES (?, ?, ?)",
+        """INSERT INTO ingest_failures
+           (source_type, raw_line, error, failed_at) VALUES (?, ?, ?, ?)""",
         (
+            source_type,
             line.rstrip("\r\n"),
             str(error)[:1000],
             utc_now_iso(),
