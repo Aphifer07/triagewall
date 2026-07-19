@@ -104,7 +104,9 @@ class IngestDurabilityTests(unittest.TestCase):
         self.conn.close()
 
     def test_non_object_json_is_durably_quarantined(self):
-        self.assertFalse(ingest.process_line(self.conn, '[{"event_type":"alert"}]'))
+        result = ingest.process_line(self.conn, '[{"event_type":"alert"}]')
+        self.assertFalse(result)
+        self.assertTrue(result.checkpoint)
         row = self.conn.execute(
             "SELECT raw_line, error FROM ingest_failures"
         ).fetchone()
@@ -113,7 +115,9 @@ class IngestDurabilityTests(unittest.TestCase):
 
     def test_invalid_alert_metadata_is_durably_quarantined(self):
         raw = '{"event_type":"alert","alert":[]}'
-        self.assertFalse(ingest.process_line(self.conn, raw))
+        result = ingest.process_line(self.conn, raw)
+        self.assertFalse(result)
+        self.assertTrue(result.checkpoint)
         row = self.conn.execute(
             "SELECT raw_line, error FROM ingest_failures"
         ).fetchone()
