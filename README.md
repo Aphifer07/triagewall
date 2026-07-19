@@ -17,6 +17,7 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 ## What it does
 
 - **Reads Suricata `eve.json`** in real time, tracks position across restarts and log rotations
+- **Optionally reads Wazuh `alerts.json`** from a local read-only Docker volume, admitting configurable security-relevant levels through the same private LLM pipeline
 - **Pre-filters known-benign rules** with a tunable JSON config (the "I already know what STUN traffic is, stop telling me" filter) — microsecond lookups, zero LLM cost
 - **Triages residual alerts** with a local LLM via Ollama (default: `hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M` as of v0.2-alpha, see [Performance & accuracy](#performance--accuracy) for VRAM-based model selection)
 - **Records your feedback** — every verdict has Agree / Mark Different buttons in the dashboard, building a labeled dataset and a measurable agreement rate
@@ -88,6 +89,20 @@ missing, malformed, oversized, or ambiguous inventories fail startup.
 Each asset is limited to 64 IP addresses and 64 exposed ports, and validation
 keeps the complete two-sided asset context within 2 KiB so trusted context
 cannot exhaust the model prompt budget.
+
+### Optional Wazuh connection
+
+The opt-in `docker-compose.wazuh.yml` file provides a `wazuh` profile that tails
+a same-host Wazuh manager's local `alerts.json` without API credentials or
+Docker-socket access. The base Compose project has no Wazuh volume dependency.
+The recommended level-8 admission gate keeps routine Wazuh events in Wazuh
+while sending security-relevant alerts through Triagewall. Source, event, and
+agent identity are persisted with each verdict, and the checkpoint can recover
+through Wazuh's compressed daily archives.
+
+See [Wazuh alerts.json integration](docs/wazuh-integration.md) for Docker
+requirements, private `.env` settings, startup verification, archive-gap
+recovery, and rollback.
 
 ## Performance & accuracy
 
