@@ -103,9 +103,10 @@ signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
 
-def ensure_db_initialized():
+def ensure_db_initialized(db_path=None):
     """Create the database if needed and apply idempotent schema updates."""
-    os.makedirs(DB_PATH.parent, exist_ok=True)
+    target_path = Path(db_path) if db_path is not None else DB_PATH
+    os.makedirs(target_path.parent, exist_ok=True)
 
     schema_path = Path(__file__).parent / "schema.sql"
     schema_sql = schema_path.read_text()
@@ -113,7 +114,7 @@ def ensure_db_initialized():
     for attempt in range(5):
         conn = None
         try:
-            conn = connect_database(DB_PATH)
+            conn = connect_database(target_path)
             conn.executescript(schema_sql)
             conn.execute("BEGIN IMMEDIATE")
             event_columns = {
@@ -193,7 +194,7 @@ def quarantine_line(conn, line, error, source_type="suricata"):
         ),
     )
     conn.commit()
-    log.error(f"Quarantined unprocessable eve.json record: {error}")
+    log.error(f"Quarantined unprocessable {source_type} record: {error}")
 
 
 def is_duplicate(conn, alert):
@@ -245,9 +246,14 @@ def insert_with_retry(
                     )
                     time.sleep(sleep_time)
                 else:
+                    event_reference = (
+                        event.get("flow_id")
+                        if isinstance(event, dict)
+                        else event.sensor.event_id
+                    )
                     logging.error(
                         f"Failed to insert alert after {max_retries} attempts; "
-                        f"will retry without checkpointing event: {event.get('flow_id')}"
+                        f"will retry without checkpointing event: {event_reference}"
                     )
                     return False
             else:
