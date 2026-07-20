@@ -73,3 +73,14 @@ CREATE TABLE IF NOT EXISTS sensor_event_context (
     FOREIGN KEY (triage_event_id) REFERENCES triage_events(id) ON DELETE CASCADE,
     UNIQUE (source_type, source_instance, source_event_id)
 );
+
+-- SQLite treats NULL values as distinct inside a UNIQUE table constraint.
+-- Normalize the optional instance for events that do carry a stable source ID
+-- so adapters cannot persist the same instance-less event more than once.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sensor_event_source_identity
+ON sensor_event_context (
+    source_type,
+    COALESCE(source_instance, ''),
+    source_event_id
+)
+WHERE source_event_id IS NOT NULL;
