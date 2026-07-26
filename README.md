@@ -1,8 +1,15 @@
 # Triagewall
 
-**Local-LLM Suricata alert triage for homelabs.** Reduce alert noise without sending data to the cloud. Runs entirely on your hardware. No telemetry. AGPL-3.0.
+**Local-first AI triage for Suricata and Wazuh alerts.** Reduce security-alert
+noise without sending telemetry to a cloud model. Runs entirely on your
+hardware. No telemetry. AGPL-3.0.
 
-> **TL;DR** — `docker compose up`, point it at your Suricata `eve.json`, and Triagewall pre-filters known noise out of the box. The remaining alerts get classified by a local LLM, with a dashboard showing what to investigate. Designed for homelabs and small SOCs running Suricata on OPNsense, pfSense, or any sensor that writes Suricata-format `eve.json`.
+> **TL;DR** — Point Triagewall at Suricata `eve.json` and, optionally, a
+> same-host Wazuh `alerts.json` stream. It applies validated deterministic
+> filtering where appropriate, sends the remaining evidence through an
+> isolated local-LLM pipeline, and shows source-aware verdicts in one dashboard.
+> Core remains local, read-only with respect to sensors, and independently
+> useful without optional components.
 
 ![Triagewall dashboard](https://raw.githubusercontent.com/aaronphifer/triagewall-site/main/dashboard.png)
 
@@ -20,10 +27,26 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 - **Optionally reads Wazuh `alerts.json`** from a local read-only Docker volume, admitting configurable security-relevant levels through the same private LLM pipeline
 - **Pre-filters known-benign rules** with a tunable JSON config (the "I already know what STUN traffic is, stop telling me" filter) — microsecond lookups, zero LLM cost
 - **Triages residual alerts** with a local LLM via Ollama (default: `hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M` as of v0.2-alpha, see [Performance & accuracy](#performance--accuracy) for VRAM-based model selection)
+- **Preserves sensor provenance** so Suricata and Wazuh verdicts retain their source, event identity, and Wazuh agent context
+- **Enriches exact IP matches** with a private, validated asset inventory while preserving the context revision used for each verdict
 - **Records your feedback** — every verdict has Agree / Mark Different buttons in the dashboard, building a labeled dataset and a measurable agreement rate
 - **Surfaces what matters** in a clean web dashboard with hourly traffic trends
 
-### New in v0.2 (2026-05)
+### Current status: v0.3 closeout
+
+The v0.3 implementation now provides one source-aware triage pipeline for
+Suricata network alerts and actionable Wazuh alerts. The multi-source
+foundation, Wazuh adapter, least-privilege optional Compose integration, exact-IP
+asset context, scoped prefilter policy, durable checkpoints, migration
+hardening, bounded queries, runtime dependency locks, regression CI, and
+CodeQL coverage are implemented.
+
+The release is in closeout rather than tagged as complete. Remaining work is
+focused on documented live verification, current architecture and deployment
+documentation, and release preparation. The existing Core installation remains
+the supported operational product throughout this work.
+
+### Foundation from v0.2
 
 - **Production model swap** from Mistral 7B to Cisco's [Foundation-Sec-8B-Instruct](https://huggingface.co/fdtn-ai/Foundation-Sec-8B-Instruct), a security-domain-tuned model. Validated against a human-labeled gold set: revising the prompt moved Foundation-Sec Q5_K_M from Cohen's κ=0.210 to κ=0.687 and from 0% to 83% true-positive recall, beating Mistral 7B (κ=0.480) on the same gold set — the model's security specialization was latent and the prompt had to elicit it.
 - **Revised system prompt** with explicit category priors (ET DROP, ET EXPLOIT_KIT, ET MALWARE), threat-intel context (Spamhaus, geographic priors), and operational context (smart TV ad-tech, cloud IP ranges). Required to unlock Foundation-Sec's specialized training — see [the experiment writeup](docs/experiments/2026-05-22-prompt-revision.md) for the full methodology.
@@ -198,7 +221,11 @@ Triagewall is only as useful as the alerts Suricata feeds it, and Suricata at a 
 
 This is the default deployment model and isn't a Triagewall limitation specifically — it's an IDS architecture reality. In enterprise environments, SPAN/mirror ports on switches give Suricata visibility into east-west traffic. Most homelabs don't have the spare NIC budget for that.
 
-**Practical implication for homelab users:** Triagewall covers the perimeter well. For internal lateral-movement detection, pair it with endpoint agents (Wazuh) on hosts you control. Multi-sensor integration is planned for v0.3.
+**Practical implication for homelab users:** Suricata provides strong perimeter
+visibility but cannot observe every same-segment interaction. Triagewall can
+now add actionable Wazuh alerts from enrolled endpoints to the same
+source-aware triage view. This improves context; it does not turn Triagewall
+into an endpoint agent or replace either sensor.
 
 ## What it does not do
 
@@ -211,19 +238,34 @@ This is the default deployment model and isn't a Triagewall limitation specifica
 
 See [ROADMAP.md](ROADMAP.md) for the full plan. Highlights:
 
-**v0.2 (shipped, May 2026):** Two-phase prompt injection hardening — Phase 1 (canary token detection, strict response-schema validation) and Phase 2 (field isolation: 16 attacker-controlled fields base64-encapsulated with boundary markers, closing a URL-injection vulnerability). Plus Foundation-Sec-8B model swap, benchmark harness, 265-alert gold set, SQLite WAL mode, and mounted prefilter volume. See the [writeup](https://triagewall.io/posts/prompt-injection-phase-2).
+**Core v0.3 closeout:** finish and verify the production release that unifies
+Suricata and actionable Wazuh alerts with source provenance, trusted asset
+context, hostile-field isolation, durable recovery, and source-aware dashboard
+output.
 
-**v0.2.1 (next, June 2026):** Garak injection gate (pre-release adversarial scanning of the full pipeline), prompt iteration so URL injection produces an explicit "real + flagged" verdict, architecture diagram.
+**Core operational usability:** add a bounded alert-detail view, source and
+time filtering, IP and asset filtering, saved views, and structured JSON
+export.
 
-**v0.3 (Jul–Aug 2026):** Wazuh integration — pull Wazuh alerts through the same LLM triage pipeline. Source-aware prompts, multi-sensor schema, gold-set change validation (regressions block + notify, never silent).
+**Decision provenance and portable event bundles:** make every verdict
+traceable through its sensor identity, policy, prompt, model, validation, and
+operator feedback. Export sanitized, versioned bundles without requiring
+access to the production database or sensor logs.
 
-**v0.4 (Sep–Oct 2026):** Awareness layer — daily plain-English digest, coverage gap detection ("12 active devices but only 3 running endpoint agents"), cross-sensor correlation, assisted prefilter suggestions (you approve), asset criticality tagging.
+**Triagewall Lab:** a future optional evaluation application for replay, model
+and prompt comparison, injection testing, gold-set regression, and
+human-reviewed release gates. Lab will run independently or alongside Core,
+but it will not participate in live ingestion or modify production behavior.
+It is a direction, not a currently shipped component.
 
-**v0.5 (late 2026):** Vulnerability summarization wrapping Wazuh vulnerability detection and/or OpenVAS with LLM-driven prioritization and remediation guidance.
+**Awareness:** build cross-sensor correlation, daily narratives, coverage-gap
+reporting, assisted tuning suggestions, and operator-controlled notifications
+on top of the operational and provenance foundations.
 
-**v1.0 (early 2027):** Positioned as a homelab security awareness platform — the tool that fights the "out of sight, out of mind" problem by surfacing what matters across all your sensors without requiring you to remember to check dashboards.
-
-Strategy: integrate battle-tested tools (Suricata, Wazuh, Zeek, Pi-hole, OpenVAS), don't reinvent. The LLM provides reasoning and prioritization; the underlying tools provide the data.
+The strategy remains: integrate battle-tested tools rather than reinvent them.
+Suricata, Wazuh, and future sensors provide detection and ground truth;
+Triagewall provides safe local reasoning, prioritization, correlation, and
+operator awareness.
 
 ## Contributing
 
