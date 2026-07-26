@@ -421,6 +421,34 @@ class PersistenceAndApiTests(unittest.TestCase):
             1,
         )
 
+    def test_null_source_instance_still_deduplicates_source_events(self):
+        raw = self.alert(11)
+        event = SensorEvent(
+            timestamp=raw["timestamp"],
+            signature_id=11,
+            signature="Instance-less source event",
+            raw_event=raw,
+            sensor=SensorContext(
+                source="example-sensor",
+                event_id="event-11",
+            ),
+        )
+        triage.insert_triage_row(self.conn, event, self.verdict("test-model"))
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            triage.insert_triage_row(self.conn, event, self.verdict("test-model"))
+        self.conn.rollback()
+
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM triage_events").fetchone()[0],
+            1,
+        )
+        context = self.conn.execute(
+            """SELECT source_type, source_instance, source_event_id
+               FROM sensor_event_context"""
+        ).fetchone()
+        self.assertEqual(context, ("example-sensor", None, "event-11"))
+
     def test_api_returns_snapshots_historical_nulls_and_demo_redaction(self):
         inventory = load_document(populated_document())
         triage.insert_triage_row(

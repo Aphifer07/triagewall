@@ -24,6 +24,7 @@ EXPECTED_INDEXES = {
     "idx_triage_verdict",
     "idx_triage_processed",
 }
+SENSOR_IDENTITY_INDEX = "idx_sensor_event_source_identity"
 
 
 def create_existing_database_without_indexes(db_path: Path) -> None:
@@ -113,6 +114,12 @@ class DatabaseStartupTests(unittest.TestCase):
                     """SELECT name FROM sqlite_master
                        WHERE type = 'table' AND name = 'sensor_event_context'"""
                 ).fetchone()
+                context_indexes = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA index_list('sensor_event_context')"
+                    ).fetchall()
+                }
                 failure_columns = {
                     row[1]
                     for row in conn.execute("PRAGMA table_info('ingest_failures')")
@@ -121,6 +128,7 @@ class DatabaseStartupTests(unittest.TestCase):
                 conn.close()
 
             self.assertEqual(context_table, ("sensor_event_context",))
+            self.assertIn(SENSOR_IDENTITY_INDEX, context_indexes)
             self.assertIn("source_type", failure_columns)
 
     def test_existing_database_receives_idempotent_asset_metadata_migration(self):
@@ -150,6 +158,12 @@ class DatabaseStartupTests(unittest.TestCase):
                     """SELECT name FROM sqlite_master
                        WHERE type = 'table' AND name = 'sensor_event_context'"""
                 ).fetchone()
+                sensor_indexes = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA index_list('sensor_event_context')"
+                    ).fetchall()
+                }
                 failure_columns = {
                     row[1]
                     for row in conn.execute("PRAGMA table_info('ingest_failures')")
@@ -162,6 +176,7 @@ class DatabaseStartupTests(unittest.TestCase):
             self.assertEqual(historical, (None, None))
             self.assertEqual(snapshot_table, ("asset_snapshots",))
             self.assertEqual(sensor_table, ("sensor_event_context",))
+            self.assertIn(SENSOR_IDENTITY_INDEX, sensor_indexes)
             self.assertIn("source_type", failure_columns)
 
     def test_existing_database_receives_indexes_without_data_loss(self):
