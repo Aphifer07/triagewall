@@ -41,6 +41,12 @@ CREATE INDEX IF NOT EXISTS idx_triage_timestamp ON triage_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_triage_signature_id ON triage_events(signature_id);
 CREATE INDEX IF NOT EXISTS idx_triage_verdict ON triage_events(verdict);
 CREATE INDEX IF NOT EXISTS idx_triage_processed ON triage_events(processed_at);
+CREATE INDEX IF NOT EXISTS idx_triage_src_asset_snapshot
+ON triage_events(src_asset_snapshot_id)
+WHERE src_asset_snapshot_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_triage_dest_asset_snapshot
+ON triage_events(dest_asset_snapshot_id)
+WHERE dest_asset_snapshot_id IS NOT NULL;
 
 -- Complete input records that cannot be triaged are retained before the
 -- ingest checkpoint advances, so malformed or unsupported input is not lost.

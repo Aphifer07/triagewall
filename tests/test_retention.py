@@ -353,6 +353,19 @@ class RetentionTests(unittest.TestCase):
         details = " ".join(row[3] for row in plan)
         self.assertIn("idx_triage_processed", details)
 
+    def test_orphan_cleanup_uses_snapshot_reference_indexes(self):
+        plan = self.conn.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT 1 FROM triage_events
+               WHERE src_asset_snapshot_id = ?
+                  OR dest_asset_snapshot_id = ?""",
+            (1, 1),
+        ).fetchall()
+
+        details = " ".join(row[3] for row in plan)
+        self.assertIn("idx_triage_src_asset_snapshot", details)
+        self.assertIn("idx_triage_dest_asset_snapshot", details)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
