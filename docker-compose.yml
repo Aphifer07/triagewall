@@ -55,3 +55,26 @@ services:
     depends_on:
       - ingest
     restart: unless-stopped
+
+  maintenance:
+    profiles: ["maintenance"]
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    entrypoint:
+      - python3
+      - triagewall/retention.py
+    command:
+      - status
+    environment:
+      TZ: ${TZ:-UTC}
+      DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+      - ${HOST_BACKUP_DIR:-./backups}:/var/backups/triagewall
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

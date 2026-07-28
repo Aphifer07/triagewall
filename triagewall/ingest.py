@@ -115,28 +115,43 @@ def ensure_db_initialized(db_path=None):
         conn = None
         try:
             conn = connect_database(target_path)
-            conn.executescript(schema_sql)
             conn.execute("BEGIN IMMEDIATE")
-            event_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info('triage_events')")
-            }
-            for column_name in (
-                "src_asset_snapshot_id",
-                "dest_asset_snapshot_id",
-            ):
-                if column_name not in event_columns:
-                    conn.execute(
-                        f"ALTER TABLE triage_events ADD COLUMN {column_name} INTEGER"
+            event_table_exists = conn.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table' AND name = 'triage_events'"""
+            ).fetchone()
+            if event_table_exists:
+                event_columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info('triage_events')")
+                }
+                for column_name in (
+                    "src_asset_snapshot_id",
+                    "dest_asset_snapshot_id",
+                ):
+                    if column_name not in event_columns:
+                        conn.execute(
+                            f"ALTER TABLE triage_events "
+                            f"ADD COLUMN {column_name} INTEGER"
+                        )
+            failure_table_exists = conn.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table' AND name = 'ingest_failures'"""
+            ).fetchone()
+            if failure_table_exists:
+                failure_columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info('ingest_failures')"
                     )
-            failure_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info('ingest_failures')")
-            }
-            if "source_type" not in failure_columns:
-                conn.execute(
-                    "ALTER TABLE ingest_failures ADD COLUMN source_type TEXT "
-                    "NOT NULL DEFAULT 'suricata'"
-                )
+                }
+                if "source_type" not in failure_columns:
+                    conn.execute(
+                        "ALTER TABLE ingest_failures ADD COLUMN source_type TEXT "
+                        "NOT NULL DEFAULT 'suricata'"
+                    )
             conn.commit()
+            conn.executescript(schema_sql)
             break
         except sqlite3.OperationalError as exc:
             if conn is not None:

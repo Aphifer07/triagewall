@@ -23,6 +23,8 @@ EXPECTED_INDEXES = {
     "idx_triage_signature_id",
     "idx_triage_verdict",
     "idx_triage_processed",
+    "idx_triage_src_asset_snapshot",
+    "idx_triage_dest_asset_snapshot",
 }
 SENSOR_IDENTITY_INDEX = "idx_sensor_event_source_identity"
 
@@ -72,6 +74,15 @@ def create_legacy_database_without_asset_columns(db_path: Path) -> None:
     )
     schema_sql = schema_sql.replace(
         "    source_type TEXT NOT NULL DEFAULT 'suricata',\n",
+        "",
+    )
+    schema_sql = schema_sql.replace(
+        "CREATE INDEX IF NOT EXISTS idx_triage_src_asset_snapshot\n"
+        "ON triage_events(src_asset_snapshot_id)\n"
+        "WHERE src_asset_snapshot_id IS NOT NULL;\n"
+        "CREATE INDEX IF NOT EXISTS idx_triage_dest_asset_snapshot\n"
+        "ON triage_events(dest_asset_snapshot_id)\n"
+        "WHERE dest_asset_snapshot_id IS NOT NULL;\n",
         "",
     )
     conn = sqlite3.connect(db_path)
