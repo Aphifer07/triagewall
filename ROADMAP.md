@@ -54,14 +54,17 @@ Prompt-injection and operational hardening.
   trusted; unknown and free-text evidence is isolated by default
 - [x] SQLite WAL mode, bounded automatic checkpointing, and busy timeouts
 - [x] Mounted, validated prefilter configuration
-- [x] Durable quarantine for malformed and failed ingest records
-- [x] Checkpoint advancement only after a durable process or intentional skip
-- [x] Trusted-host validation and complete demo-mode redaction
-- [x] Required regression CI, CodeQL, and Dependabot
 
 ---
 
 ## Current and planned
+
+### Post-v0.2 hardening in the current tree
+
+- [x] Durable quarantine for malformed and failed ingest records
+- [x] Checkpoint advancement only after a durable process or intentional skip
+- [x] Trusted-host validation and complete demo-mode redaction
+- [x] Required regression CI, CodeQL, and Dependabot
 
 ### v0.2.1 — June 2026
 

@@ -56,6 +56,7 @@ _load_dotenv(override=False)
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
 from triage import call_ollama, get_asset_context, insert_triage_row, MODEL
+from sensor_event import SuricataValidationError, normalize_suricata_event
 
 # --- Config ---
 DEMO_MODE = os.environ.get("DEMO_MODE", "false").strip().lower() == "true"
@@ -289,17 +290,23 @@ def process_line(conn, line):
         quarantine_line(conn, raw_line, f"invalid alert timestamp: {e}")
         return CHECKPOINT_LINE
 
+    try:
+        normalized_event = normalize_suricata_event(event)
+    except SuricataValidationError as e:
+        quarantine_line(conn, raw_line, f"invalid alert data: {e}")
+        return CHECKPOINT_LINE
+
     if is_duplicate(conn, event):
         log.debug(f"Skipping duplicate alert flow_id={event.get('flow_id')}")
         return CHECKPOINT_LINE
 
-    sig = event.get("alert", {}).get("signature", "?")
+    sig = normalized_event.signature
     try:
         asset_context = get_asset_context(event)
         verdict = call_ollama(event, asset_context=asset_context)
         if not insert_with_retry(
             conn,
-            event,
+            normalized_event,
             verdict,
             asset_context=asset_context,
         ):

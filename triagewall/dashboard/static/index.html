@@ -405,7 +405,7 @@ function renderSpc(data) {
     const featureLabel = isRate
       ? `<span class="spc-feature-rate font-semibold">rate spike</span>`
       : `<span class="spc-feature-novel font-semibold">novel signature</span>`;
-    const sid = a.signature_id != null ? `<span class="text-gray-500 mono">SID ${a.signature_id}</span>` : '';
+    const sid = a.signature_id != null ? `<span class="text-gray-500 mono">SID ${escapeHtml(a.signature_id)}</span>` : '';
     return `
       <div class="spc-row py-3 flex items-start gap-3">
         <span class="badge badge-spc mt-0.5">SPC</span>
@@ -505,7 +505,7 @@ function renderVerdicts(list) {
             ${classificationBadge}
             ${sensorBadge}
             <span class="text-xs text-gray-500 mono">${conf}%</span>
-            <span class="text-xs text-gray-500 mono">${ruleLabel} ${v.signature_id ?? '?'}</span>
+            <span class="text-xs text-gray-500 mono">${ruleLabel} ${escapeHtml(v.signature_id ?? '?')}</span>
             <span class="text-xs text-gray-600 mono ml-auto">${ts}</span>
           </div>
           <div class="font-semibold text-gray-200 mt-2 leading-snug">${escapeHtml(v.signature ?? '?')}</div>

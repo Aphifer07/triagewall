@@ -78,7 +78,7 @@ test("dashboard wires SPC outside the verdict-loading function", () => {
   );
 });
 
-test("dashboard renders source-aware labels and escapes agent names", () => {
+test("dashboard renders source-aware labels and escapes dynamic identifiers", () => {
   const indexPath = path.join(
     __dirname,
     "..",
@@ -91,5 +91,10 @@ test("dashboard renders source-aware labels and escapes agent names", () => {
 
   assert.match(html, /sensor === 'wazuh' \? 'Rule' : 'SID'/);
   assert.match(html, /Agent \$\{escapeHtml\(agent\.name\)\}/);
+  assert.match(html, /SID \$\{escapeHtml\(a\.signature_id\)\}/);
+  assert.match(
+    html,
+    /\$\{ruleLabel\} \$\{escapeHtml\(v\.signature_id \?\? '\?'\)\}/,
+  );
   assert.match(html, /badge badge-sensor/);
 });

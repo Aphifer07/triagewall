@@ -57,7 +57,24 @@ def _load_dotenv(override: bool = False) -> None:
 
 _load_dotenv(override=False)
 
-MODE = os.environ.get("MODE", "local").lower()
+
+def _dashboard_mode_from_env() -> str:
+    """Resolve one shared demo setting while retaining MODE compatibility."""
+    configured_mode = os.environ.get("MODE", "").strip().lower()
+    if configured_mode:
+        if configured_mode not in {"local", "demo"}:
+            raise RuntimeError("MODE must be either 'local' or 'demo'")
+        return configured_mode
+
+    demo_mode = os.environ.get("DEMO_MODE", "false").strip().lower()
+    if demo_mode in {"true", "1", "yes", "on"}:
+        return "demo"
+    if demo_mode in {"false", "0", "no", "off", ""}:
+        return "local"
+    raise RuntimeError("DEMO_MODE must be a boolean value")
+
+
+MODE = _dashboard_mode_from_env()
 STALE_THRESHOLD_SECONDS = int(os.environ.get("STALE_THRESHOLD_SECONDS", "600"))
 DB_PATH = Path(
     os.environ.get("DB_PATH")

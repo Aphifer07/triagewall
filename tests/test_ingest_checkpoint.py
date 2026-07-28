@@ -17,6 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "triagewall"))
 
 import ingest
 import triage
+from sensor_event import normalize_suricata_event
 
 
 class IngestCheckpointTests(unittest.TestCase):
@@ -73,7 +74,7 @@ class IngestCheckpointTests(unittest.TestCase):
         call_ollama.assert_called_once_with(event, asset_context=context)
         insert_with_retry.assert_called_once_with(
             self.conn,
-            event,
+            normalize_suricata_event(event),
             verdict,
             asset_context=context,
         )

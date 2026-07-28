@@ -44,7 +44,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
       DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
-      MODE: ${MODE:-local}
+      MODE: ${MODE:-}
+      DEMO_MODE: ${DEMO_MODE:-false}
       DASHBOARD_HOST: ${DASHBOARD_HOST:-0.0.0.0}
       DASHBOARD_PORT: ${DASHBOARD_PORT:-8084}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost}
