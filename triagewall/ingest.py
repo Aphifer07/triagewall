@@ -22,6 +22,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from database import connect_database
+from environment import parse_boolean
 from time_utils import format_utc_timestamp, utc_now_iso
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,7 +64,10 @@ from sensor_event import (
 )
 
 # --- Config ---
-DEMO_MODE = os.environ.get("DEMO_MODE", "false").strip().lower() == "true"
+DEMO_MODE = parse_boolean(
+    os.environ.get("DEMO_MODE", "false"),
+    "DEMO_MODE",
+)
 EVE_PATH = Path(os.environ.get("EVE_PATH", "/var/log/suricata/eve.json"))
 POSITION_PATH = Path(os.environ.get("POSITION_PATH", "/var/lib/triagewall/position.json"))
 DB_PATH = Path(
@@ -317,7 +321,7 @@ def process_line(conn, line):
 
     classification_event = suricata_classification_alert(normalized_event)
 
-    if is_duplicate(conn, classification_event):
+    if is_duplicate(conn, event):
         log.debug(f"Skipping duplicate alert flow_id={event.get('flow_id')}")
         return CHECKPOINT_LINE
 

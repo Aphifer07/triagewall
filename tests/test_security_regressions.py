@@ -25,6 +25,7 @@ from sensor_event import SuricataValidationError, normalize_suricata_event
 from scripts import benchmark_quants
 from fastapi.testclient import TestClient
 from triagewall.dashboard import app as dashboard
+from triagewall.environment import parse_boolean
 from triagewall.time_utils import format_utc_timestamp
 
 
@@ -268,6 +269,13 @@ class DashboardBoundaryTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_shared_demo_environment_controls_dashboard_mode(self):
+        for value in ("true", "1", "yes", "on"):
+            with self.subTest(value=value):
+                self.assertTrue(parse_boolean(value, "DEMO_MODE"))
+        for value in ("false", "0", "no", "off", ""):
+            with self.subTest(value=value):
+                self.assertFalse(parse_boolean(value, "DEMO_MODE"))
+
         with patch.dict(
             os.environ,
             {"DEMO_MODE": "true", "MODE": ""},

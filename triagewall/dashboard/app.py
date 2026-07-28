@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from triagewall.dashboard.stats import get_dashboard_stats
 from triagewall.database import connect_database
+from triagewall.environment import parse_boolean
 from triagewall.storage import get_storage_metrics
 from triagewall.time_utils import (
     format_utc_timestamp,
@@ -67,12 +68,12 @@ def _dashboard_mode_from_env() -> str:
             raise RuntimeError("MODE must be either 'local' or 'demo'")
         return configured_mode
 
-    demo_mode = os.environ.get("DEMO_MODE", "false").strip().lower()
-    if demo_mode in {"true", "1", "yes", "on"}:
+    if parse_boolean(
+        os.environ.get("DEMO_MODE", "false"),
+        "DEMO_MODE",
+    ):
         return "demo"
-    if demo_mode in {"false", "0", "no", "off", ""}:
-        return "local"
-    raise RuntimeError("DEMO_MODE must be a boolean value")
+    return "local"
 
 
 MODE = _dashboard_mode_from_env()

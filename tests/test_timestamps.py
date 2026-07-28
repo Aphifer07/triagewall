@@ -112,6 +112,34 @@ class TimestampTests(unittest.TestCase):
 
         self.assertTrue(duplicate)
 
+    def test_process_line_skips_legacy_timestamp_duplicate_before_model(self):
+        conn = sqlite3.connect(":memory:")
+        conn.executescript((PROJECT_ROOT / "triagewall" / "schema.sql").read_text())
+        legacy_timestamp = "2026-07-19T04:30:00.123456+0000"
+        conn.execute(
+            """INSERT INTO triage_events
+               (timestamp, flow_id, signature_id, signature, raw_alert)
+               VALUES (?, ?, ?, ?, ?)""",
+            (legacy_timestamp, 42, 7, "Test", "{}"),
+        )
+        line = (
+            '{"event_type":"alert",'
+            f'"timestamp":"{legacy_timestamp}","flow_id":42,'
+            '"alert":{"signature_id":7,"signature":"Test"}}'
+        )
+
+        with patch.object(ingest, "call_ollama") as call_ollama:
+            result = ingest.process_line(conn, line)
+
+        row_count = conn.execute(
+            "SELECT COUNT(*) FROM triage_events"
+        ).fetchone()[0]
+        conn.close()
+        self.assertTrue(result.checkpoint)
+        self.assertFalse(result.processed)
+        self.assertEqual(row_count, 1)
+        call_ollama.assert_not_called()
+
     def test_invalid_ingest_timestamp_is_quarantined_before_triage(self):
         conn = sqlite3.connect(":memory:")
         conn.executescript((PROJECT_ROOT / "triagewall" / "schema.sql").read_text())
