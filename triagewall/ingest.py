@@ -56,7 +56,11 @@ _load_dotenv(override=False)
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
 from triage import call_ollama, get_asset_context, insert_triage_row, MODEL
-from sensor_event import SuricataValidationError, normalize_suricata_event
+from sensor_event import (
+    SuricataValidationError,
+    normalize_suricata_event,
+    suricata_classification_alert,
+)
 
 # --- Config ---
 DEMO_MODE = os.environ.get("DEMO_MODE", "false").strip().lower() == "true"
@@ -311,14 +315,19 @@ def process_line(conn, line):
         quarantine_line(conn, raw_line, f"invalid alert data: {e}")
         return CHECKPOINT_LINE
 
-    if is_duplicate(conn, event):
+    classification_event = suricata_classification_alert(normalized_event)
+
+    if is_duplicate(conn, classification_event):
         log.debug(f"Skipping duplicate alert flow_id={event.get('flow_id')}")
         return CHECKPOINT_LINE
 
     sig = normalized_event.signature
     try:
-        asset_context = get_asset_context(event)
-        verdict = call_ollama(event, asset_context=asset_context)
+        asset_context = get_asset_context(classification_event)
+        verdict = call_ollama(
+            classification_event,
+            asset_context=asset_context,
+        )
         if not insert_with_retry(
             conn,
             normalized_event,
@@ -331,7 +340,7 @@ def process_line(conn, line):
             return RETRY_LINE
         # SPC behavioral baselining — independent observer, never fatal
         try:
-            spc.observe(conn, event)
+            spc.observe(conn, classification_event)
             conn.commit()
         except Exception as e:
             log.warning(f"SPC observe failed (non-fatal): {type(e).__name__}: {e}")

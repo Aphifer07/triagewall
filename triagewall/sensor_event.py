@@ -188,3 +188,40 @@ def normalize_suricata_event(alert: Mapping[str, Any]) -> SensorEvent:
         raw_event=alert,
         sensor=SensorContext(source="suricata"),
     )
+
+
+def suricata_classification_alert(event: SensorEvent) -> dict[str, Any]:
+    """Project validated canonical fields over a detached copy of raw evidence."""
+    alert = dict(event.raw_event)
+    normalized_fields = {
+        "timestamp": event.timestamp,
+        "flow_id": event.flow_id,
+        "src_ip": event.src_ip,
+        "src_port": event.src_port,
+        "dest_ip": event.dest_ip,
+        "dest_port": event.dest_port,
+        "proto": event.proto,
+        "in_iface": event.in_iface,
+        "pkt_src": event.pkt_src,
+    }
+    for key, value in normalized_fields.items():
+        if value is None:
+            alert.pop(key, None)
+        else:
+            alert[key] = value
+
+    metadata = dict(alert.get("alert", {}))
+    normalized_metadata = {
+        "signature_id": event.signature_id,
+        "signature": event.signature,
+        "category": event.category,
+        "severity": event.severity,
+        "action": event.action,
+    }
+    for key, value in normalized_metadata.items():
+        if value is None:
+            metadata.pop(key, None)
+        else:
+            metadata[key] = value
+    alert["alert"] = metadata
+    return alert
