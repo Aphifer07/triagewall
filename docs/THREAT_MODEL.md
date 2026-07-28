@@ -42,11 +42,13 @@ or take autonomous action.
 
 The important boundaries are:
 
-1. **Sensors to adapters.** Records are untrusted input. Required typed
-   identity, timestamp, rule, level, network, and protocol fields are validated
-   before use. Free text, unknown fields, agent names, descriptions, URLs,
-   hostnames, payloads, TLS/DNS data, and Wazuh `data.*` values remain
-   attacker- or environment-controlled evidence.
+1. **Sensors to adapters.** Records are untrusted input. Suricata validates its
+   required timestamp and rule identity plus every optional flow, IP, port,
+   protocol, severity, and bounded rule-text field it consumes. Wazuh validates
+   its required timestamp, event identity, rule identity, and level, and
+   normalizes valid optional network fields. Free text, unknown fields, agent
+   names, descriptions, URLs, hostnames, payloads, TLS/DNS data, and Wazuh
+   `data.*` values remain attacker- or environment-controlled evidence.
 2. **Operator configuration to Core.** The mounted prefilter and asset
    inventory are trusted operator inputs, but they are still schema-, size-,
    type-, and ambiguity-validated. Invalid configured files fail startup.
@@ -84,9 +86,11 @@ control of the sensor ruleset is outside this threat model.
 
 Suricata uses a fail-closed typed allowlist: only explicitly trusted structured
 sensor fields remain plain; unknown and free-text fields are base64-wrapped with
-explicit untrusted-data boundaries. Wazuh uses a source-specific projection in
-which free text, descriptions, agent identity, location, groups, decoder data,
-`full_log`, and nested `data` strings are isolated as untrusted evidence.
+explicit untrusted-data boundaries. Allowlisted Suricata IP addresses, ports,
+protocols, and signature IDs also require valid values before they remain
+plain. Wazuh uses a source-specific projection in which free text, descriptions,
+agent identity, location, groups, decoder data, `full_log`, and nested `data`
+strings are isolated as untrusted evidence.
 
 A per-process canary is included in the system prompt. Raw and decoded model
 output is checked for that canary. A leaked canary causes a conservative
@@ -102,6 +106,9 @@ responses fail closed.
   32 KiB. Oversized complete records are hashed, quarantined with bounded
   diagnostics, and checkpointed without reaching Ollama.
 - Wazuh descriptions and agent fields have explicit length limits.
+- Suricata signature and rule-text fields have explicit length limits; invalid
+  rule identity, network tuple, protocol, severity, and flow identity values
+  are durably quarantined before model or database use.
 - Asset inventory and prefilter files are each limited to 1 MiB and have
   bounded collection and text fields.
 - Two-sided trusted asset prompt context is limited to 2 KiB.

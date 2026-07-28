@@ -22,6 +22,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from database import connect_database
+from environment import parse_boolean
 from time_utils import format_utc_timestamp, utc_now_iso
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,9 +57,17 @@ _load_dotenv(override=False)
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
 from triage import call_ollama, get_asset_context, insert_triage_row, MODEL
+from sensor_event import (
+    SuricataValidationError,
+    normalize_suricata_event,
+    suricata_classification_alert,
+)
 
 # --- Config ---
-DEMO_MODE = os.environ.get("DEMO_MODE", "false").strip().lower() == "true"
+DEMO_MODE = parse_boolean(
+    os.environ.get("DEMO_MODE", "false"),
+    "DEMO_MODE",
+)
 EVE_PATH = Path(os.environ.get("EVE_PATH", "/var/log/suricata/eve.json"))
 POSITION_PATH = Path(os.environ.get("POSITION_PATH", "/var/lib/triagewall/position.json"))
 DB_PATH = Path(
@@ -304,17 +313,28 @@ def process_line(conn, line):
         quarantine_line(conn, raw_line, f"invalid alert timestamp: {e}")
         return CHECKPOINT_LINE
 
+    try:
+        normalized_event = normalize_suricata_event(event)
+    except SuricataValidationError as e:
+        quarantine_line(conn, raw_line, f"invalid alert data: {e}")
+        return CHECKPOINT_LINE
+
+    classification_event = suricata_classification_alert(normalized_event)
+
     if is_duplicate(conn, event):
         log.debug(f"Skipping duplicate alert flow_id={event.get('flow_id')}")
         return CHECKPOINT_LINE
 
-    sig = event.get("alert", {}).get("signature", "?")
+    sig = normalized_event.signature
     try:
-        asset_context = get_asset_context(event)
-        verdict = call_ollama(event, asset_context=asset_context)
+        asset_context = get_asset_context(classification_event)
+        verdict = call_ollama(
+            classification_event,
+            asset_context=asset_context,
+        )
         if not insert_with_retry(
             conn,
-            event,
+            normalized_event,
             verdict,
             asset_context=asset_context,
         ):
@@ -324,7 +344,7 @@ def process_line(conn, line):
             return RETRY_LINE
         # SPC behavioral baselining — independent observer, never fatal
         try:
-            spc.observe(conn, event)
+            spc.observe(conn, classification_event)
             conn.commit()
         except Exception as e:
             log.warning(f"SPC observe failed (non-fatal): {type(e).__name__}: {e}")

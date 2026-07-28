@@ -17,6 +17,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "triagewall"))
 
 import ingest
 import triage
+from sensor_event import (
+    normalize_suricata_event,
+    suricata_classification_alert,
+)
 
 
 class IngestCheckpointTests(unittest.TestCase):
@@ -51,6 +55,8 @@ class IngestCheckpointTests(unittest.TestCase):
         raw = json.dumps({
             "event_type": "alert",
             "timestamp": "2026-07-19T00:00:00Z",
+            "src_ip": " 10.0.0.1 ",
+            "proto": "tcp",
             "alert": {"signature_id": 2, "signature": "Persist me"},
         })
         verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
@@ -60,7 +66,7 @@ class IngestCheckpointTests(unittest.TestCase):
         }
         with patch.object(
             ingest, "get_asset_context", return_value=context
-        ), patch.object(
+        ) as get_asset_context, patch.object(
             ingest, "call_ollama", return_value=verdict
         ) as call_ollama, patch.object(
             ingest, "insert_with_retry", return_value=False
@@ -70,10 +76,18 @@ class IngestCheckpointTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertFalse(result.checkpoint)
         event = json.loads(raw)
-        call_ollama.assert_called_once_with(event, asset_context=context)
+        normalized_event = normalize_suricata_event(event)
+        classification_event = suricata_classification_alert(normalized_event)
+        self.assertEqual(classification_event["src_ip"], "10.0.0.1")
+        self.assertEqual(classification_event["proto"], "TCP")
+        get_asset_context.assert_called_once_with(classification_event)
+        call_ollama.assert_called_once_with(
+            classification_event,
+            asset_context=context,
+        )
         insert_with_retry.assert_called_once_with(
             self.conn,
-            event,
+            normalized_event,
             verdict,
             asset_context=context,
         )

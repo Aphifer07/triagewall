@@ -30,6 +30,7 @@ told to (validated 2026-05-25), so the defense hides untrusted content from
 the instruction pathway rather than relying on the model to ignore it.
 """
 import base64
+import ipaddress
 import json
 import re
 
@@ -136,6 +137,23 @@ TRUSTED_PATHS = {
 }
 
 _ARRAY_INDEX_RE = re.compile(r"\.\d+(?=\.|$)")
+_SAFE_PROTOCOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,31}$")
+_IP_PATHS = {
+    "src_ip",
+    "dest_ip",
+    "alert.source.ip",
+    "alert.target.ip",
+    "flow.src_ip",
+    "flow.dest_ip",
+}
+_PORT_PATHS = {
+    "src_port",
+    "dest_port",
+    "alert.source.port",
+    "alert.target.port",
+    "flow.src_port",
+    "flow.dest_port",
+}
 
 
 def _normalize_path(path: str) -> str:
@@ -161,7 +179,28 @@ def _is_trusted(norm_path: str, value) -> bool:
     allowed = TRUSTED_PATHS.get(norm_path)
     if allowed is None:
         return False
-    return _json_type(value) in allowed
+    if _json_type(value) not in allowed:
+        return False
+    if norm_path in _IP_PATHS:
+        try:
+            ipaddress.ip_address(value.strip())
+        except ValueError:
+            return False
+    if norm_path in _PORT_PATHS:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= 65535
+        )
+    if norm_path == "alert.signature_id":
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 1 <= value <= (2**63) - 1
+        )
+    if norm_path in {"proto", "app_proto"}:
+        return _SAFE_PROTOCOL_RE.fullmatch(value) is not None
+    return True
 
 
 def _wrap_value(field_path: str, value) -> str:
