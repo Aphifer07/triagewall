@@ -41,10 +41,12 @@ asset context, scoped prefilter policy, durable checkpoints, migration
 hardening, bounded queries, runtime dependency locks, regression CI, and
 CodeQL coverage are implemented.
 
-The release is in closeout rather than tagged as complete. Remaining work is
-focused on documented live verification, current architecture and deployment
-documentation, and release preparation. The existing Core installation remains
-the supported operational product throughout this work.
+The release is in closeout rather than tagged as complete. The current
+multi-sensor build has been exercised against live Suricata and Wazuh streams;
+remaining work is concentrated on release preparation, a deliberate retention
+policy for long-running databases, and serializing startup migrations so
+optional ingest services do not compete for schema work. The existing Core
+installation remains the supported operational product throughout this work.
 
 ### Foundation from v0.2
 
@@ -138,7 +140,7 @@ Triagewall has been running on a homelab production network for multi-day contin
 | LLM latency | 7–10 seconds per call (Foundation-Sec-8B Q5_K_M on RTX 4060) |
 | End-to-end lag | under 2 minutes at steady state with healthy prefilter |
 | Daemon RAM footprint (excluding Ollama) | ~17 MB |
-| Database growth | ~1.5 GB after 7 days |
+| Database growth | Workload-dependent; one long-running deployment reached ~14.7 GB. Automated retention is not shipped yet. |
 | Classifier accuracy (v0.2, 265-alert gold set) | Cohen's κ = 0.687, true-positive recall = 83% |
 
 Throughput scales primarily with prefilter ratio. The two-tier design means prefiltered alerts are processed in microseconds; only LLM-classified alerts (typically 0.3–3% after tuning) are bound by Ollama latency.
@@ -234,14 +236,39 @@ into an endpoint agent or replace either sensor.
 - It does not call out to OpenAI, Anthropic, or any cloud LLM. Ever. By design.
 - It does not work without a GPU. Ollama runs models on CPU but inference is too slow to keep up with most networks' alert rates.
 
+## Product architecture: Core and Lab
+
+Triagewall is evolving as one product family with two independently runnable
+applications:
+
+- **Triagewall Core** is the production-supported alert-ingest, triage, and
+  operator dashboard shipped by this repository today.
+- **Triagewall Lab** is a future replay, evaluation, and release-validation
+  application. It will compare prompts and models, run injection and gold-set
+  regressions, and produce evidence for a human release decision. It will not
+  participate in live ingest or modify Core.
+
+Lab will be incubated privately while its interfaces and security model are
+experimental. After it meets documented graduation criteria, it will join this
+public repository as an optional application. The finished product will support
+Core-only, Lab-only, and explicitly enabled combined installations without
+making Lab a dependency of the default Core path.
+
+Core and Lab will exchange sanitized, versioned event bundles rather than share
+the production database, sensor logs, asset inventory, or checkpoints. See
+[Core and Lab product boundary](docs/core-lab-product-boundary.md) for the
+runtime boundary and graduation path. Lab is a product direction, not a
+currently shipped component.
+
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for the full plan. Highlights:
 
-**Core v0.3 closeout:** finish and verify the production release that unifies
-Suricata and actionable Wazuh alerts with source provenance, trusted asset
-context, hostile-field isolation, durable recovery, and source-aware dashboard
-output.
+**Core v0.3 closeout:** prepare the production release that unifies Suricata
+and actionable Wazuh alerts with source provenance, trusted asset context,
+hostile-field isolation, durable recovery, and source-aware dashboard output.
+Closeout now focuses on retention, serialized startup migrations, and release
+evidence rather than new sensor scope.
 
 **Core operational usability:** add a bounded alert-detail view, source and
 time filtering, IP and asset filtering, saved views, and structured JSON
@@ -252,11 +279,9 @@ traceable through its sensor identity, policy, prompt, model, validation, and
 operator feedback. Export sanitized, versioned bundles without requiring
 access to the production database or sensor logs.
 
-**Triagewall Lab:** a future optional evaluation application for replay, model
-and prompt comparison, injection testing, gold-set regression, and
-human-reviewed release gates. Lab will run independently or alongside Core,
-but it will not participate in live ingestion or modify production behavior.
-It is a direction, not a currently shipped component.
+**Triagewall Lab:** specify the portable event-bundle boundary, add sanitized
+Core export, incubate the Lab privately, and graduate it only after standalone,
+combined, security, upgrade, and removal paths are proven.
 
 **Awareness:** build cross-sensor correlation, daily narratives, coverage-gap
 reporting, assisted tuning suggestions, and operator-controlled notifications
