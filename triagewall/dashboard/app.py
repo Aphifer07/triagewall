@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from triagewall.dashboard.stats import get_dashboard_stats
 from triagewall.database import connect_database
+from triagewall.storage import get_storage_metrics
 from triagewall.time_utils import (
     format_utc_timestamp,
     parse_utc_timestamp,
@@ -324,6 +325,7 @@ def submit_feedback(event_id: int, payload: dict = Body(...)):
 @app.get("/api/health")
 def health():
     last_processed_at = None
+    storage = None
     with db(readonly=True) as conn:
         try:
             row = conn.execute(
@@ -331,6 +333,7 @@ def health():
             ).fetchone()
             if row:
                 last_processed_at = row["last_processed_at"]
+            storage = get_storage_metrics(conn, DB_PATH)
         except sqlite3.OperationalError:
             # If schema/table doesn't exist yet, treat as stale.
             last_processed_at = None
@@ -344,7 +347,10 @@ def health():
         except Exception:
             age_seconds = 10**9
 
-    payload = {"last_alert_age_seconds": max(0, age_seconds)}
+    payload = {
+        "last_alert_age_seconds": max(0, age_seconds),
+        "storage": storage,
+    }
     if age_seconds > STALE_THRESHOLD_SECONDS:
         payload["status"] = "stale"
         return JSONResponse(payload, status_code=503)

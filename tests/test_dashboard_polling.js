@@ -98,3 +98,20 @@ test("dashboard renders source-aware labels and escapes dynamic identifiers", ()
   );
   assert.match(html, /badge badge-sensor/);
 });
+
+test("dashboard renders storage allocation from the health endpoint", () => {
+  const indexPath = path.join(
+    __dirname,
+    "..",
+    "triagewall",
+    "dashboard",
+    "static",
+    "index.html",
+  );
+  const html = fs.readFileSync(indexPath, "utf8");
+
+  assert.match(html, /id="storageMeta"/);
+  assert.match(html, /health\.storage\.total_on_disk_bytes/);
+  assert.match(html, /health\.storage\.reusable_bytes/);
+  assert.match(html, /function formatBytes\(value\)/);
+});
