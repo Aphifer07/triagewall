@@ -1,182 +1,192 @@
-# Threat Model
+# Threat model
 
-This document states what Triagewall protects against, what it doesn't, and the
-trust assumptions it makes. It exists because a security tool you can't reason
-about is a security tool you can't trust — and because being explicit about
-limitations is more useful than implying there are none.
+This document describes the trust assumptions and known limitations of the
+currently shipped **Triagewall Core** application. Triagewall Lab is a future
+component with a separate threat model and graduation gate; see
+[Core and Lab product boundary](core-lab-product-boundary.md).
 
-Triagewall is a homelab tool. It is built for a single operator running it on
-their own network, not for multi-tenant or enterprise deployment. The threat
-model reflects that.
+Triagewall targets a single trusted operator running services on a private
+homelab network. It is not a multi-tenant or internet-facing application.
 
----
+## What Core does
 
-## What Triagewall is
+Core is a decision-support layer between Suricata and, optionally, Wazuh alert
+streams and a human operator. It:
 
-A two-tier triage layer that sits between a Suricata IDS alert stream and a
-human. A prefilter classifies known-noise signatures using validated SID and
-optional direction, CIDR, protocol, port, and asset-context conditions;
-everything else
-goes to a local LLM that returns a verdict (`real`, `false_positive`,
-`uncertain`) with a confidence score and reasoning. Results land in SQLite and
-surface on a local web dashboard.
+- applies validated deterministic policy to eligible Suricata alerts;
+- sends remaining Suricata alerts and admitted Wazuh alerts to a local Ollama
+  model through source-specific isolated prompts;
+- attaches exact-IP matches from a private trusted asset inventory;
+- stores verdicts, source provenance, asset snapshots, failures, checkpoints,
+  and operator feedback in local persistent storage;
+- serves a local dashboard and JSON API.
 
-It triages alerts. It does **not** block traffic, modify firewall rules, or take
-any action on the network. It is a decision-support tool, not an enforcement
-point.
-
----
+Core does not block traffic, change sensor rules, invoke Wazuh Active Response,
+or take autonomous action.
 
 ## Data flow and trust boundaries
 
+```text
+[ Suricata eve.json ] --> [ Suricata adapter ] --+
+                                                  |
+[ Wazuh alerts.json ] --> [ Wazuh adapter ] -----+--> [ normalized event ]
+                                                           |
+                                     [ trusted asset and policy config ]
+                                                           |
+                              Suricata scoped prefilter or local Ollama
+                                                           |
+                                                        [ SQLite ]
+                                                           |
+                                                   [ local dashboard ]
 ```
-[ Suricata on OPNsense ]  --(eve.json, rsync/SSH or mount)-->  [ ingest daemon ]
-                                                                      |
-                                                  prefilter (trusted scoped policy)
-                                                                      |
-                                                       (miss) --> [ local Ollama LLM ]
-                                                                      |
-                                                                  [ SQLite ]
-                                                                      |
-                                                          [ FastAPI dashboard ]
-```
 
-Three trust boundaries matter:
+The important boundaries are:
 
-1. **Suricata → ingest.** Alert *metadata* (signature ID, category, IPs, ports)
-   is trusted: it is Suricata's own analysis. Alert *content* (URLs, hostnames,
-   user-agents, payloads, TLS/DNS fields) is **untrusted** — it is
-   attacker-controllable network data. This distinction is the foundation of
-   the injection hardening (see below).
-
-2. **ingest → Ollama.** Assumed to be a trusted network segment. Traffic to the
-   LLM is unencrypted HTTP by default. See *Assumptions* and *Known gaps*.
-
-3. **dashboard → operator.** The dashboard is unauthenticated by default and
-   intended to be reachable only from the operator's own network. It is not
-   built to be exposed to the internet.
-
----
+1. **Sensors to adapters.** Records are untrusted input. Required typed
+   identity, timestamp, rule, level, network, and protocol fields are validated
+   before use. Free text, unknown fields, agent names, descriptions, URLs,
+   hostnames, payloads, TLS/DNS data, and Wazuh `data.*` values remain
+   attacker- or environment-controlled evidence.
+2. **Operator configuration to Core.** The mounted prefilter and asset
+   inventory are trusted operator inputs, but they are still schema-, size-,
+   type-, and ambiguity-validated. Invalid configured files fail startup.
+3. **Core to Ollama.** Only source identity, typed severity guidance, prompt
+   policy, and validated asset context enter trusted system context. Sensor
+   evidence stays in the isolated user evidence block. Ollama traffic is
+   unencrypted HTTP unless the operator adds a protected transport.
+4. **Writers to SQLite.** Verdict, asset snapshots, and source provenance are
+   committed together. Retryable model or persistence failures do not advance
+   the relevant checkpoint.
+5. **Dashboard to operator.** The dashboard validates configured Host values,
+   but it has no user authentication by default and is intended for a trusted
+   private network.
 
 ## Attacker model
 
-The primary adversary Triagewall defends against is an attacker who can
-**influence the content of a Suricata alert** — by sending crafted traffic that
-Suricata logs (a malicious URL, a hostile user-agent, a payload containing
-attacker text). Because that content flows into an LLM prompt, the attacker's
-goal is **prompt injection**: manipulating the LLM into returning an
-attacker-chosen verdict (e.g. forcing a real attack to be classified
-`false_positive` so it never surfaces to the human).
+The primary adversary can influence sensor evidence by sending crafted network
+traffic or generating endpoint activity that appears in Suricata or Wazuh
+alerts. Their goals may include:
 
-This is a real, demonstrated threat. v0.2 closed a vulnerability where an
-attacker who controlled a URL field could dictate both the verdict and the
-confidence score. See
-[the writeup](https://triagewall.io/posts/prompt-injection-phase-2) and
-[docs/experiments](experiments) for the attack and the fix.
+- prompt injection that forces a benign verdict or attacker-selected output;
+- malformed or oversized records that cause gaps, retries, or resource
+  exhaustion;
+- duplicate or conflicting event identity;
+- hostile strings that become HTML, logs, CSV formulas, or model instructions;
+- discovery of private asset or agent context through demo responses.
 
-**Out of the attacker model:** an adversary who already has code execution on
-the host running Triagewall, or who is already on the trusted LAN segment
-between ingest and Ollama, or who controls Suricata's ruleset or the prefilter
-config. Those are pre-compromise scenarios that this tool does not defend
-against and is not positioned to.
+An adversary with code execution on the Triagewall host, control of operator
+configuration, control of the trusted network between Core and Ollama, or
+control of the sensor ruleset is outside this threat model.
 
----
+## Defenses
 
-## What is defended
+### Prompt and response isolation
 
-**Prompt injection via attacker-controlled alert fields.** Sixteen field paths
-(URLs, hostnames, user-agents, HTTP bodies, DNS names, TLS cert fields, SSH
-banners, payloads) are base64-encapsulated with explicit boundary markers before
-reaching the LLM, so injected text cannot be parsed as instructions. Trusted
-Suricata metadata stays plain. (Phase 2.)
+Suricata uses a fail-closed typed allowlist: only explicitly trusted structured
+sensor fields remain plain; unknown and free-text fields are base64-wrapped with
+explicit untrusted-data boundaries. Wazuh uses a source-specific projection in
+which free text, descriptions, agent identity, location, groups, decoder data,
+`full_log`, and nested `data` strings are isolated as untrusted evidence.
 
-**Prompt/system-prompt leakage.** A per-process canary token is embedded in the
-system prompt; if it appears in model output, the response is rejected and the
-alert is flagged. (Phase 1.)
+A per-process canary is included in the system prompt. Raw and decoded model
+output is checked for that canary. A leaked canary causes a conservative
+security verdict rather than accepting the requested output.
 
-**Malformed or manipulated model output.** Strict response-schema validation
-rejects responses with unexpected keys, enforces the verdict enum, clamps
-confidence to `[0, 1]`, and caps reasoning length. An attacker cannot smuggle
-extra structure or oversized output through the verdict path. (Phase 1.)
+The complete model response must be one JSON object with exactly the expected
+keys and valid types. Truncated, salvaged, extra-key, or otherwise malformed
+responses fail closed.
 
-The defense is empirically tested — see the Phase 1 / Phase 2 experiment docs
-and the test scenarios in the repo.
+### Input and configuration bounds
 
----
+- Wazuh records are limited to 1 MiB and its model-evidence projection to
+  32 KiB. Oversized complete records are hashed, quarantined with bounded
+  diagnostics, and checkpointed without reaching Ollama.
+- Wazuh descriptions and agent fields have explicit length limits.
+- Asset inventory and prefilter files are each limited to 1 MiB and have
+  bounded collection and text fields.
+- Two-sided trusted asset prompt context is limited to 2 KiB.
+- Wazuh source identity, rule fields, IP addresses, ports, protocols, and
+  checkpoint documents are validated before use.
 
-## What is NOT defended (limitations)
+### Persistence and recovery
 
-These are honest gaps, stated so operators can make informed decisions.
+- Incomplete append-in-place records remain uncheckpointed and use the normal
+  polling backoff.
+- Retryable Ollama and SQLite failures block later records and leave the failed
+  record uncheckpointed.
+- Intentional skips, duplicates, and durably quarantined malformed input may
+  advance the checkpoint.
+- Wazuh checkpoints are written atomically and bind to the configured source
+  instance. Missing or corrupt required rotation archives fail closed rather
+  than silently skipping a gap.
+- New Wazuh identities are deduplicated by source type, source instance, and
+  source event ID. Instance-less identities use a separate unique constraint.
 
-**Injection hardening is a friction layer, not a guarantee.** Base64
-encapsulation removes the obvious attack — plain-English imperatives in alert
-fields — and was validated against the known attacks. It is not a proof. A
-sufficiently clever adversary may find inputs that survive encoding. The right
-mental model is "raised the bar and keep iterating," not "solved." Breaking it
-is explicitly invited; that is how the next hardening phase gets written.
+### Operator-facing output
 
-**The prefilter is a deliberate detection gap.** Alerts that match a rule in
-`prefilter.json` are auto-classified as `false_positive` and never reach the
-LLM. Versioned rules can narrow that decision by network/flow direction, CIDR,
-protocol, port, and trusted asset context; missing or malformed required context
-does not match. Legacy rules without a `match` block still suppress globally by
-SID. An attacker who knows a rule's full conditions could craft matching traffic
-to avoid LLM review, so the prefilter still trades detection coverage for volume
-reduction. Tune it conservatively and do not suppress patterns you care about.
+- Dashboard values are HTML-escaped.
+- Demo mode masks private network addresses and removes model reasoning, asset
+  inventory data, agent identity, event identity, SPC notes, and other private
+  context.
+- Benchmark CSV output neutralizes formula-capable cells.
+- Application logs avoid raw Wazuh alerts and private agent data.
 
-**False negatives are expected.** The LLM misses things. On the v0.2-alpha gold
-set, true-positive recall was 5/6 — one real threat in six was misclassified.
-Triagewall reduces the alerts you have to read; it does not guarantee you'll
-catch every real one. It is a triage aid, not a replacement for an analyst or
-for the underlying IDS.
+## Known limitations
 
-**The ingest→Ollama path is unencrypted and unauthenticated by default.** Alert
-content (including payloads) crosses the LAN in cleartext to the Ollama
-endpoint, and anything on that segment can query the model. This is acceptable
-only if you trust that network segment. On a flatter or shared network, put
-Ollama behind localhost + a tunnel, or a reverse proxy with a token.
+**Isolation reduces risk; it does not prove model safety.** Encapsulation,
+canary detection, and schema validation raise the cost of prompt injection but
+do not make an LLM a security boundary. Adversarial regression work remains
+required.
 
-**The dashboard is unauthenticated.** It assumes a trusted local network and is
-not hardened for internet exposure. Do not port-forward it. If you need remote
-access, use a VPN or an authenticated reverse proxy.
+**The prefilter deliberately trades coverage for volume.** A matching rule is
+auto-classified without Ollama review. Contextual conditions reduce the blast
+radius, and missing required context does not match, but legacy global SID
+rules remain supported. Operators must review suppressions conservatively.
 
-**No protection against a compromised host or LAN.** If the box running
-Triagewall is compromised, or the trusted segment between components is hostile,
-the tool offers no defense. It assumes its own execution environment is trusted.
+**False negatives are expected.** The local model is fallible. Triagewall
+reduces review volume; it does not replace the underlying sensor or a human
+analyst.
 
-**Resource exhaustion via oversized fields is not yet bounded.** A crafted alert
-with a very large untrusted field (e.g. a multi-megabyte payload) is currently
-wrapped and sent to the model as-is, which could exhaust the context window or
-stall the LLM tier. Field-size capping is planned for v0.2.1.
+**Suricata record size is not globally bounded yet.** Wazuh has record and
+projection limits, but an unusually large complete Suricata JSONL record can
+still consume memory and model context. Adding a bounded Suricata reader and
+prompt projection remains hardening work.
 
----
+**Ollama transport is unencrypted and unauthenticated by default.** Use
+localhost, a tunnel, a private segmented network, or an authenticated proxy
+when the network between Core and Ollama is not fully trusted.
+
+**The dashboard is unauthenticated.** Host validation is not user
+authentication. Do not port-forward the dashboard; use a VPN or authenticated
+reverse proxy for remote access.
+
+**Retention is not automated.** Long-running, high-volume deployments can
+produce large SQLite databases. Operators must monitor storage until a bounded,
+tested retention and archival workflow ships.
+
+**Concurrent startup migrations currently retry rather than use one explicit
+migration owner.** This is fail-closed, but optional ingest services can contend
+for SQLite schema work on startup. A serialized migration phase is planned for
+release closeout.
 
 ## Assumptions
 
-- The host running Triagewall is trusted and not already compromised.
-- The network segment between ingest, Ollama, SQLite, and the dashboard is
-  trusted.
-- Suricata's ruleset, the prefilter config, and the mounted asset inventory are
-  trusted inputs controlled by the operator. Asset context is supplied only in
-  the LLM system prompt, and demo API responses redact it on both traffic sides.
-- The operator is a single trusted user; there is no multi-user authorization
-  model.
-- The deployment is not exposed to the public internet.
+- The Triagewall host and operator-controlled configuration are trusted.
+- Suricata and Wazuh remain the authoritative detection and alert stores.
+- The network between Core components and Ollama is private and trusted unless
+  the operator adds transport protection.
+- Core is not exposed directly to the public internet.
+- There is one trusted operator and no multi-user authorization model.
 
----
+## Example and demo data
 
-## A note on example data
-
-The benchmark results and experiment docs in this repo contain real RFC 1918
-private IP addresses (10.x and 192.168.x) from the development network, visible
-in model reasoning text. These are non-routable, reveal nothing reachable from
-outside the LAN, and are retained because the unedited reasoning is useful
-evidence for the benchmark. Masking them is tracked as a v0.2.1 cleanup item.
-
----
+Tracked fixtures and experiment material are intended to be synthetic or
+sanitized. Demo API responses apply additional redaction at runtime. Do not
+commit production alerts, private inventories, checkpoints, packet captures,
+or populated databases.
 
 ## Reporting
 
-Found a way to break the injection hardening, or another security issue? That's
-genuinely welcome — open an issue, or see [SECURITY.md](../SECURITY.md) for
-responsible disclosure. Breaking Phase 2 is how Phase 3 gets designed.
+Report security issues according to [SECURITY.md](../SECURITY.md). Prompt-
+injection bypasses, checkpoint gaps, identity collisions, cross-source context
+leaks, and unsafe configuration behavior are all in scope.
