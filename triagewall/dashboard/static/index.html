@@ -96,7 +96,10 @@
       <h1 class="text-3xl font-bold text-white tracking-tight">Triagewall</h1>
       <p class="text-gray-500 text-sm mt-1">Local-LLM alert triage for self-hosted SOCs.</p>
     </div>
-    <div class="freshness" id="freshness">Live · Updated never</div>
+    <div class="text-right">
+      <div class="freshness" id="freshness">Live · Updated never</div>
+      <div class="text-xs text-gray-600 mono mt-1" id="storageMeta">Storage unavailable</div>
+    </div>
   </header>
 
   <div id="staleBanner" class="hidden mb-6 rounded-lg border border-yellow-700/40 bg-yellow-900/30 text-yellow-100 px-4 py-3 text-sm">
@@ -323,6 +326,12 @@ async function load() {
     const banner = document.getElementById("staleBanner");
     const bannerText = document.getElementById("staleBannerText");
     const age = Number(health.last_alert_age_seconds ?? NaN);
+    const storageMeta = document.getElementById("storageMeta");
+    if (storageMeta && health.storage) {
+      const total = formatBytes(health.storage.total_on_disk_bytes);
+      const reusable = formatBytes(health.storage.reusable_bytes);
+      storageMeta.textContent = `DB ${total} · ${reusable} reusable`;
+    }
     const isStale = !healthRes.ok || health.status === "stale";
     if (isStale) {
       const mins = isFinite(age) ? Math.max(0, age) / 60.0 : NaN;
@@ -552,6 +561,20 @@ function feedbackOther(id) {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 ? 0 : size >= 10 ? 1 : 2;
+  return `${size.toFixed(digits)} ${units[unit]}`;
 }
 
 // Filter buttons

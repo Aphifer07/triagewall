@@ -145,6 +145,54 @@ Triagewall has been running on a homelab production network for multi-day contin
 
 Throughput scales primarily with prefilter ratio. The two-tier design means prefiltered alerts are processed in microseconds; only LLM-classified alerts (typically 0.3–3% after tuning) are bound by Ollama latency.
 
+### Retention and storage visibility
+
+The dashboard header reports the SQLite database, WAL, and shared-memory files
+currently allocated on disk, plus space inside the database that SQLite can
+reuse. Reusable space is not the same as filesystem free space: with the
+default `auto_vacuum=none` policy, deleted pages are reused by future writes but
+the main database file does not shrink automatically.
+
+Inspect the live allocation and history bounds without scanning raw alert
+payloads:
+
+```bash
+docker compose run --rm maintenance status
+```
+
+Preview a 30-day hot-data window. Preview is the default and performs no
+writes:
+
+```bash
+docker compose run --rm maintenance prune --keep-days 30
+```
+
+Human-reviewed verdicts are protected unless `--include-reviewed` is supplied.
+To apply a prune, either create a verified online SQLite backup on a separately
+provisioned path. The tool checks that the destination has room for the backup
+plus a safety margin before writing:
+
+```bash
+HOST_BACKUP_DIR=/mnt/triagewall-backups docker compose run --rm maintenance \
+  prune --keep-days 30 --apply \
+  --backup /var/backups/triagewall/triage-before-retention.db
+```
+
+or explicitly acknowledge that no backup will be created:
+
+```bash
+docker compose run --rm maintenance prune --keep-days 30 --apply --no-backup
+```
+
+Applied pruning uses short indexed transactions, pauses between batches, and
+cleans source-context rows and orphaned asset snapshots. `--max-rows` supports a
+small canary run before a full prune. This control applies to verdict history;
+it does not reset SPC baselines or remove ingest-failure quarantine records.
+The tool does not run `VACUUM`: rebuilding a large live database can require
+substantial temporary disk space and should only be planned as a separate
+maintenance operation with all writers stopped and adequate free space
+verified.
+
 ### Recommended models by VRAM
 
 Triagewall has been benchmarked on Foundation-Sec-8B-Instruct across multiple quantizations against a 265-alert human-labeled gold set. Full methodology and results in [docs/experiments/](docs/experiments/).

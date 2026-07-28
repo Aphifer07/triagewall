@@ -319,6 +319,18 @@ class DashboardBoundaryTests(unittest.TestCase):
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$",
         )
 
+    def test_health_reports_cheap_storage_metrics(self):
+        response = self.client.get(
+            "/api/health",
+            headers={"host": "localhost"},
+        )
+        self.assertEqual(response.status_code, 200)
+        storage = response.json()["storage"]
+        self.assertGreater(storage["database_bytes"], 0)
+        self.assertGreater(storage["page_size_bytes"], 0)
+        self.assertIn("reusable_bytes", storage)
+        self.assertIn("wal_bytes", storage)
+
 
 class BenchmarkExportTests(unittest.TestCase):
     def test_formula_capable_cells_are_neutralized(self):
