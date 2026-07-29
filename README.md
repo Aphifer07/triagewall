@@ -153,45 +153,112 @@ reuse. Reusable space is not the same as filesystem free space: with the
 default `auto_vacuum=none` policy, deleted pages are reused by future writes but
 the main database file does not shrink automatically.
 
-Inspect the live allocation and history bounds without scanning raw alert
-payloads:
+Use a controlled maintenance window. SQLite online backup can fail to converge
+under sustained ingest writes; the retention tool now bounds copy/integrity
+progress and still requires an explicit operator acknowledgement that writers
+are stopped before any applied prune.
+
+1. Inspect allocation and history bounds (read-only):
 
 ```bash
-docker compose run --rm maintenance status
+docker compose --profile maintenance run --rm maintenance status
 ```
 
-Preview a 30-day hot-data window. Preview is the default and performs no
-writes:
+With optional Wazuh enabled, include both Compose files and profiles so Compose
+does not treat Wazuh services as orphans:
 
 ```bash
-docker compose run --rm maintenance prune --keep-days 30
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.wazuh.yml \
+  --profile wazuh \
+  --profile maintenance \
+  run --rm maintenance status
 ```
 
-Human-reviewed verdicts are protected unless `--include-reviewed` is supplied.
-To apply a prune, either create a verified online SQLite backup on a separately
-provisioned path. The tool checks that the destination has room for the backup
-plus a safety margin before writing:
+2. Dry-preview a 30-day hot-data window (default; no writes):
 
 ```bash
-HOST_BACKUP_DIR=/mnt/triagewall-backups docker compose run --rm maintenance \
-  prune --keep-days 30 --apply \
+docker compose --profile maintenance run --rm maintenance \
+  prune --keep-days 30
+```
+
+3. Record current ingest checkpoint metadata outside the database so you can
+confirm resumption after the window.
+
+4. Stop writers before apply. The dashboard is included because human-feedback
+submissions write to the verdict database:
+
+```bash
+docker compose stop dashboard ingest
+```
+
+With optional Wazuh enabled, stop both writers through the combined
+configuration:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.wazuh.yml \
+  --profile wazuh \
+  stop dashboard ingest wazuh-ingest
+```
+
+5. Run a backed-up canary prune with the maintenance acknowledgement. The tool
+checks free space, creates an exclusive backup destination, verifies integrity,
+then deletes. `--confirm-writers-stopped` is an operator acknowledgement, not
+proof that the program can observe all writers:
+
+```bash
+HOST_BACKUP_DIR=/mnt/triagewall-backups docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.wazuh.yml \
+  --profile wazuh \
+  --profile maintenance \
+  run --rm maintenance \
+  prune --keep-days 30 --apply --confirm-writers-stopped \
+  --max-rows 10000 \
   --backup /var/backups/triagewall/triage-before-retention.db
 ```
 
-or explicitly acknowledge that no backup will be created:
+Human-reviewed verdicts remain protected unless `--include-reviewed` is
+supplied. To apply without a backup, pass both acknowledgements explicitly:
 
 ```bash
-docker compose run --rm maintenance prune --keep-days 30 --apply --no-backup
+docker compose --profile maintenance run --rm maintenance \
+  prune --keep-days 30 --apply --confirm-writers-stopped --no-backup
 ```
 
+6. Verify the canary before a larger prune: process exit code, `deleted_rows`,
+backup integrity, WAL checkpoint fields in the JSON result, dashboard/API
+health, and ingest checkpoint resumption after restart.
+
+7. Restart writers:
+
+```bash
+docker compose start ingest dashboard
+```
+
+With optional Wazuh enabled, restart both writers through the combined
+configuration:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.wazuh.yml \
+  --profile wazuh \
+  start ingest wazuh-ingest dashboard
+```
+
+8. Retain the verified backup. Do not run `VACUUM` as part of this workflow:
+rebuilding a large live database can require substantial temporary disk space
+and should only be planned as a separate maintenance operation with all writers
+stopped and adequate free space verified.
+
 Applied pruning uses short indexed transactions, pauses between batches, and
-cleans source-context rows and orphaned asset snapshots. `--max-rows` supports a
-small canary run before a full prune. This control applies to verdict history;
-it does not reset SPC baselines or remove ingest-failure quarantine records.
-The tool does not run `VACUUM`: rebuilding a large live database can require
-substantial temporary disk space and should only be planned as a separate
-maintenance operation with all writers stopped and adequate free space
-verified.
+cleans source-context rows and orphaned asset snapshots. This control applies to
+verdict history; it does not reset SPC baselines or remove ingest-failure
+quarantine records.
 
 ### Recommended models by VRAM
 

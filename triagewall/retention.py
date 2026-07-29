@@ -7,12 +7,15 @@ import argparse
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import timedelta
+import errno
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import tempfile
+import threading
 import time
 
 try:
@@ -38,6 +41,23 @@ DEFAULT_PAUSE_MS = 100
 MAX_BATCH_SIZE = 10_000
 MAX_PAUSE_MS = 60_000
 
+DEFAULT_BACKUP_MAX_SECONDS = 1_800
+DEFAULT_BACKUP_STALL_SECONDS = 120
+DEFAULT_BACKUP_MAX_RESTARTS = 3
+DEFAULT_BACKUP_PROGRESS_SECONDS = 30
+DEFAULT_INTEGRITY_MAX_SECONDS = 10_800
+DEFAULT_INTEGRITY_PROGRESS_SECONDS = 30
+MAX_BACKUP_BOUND_SECONDS = 86_400
+MAX_BACKUP_RESTARTS = 100
+
+BACKUP_FILE_MODE = 0o600
+MAX_BACKUP_STEP_BUSY_MS = 100
+
+# sqlite3 backup progress statuses (not always exported by the stdlib module).
+SQLITE_OK = 0
+SQLITE_BUSY = 5
+SQLITE_LOCKED = 6
+
 
 @dataclass(frozen=True)
 class RetentionPlan:
@@ -58,6 +78,22 @@ class PruneResult:
     checkpoint_busy_frames: int
     checkpoint_log_frames: int
     checkpointed_frames: int
+
+
+@dataclass(frozen=True)
+class BackupLimits:
+    max_copy_seconds: float = DEFAULT_BACKUP_MAX_SECONDS
+    stall_seconds: float = DEFAULT_BACKUP_STALL_SECONDS
+    max_restarts: int = DEFAULT_BACKUP_MAX_RESTARTS
+    progress_interval_seconds: float = DEFAULT_BACKUP_PROGRESS_SECONDS
+    integrity_max_seconds: float = DEFAULT_INTEGRITY_MAX_SECONDS
+    integrity_progress_interval_seconds: float = (
+        DEFAULT_INTEGRITY_PROGRESS_SECONDS
+    )
+
+
+class BackupLimitExceeded(RuntimeError):
+    """Raised when a bounded backup or integrity check hits a safety limit."""
 
 
 def _retention_predicate(include_reviewed: bool) -> str:
@@ -131,47 +167,527 @@ def _history_bounds(
     )
 
 
-def create_online_backup(
-    source: sqlite3.Connection,
-    backup_path: str | Path,
-) -> Path:
-    """Create and integrity-check a new SQLite backup without overwriting."""
-    target = Path(backup_path)
-    if target.exists():
-        raise FileExistsError(f"backup target already exists: {target}")
+def _default_backup_report(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+class BackupProgressMonitor:
+    """Track SQLite online-backup progress and enforce copy bounds."""
+
+    def __init__(
+        self,
+        limits: BackupLimits,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        report: Callable[[str], None] = _default_backup_report,
+    ) -> None:
+        self.limits = limits
+        self.clock = clock
+        self.report = report
+        self.started_at = clock()
+        self.last_progress_at = self.started_at
+        self.last_report_at = self.started_at
+        self.previous_remaining: int | None = None
+        self.restarts = 0
+        self.total = 0
+        self.remaining = 0
+
+    def __call__(self, status: int, remaining: int, total: int) -> None:
+        now = self.clock()
+        self.total = int(total)
+        self.remaining = int(remaining)
+        elapsed = now - self.started_at
+
+        if elapsed >= self.limits.max_copy_seconds:
+            raise BackupLimitExceeded(
+                "backup copy exceeded maximum duration of "
+                f"{self.limits.max_copy_seconds:g} seconds "
+                f"(elapsed {elapsed:.1f}s, remaining pages "
+                f"{self.remaining}/{self.total}, restarts {self.restarts})"
+            )
+
+        busy_or_locked = status in (SQLITE_BUSY, SQLITE_LOCKED)
+
+        # BUSY/LOCKED callbacks are observations of contention, not page-copy
+        # progress. Do not let their remaining-page values establish or move
+        # the comparison baseline.
+        if not busy_or_locked:
+            if self.previous_remaining is None:
+                self.previous_remaining = self.remaining
+            elif self.remaining < self.previous_remaining:
+                self.last_progress_at = now
+                self.previous_remaining = self.remaining
+            elif self.remaining > self.previous_remaining:
+                self.restarts += 1
+                self.previous_remaining = self.remaining
+                if self.restarts > self.limits.max_restarts:
+                    raise BackupLimitExceeded(
+                        "backup copy exceeded maximum restarts of "
+                        f"{self.limits.max_restarts} "
+                        f"(detected {self.restarts}, remaining pages "
+                        f"{self.remaining}/{self.total})"
+                    )
+        # equal remaining: no progress; do not refresh stall timer
+
+        stalled_for = now - self.last_progress_at
+        if stalled_for >= self.limits.stall_seconds:
+            raise BackupLimitExceeded(
+                "backup copy stalled without forward progress for "
+                f"{stalled_for:.1f}s "
+                f"(limit {self.limits.stall_seconds:g}s, remaining pages "
+                f"{self.remaining}/{self.total}, restarts {self.restarts})"
+            )
+
+        if (
+            now - self.last_report_at
+            >= self.limits.progress_interval_seconds
+        ):
+            self.report(self._format_progress(elapsed))
+            self.last_report_at = now
+
+    def _format_progress(self, elapsed: float) -> str:
+        copied = max(self.total - self.remaining, 0)
+        if self.total > 0:
+            percent = (copied / self.total) * 100.0
+            percent_text = f", {percent:.1f}%"
+        else:
+            percent_text = ""
+        return (
+            "retention backup progress: phase=backup "
+            f"elapsed={elapsed:.1f}s "
+            f"copied_pages={copied} remaining_pages={self.remaining} "
+            f"total_pages={self.total}{percent_text} "
+            f"restarts={self.restarts}"
+        )
+
+
+class BackupCopyWatchdog:
+    """Enforce copy deadlines even while SQLite is inside a backup step."""
+
+    def __init__(
+        self,
+        source: sqlite3.Connection,
+        monitor: BackupProgressMonitor,
+        limits: BackupLimits,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        poll_seconds: float = 0.05,
+    ) -> None:
+        self.source = source
+        self.monitor = monitor
+        self.limits = limits
+        self.clock = clock
+        self.sleep = sleep
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self.failure: BackupLimitExceeded | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name="retention-backup-watchdog",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            raise BackupLimitExceeded(
+                "backup copy watchdog did not stop cleanly"
+            )
+
+    def _fail(self, message: str) -> None:
+        self.failure = BackupLimitExceeded(message)
+        try:
+            self.source.interrupt()
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            now = self.clock()
+            elapsed = now - self.monitor.started_at
+            stalled_for = now - self.monitor.last_progress_at
+            if elapsed >= self.limits.max_copy_seconds:
+                self._fail(
+                    "backup copy exceeded maximum duration of "
+                    f"{self.limits.max_copy_seconds:g} seconds "
+                    f"(elapsed {elapsed:.1f}s, remaining pages "
+                    f"{self.monitor.remaining}/{self.monitor.total}, "
+                    f"restarts {self.monitor.restarts})"
+                )
+                return
+            if stalled_for >= self.limits.stall_seconds:
+                self._fail(
+                    "backup copy stalled without forward progress for "
+                    f"{stalled_for:.1f}s "
+                    f"(limit {self.limits.stall_seconds:g}s, "
+                    f"remaining pages {self.monitor.remaining}/"
+                    f"{self.monitor.total}, "
+                    f"restarts {self.monitor.restarts})"
+                )
+                return
+            if (
+                now - self.monitor.last_report_at
+                >= self.limits.progress_interval_seconds
+            ):
+                try:
+                    self.monitor.report(
+                        self.monitor._format_progress(elapsed)
+                    )
+                except Exception:
+                    pass
+                self.monitor.last_report_at = now
+            if self.sleep is time.sleep:
+                if self._stop.wait(timeout=self.poll_seconds):
+                    return
+            else:
+                self.sleep(self.poll_seconds)
+
+
+class IntegrityCheckMonitor:
+    """Emit integrity heartbeats and interrupt the connection on timeout."""
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        limits: BackupLimits,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        report: Callable[[str], None] = _default_backup_report,
+        poll_seconds: float = 0.05,
+    ) -> None:
+        self.conn = conn
+        self.limits = limits
+        self.clock = clock
+        self.sleep = sleep
+        self.report = report
+        self.poll_seconds = poll_seconds
+        self.started_at = clock()
+        self._stop = threading.Event()
+        self.timed_out = False
+        self.thread = threading.Thread(
+            target=self._run,
+            name="retention-integrity-monitor",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            raise BackupLimitExceeded(
+                "backup integrity monitor did not stop cleanly"
+            )
+
+    def _run(self) -> None:
+        last_report_at = self.started_at
+        while not self._stop.is_set():
+            now = self.clock()
+            elapsed = now - self.started_at
+            if elapsed >= self.limits.integrity_max_seconds:
+                self.timed_out = True
+                try:
+                    self.conn.interrupt()
+                except Exception:
+                    pass
+                return
+            if (
+                now - last_report_at
+                >= self.limits.integrity_progress_interval_seconds
+            ):
+                try:
+                    self.report(
+                        "retention backup progress: phase=integrity "
+                        f"elapsed={elapsed:.1f}s"
+                    )
+                except Exception:
+                    # A logging failure must not disable timeout enforcement.
+                    pass
+                last_report_at = now
+            # Prefer Event.wait so stop() wakes promptly; fall back to sleep
+            # when tests inject a fake sleeper for deterministic clocks.
+            if self.sleep is time.sleep:
+                if self._stop.wait(timeout=self.poll_seconds):
+                    return
+            else:
+                self.sleep(self.poll_seconds)
+
+
+
+def _reserve_backup_staging_file(target: Path) -> Path:
+    """Create an unpredictable, exclusive staging file beside the target."""
     if not target.parent.exists():
         raise FileNotFoundError(
             f"backup parent directory does not exist: {target.parent}"
         )
-    page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
-    page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
-    backup_bytes = page_size * page_count
-    safety_margin = max(64 * 1024 * 1024, backup_bytes // 20)
-    free_bytes = shutil.disk_usage(target.parent).free
-    if free_bytes < backup_bytes + safety_margin:
-        raise OSError(
-            "backup target lacks free space: "
-            f"needs at least {backup_bytes + safety_margin} bytes, "
-            f"has {free_bytes}"
-        )
-
-    destination = sqlite3.connect(target)
+    fd, staging_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
     try:
-        source.backup(destination, pages=1_024, sleep=0.05)
-        result = destination.execute("PRAGMA quick_check").fetchone()[0]
+        os.chmod(staging_name, BACKUP_FILE_MODE)
+    except OSError as exc:
+        os.close(fd)
+        Path(staging_name).unlink(missing_ok=True)
+        raise OSError(
+            "failed to set backup staging permissions to 0600: "
+            f"{staging_name}"
+        ) from exc
+    os.close(fd)
+    return Path(staging_name)
+
+
+def _publish_backup(staging: Path, target: Path) -> None:
+    """Atomically publish a verified backup without replacing any target."""
+    try:
+        os.link(staging, target)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"backup target already exists: {target}"
+        ) from exc
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            raise FileExistsError(
+                f"backup target already exists: {target}"
+            ) from exc
+        raise
+
+
+def _unlink_owned_backup(target: Path) -> None:
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _ensure_backup_permissions(target: Path) -> None:
+    try:
+        os.chmod(target, BACKUP_FILE_MODE)
+    except OSError as exc:
+        raise OSError(
+            f"failed to set backup permissions to 0600: {target}"
+        ) from exc
+
+
+def _set_bounded_backup_busy_timeout(
+    source: sqlite3.Connection,
+    limits: BackupLimits,
+) -> int:
+    """Bound SQLite lock waits during backup and return the prior timeout."""
+    previous = int(source.execute("PRAGMA busy_timeout").fetchone()[0])
+    deadline_ms = max(
+        1,
+        int(
+            min(
+                limits.max_copy_seconds,
+                limits.stall_seconds,
+            )
+            * 1_000
+        ),
+    )
+    bounded = min(previous, deadline_ms, MAX_BACKUP_STEP_BUSY_MS)
+    source.execute(f"PRAGMA busy_timeout={bounded}")
+    return previous
+
+
+def _restore_busy_timeout(
+    source: sqlite3.Connection,
+    timeout_ms: int,
+) -> None:
+    source.execute(f"PRAGMA busy_timeout={timeout_ms}")
+
+
+def _default_integrity_check(conn: sqlite3.Connection) -> str:
+    row = conn.execute("PRAGMA quick_check").fetchone()
+    return str(row[0])
+
+
+def _run_integrity_check(
+    destination: sqlite3.Connection,
+    limits: BackupLimits,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    report: Callable[[str], None] = _default_backup_report,
+    integrity_check: Callable[[sqlite3.Connection], str] | None = None,
+    monitor_factory: Callable[..., IntegrityCheckMonitor] | None = None,
+) -> str:
+    check = integrity_check or _default_integrity_check
+    factory = monitor_factory or IntegrityCheckMonitor
+    monitor = factory(
+        destination,
+        limits,
+        clock=clock,
+        sleep=sleep,
+        report=report,
+    )
+    monitor.start()
+    try:
+        try:
+            result = check(destination)
+        except sqlite3.Error as exc:
+            if monitor.timed_out:
+                raise BackupLimitExceeded(
+                    "backup integrity check exceeded maximum duration of "
+                    f"{limits.integrity_max_seconds:g} seconds"
+                ) from exc
+            raise
+        if monitor.timed_out:
+            raise BackupLimitExceeded(
+                "backup integrity check exceeded maximum duration of "
+                f"{limits.integrity_max_seconds:g} seconds"
+            )
+        return result
+    finally:
+        monitor.stop()
+
+
+def create_online_backup(
+    source: sqlite3.Connection,
+    backup_path: str | Path,
+    *,
+    limits: BackupLimits | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    report: Callable[[str], None] = _default_backup_report,
+    progress_monitor: Callable[[int, int, int], None] | None = None,
+    copy_watchdog_factory: Callable[..., BackupCopyWatchdog] | None = None,
+    integrity_check: Callable[[sqlite3.Connection], str] | None = None,
+    monitor_factory: Callable[..., IntegrityCheckMonitor] | None = None,
+) -> Path:
+    """Create and integrity-check a new SQLite backup without overwriting."""
+    target = Path(backup_path)
+    active_limits = limits or BackupLimits()
+    if not target.parent.exists():
+        raise FileNotFoundError(
+            f"backup parent directory does not exist: {target.parent}"
+        )
+    if os.path.lexists(target):
+        raise FileExistsError(f"backup target already exists: {target}")
+    previous_busy_timeout = _set_bounded_backup_busy_timeout(
+        source,
+        active_limits,
+    )
+    try:
+        page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
+        backup_bytes = page_size * page_count
+        safety_margin = max(64 * 1024 * 1024, backup_bytes // 20)
+        free_bytes = shutil.disk_usage(target.parent).free
+        if free_bytes < backup_bytes + safety_margin:
+            raise OSError(
+                "backup target lacks free space: "
+                f"needs at least {backup_bytes + safety_margin} bytes, "
+                f"has {free_bytes}"
+            )
+    except Exception as exc:
+        _restore_busy_timeout(source, previous_busy_timeout)
+        if isinstance(exc, sqlite3.OperationalError):
+            raise BackupLimitExceeded(
+                "backup preparation could not read source metadata within "
+                "the bounded SQLite lock wait"
+            ) from exc
+        raise
+
+    staging: Path | None = None
+    destination: sqlite3.Connection | None = None
+    try:
+        staging = _reserve_backup_staging_file(target)
+        destination = sqlite3.connect(staging)
+        monitor = (
+            progress_monitor
+            if isinstance(progress_monitor, BackupProgressMonitor)
+            else BackupProgressMonitor(
+                active_limits,
+                clock=clock,
+                report=report,
+            )
+        )
+        progress_callback: Callable[[int, int, int], None] = monitor
+        if (
+            progress_monitor is not None
+            and progress_monitor is not monitor
+        ):
+            def progress_callback(
+                status: int,
+                remaining: int,
+                total: int,
+            ) -> None:
+                monitor(status, remaining, total)
+                progress_monitor(status, remaining, total)
+
+        watchdog_factory = copy_watchdog_factory or BackupCopyWatchdog
+        copy_watchdog = watchdog_factory(
+            source,
+            monitor,
+            active_limits,
+            clock=clock,
+            sleep=sleep,
+        )
+        copy_watchdog.start()
+        try:
+            try:
+                source.backup(
+                    destination,
+                    pages=1_024,
+                    progress=progress_callback,
+                    sleep=0.05,
+                )
+            except Exception as exc:
+                if copy_watchdog.failure is not None:
+                    raise copy_watchdog.failure from exc
+                raise
+            if copy_watchdog.failure is not None:
+                raise copy_watchdog.failure
+        finally:
+            copy_watchdog.stop()
+        result = _run_integrity_check(
+            destination,
+            active_limits,
+            clock=clock,
+            sleep=sleep,
+            report=report,
+            integrity_check=integrity_check,
+            monitor_factory=monitor_factory,
+        )
         if result != "ok":
             raise sqlite3.DatabaseError(
                 f"backup integrity check failed: {result}"
             )
-    except Exception:
         destination.close()
-        try:
-            target.unlink()
-        except OSError:
-            pass
+        destination = None
+        _ensure_backup_permissions(staging)
+        _publish_backup(staging, target)
+        _unlink_owned_backup(staging)
+        staging = None
+        return target
+    except Exception as exc:
+        if destination is not None:
+            try:
+                destination.close()
+            except Exception:
+                pass
+            destination = None
+        if staging is not None:
+            try:
+                _unlink_owned_backup(staging)
+            except OSError as cleanup_exc:
+                raise OSError(
+                    "backup failed and the incomplete staging file could not "
+                    f"be removed: {staging}: {cleanup_exc}"
+                ) from exc
         raise
-    destination.close()
-    return target
+    finally:
+        _restore_busy_timeout(source, previous_busy_timeout)
 
 
 def prune_events(
@@ -307,6 +823,19 @@ def _bounded_int(
     return parse
 
 
+def _backup_limits_from_args(args: argparse.Namespace) -> BackupLimits:
+    return BackupLimits(
+        max_copy_seconds=float(args.backup_max_seconds),
+        stall_seconds=float(args.backup_stall_seconds),
+        max_restarts=int(args.backup_max_restarts),
+        progress_interval_seconds=float(args.backup_progress_seconds),
+        integrity_max_seconds=float(args.integrity_check_max_seconds),
+        integrity_progress_interval_seconds=float(
+            args.integrity_progress_seconds
+        ),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Inspect and safely prune Triagewall verdict history."
@@ -356,6 +885,15 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Perform the planned deletion.",
     )
+    prune.add_argument(
+        "--confirm-writers-stopped",
+        action="store_true",
+        help=(
+            "Operator acknowledgement that the dashboard, Suricata ingest, "
+            "and optional wazuh-ingest are stopped before --apply. This does "
+            "not prove writers are stopped."
+        ),
+    )
     backup = prune.add_mutually_exclusive_group()
     backup.add_argument(
         "--backup",
@@ -366,6 +904,70 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-backup",
         action="store_true",
         help="Explicitly acknowledge applying without a backup.",
+    )
+    prune.add_argument(
+        "--backup-max-seconds",
+        type=_bounded_int(
+            "backup-max-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+        ),
+        default=DEFAULT_BACKUP_MAX_SECONDS,
+        help=(
+            "Abort online backup copy after this many seconds "
+            f"(default: {DEFAULT_BACKUP_MAX_SECONDS})."
+        ),
+    )
+    prune.add_argument(
+        "--backup-stall-seconds",
+        type=_bounded_int(
+            "backup-stall-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+        ),
+        default=DEFAULT_BACKUP_STALL_SECONDS,
+        help=(
+            "Abort when backup makes no forward page progress for this long "
+            f"(default: {DEFAULT_BACKUP_STALL_SECONDS})."
+        ),
+    )
+    prune.add_argument(
+        "--backup-max-restarts",
+        type=_bounded_int("backup-max-restarts", 0, MAX_BACKUP_RESTARTS),
+        default=DEFAULT_BACKUP_MAX_RESTARTS,
+        help=(
+            "Abort after this many backup remaining-page resets "
+            f"(default: {DEFAULT_BACKUP_MAX_RESTARTS})."
+        ),
+    )
+    prune.add_argument(
+        "--backup-progress-seconds",
+        type=_bounded_int(
+            "backup-progress-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+        ),
+        default=DEFAULT_BACKUP_PROGRESS_SECONDS,
+        help=(
+            "Seconds between backup copy progress lines on stderr "
+            f"(default: {DEFAULT_BACKUP_PROGRESS_SECONDS})."
+        ),
+    )
+    prune.add_argument(
+        "--integrity-check-max-seconds",
+        type=_bounded_int(
+            "integrity-check-max-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+        ),
+        default=DEFAULT_INTEGRITY_MAX_SECONDS,
+        help=(
+            "Abort backup integrity checking after this many seconds "
+            f"(default: {DEFAULT_INTEGRITY_MAX_SECONDS})."
+        ),
+    )
+    prune.add_argument(
+        "--integrity-progress-seconds",
+        type=_bounded_int(
+            "integrity-progress-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+        ),
+        default=DEFAULT_INTEGRITY_PROGRESS_SECONDS,
+        help=(
+            "Seconds between integrity-check heartbeats on stderr "
+            f"(default: {DEFAULT_INTEGRITY_PROGRESS_SECONDS})."
+        ),
     )
     prune.add_argument("--json", action="store_true")
     return parser
@@ -432,6 +1034,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--apply requires either --backup PATH or --no-backup"
         )
+    if args.command == "prune" and args.apply and not args.confirm_writers_stopped:
+        parser.error(
+            "--apply requires --confirm-writers-stopped: stop the dashboard, "
+            "Suricata ingest, and optional wazuh-ingest first. This flag is "
+            "an operator acknowledgement, not proof that all writers are "
+            "stopped."
+        )
 
     readonly = args.command == "status" or (
         args.command == "prune" and not args.apply
@@ -466,7 +1075,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.backup:
-            payload["backup"] = str(create_online_backup(conn, args.backup))
+            payload["backup"] = str(
+                create_online_backup(
+                    conn,
+                    args.backup,
+                    limits=_backup_limits_from_args(args),
+                )
+            )
 
         def report_progress(rows: int, batches: int) -> None:
             if batches == 1 or batches % 10 == 0:
@@ -489,6 +1104,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_payload(payload, args.json)
         return 0
     except (
+        BackupLimitExceeded,
         FileExistsError,
         FileNotFoundError,
         OSError,
