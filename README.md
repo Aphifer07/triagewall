@@ -161,7 +161,7 @@ are stopped before any applied prune.
 1. Inspect allocation and history bounds (read-only):
 
 ```bash
-docker compose run --rm --profile maintenance maintenance status
+docker compose --profile maintenance run --rm maintenance status
 ```
 
 With optional Wazuh enabled, include both Compose files and profiles so Compose
@@ -179,7 +179,8 @@ docker compose \
 2. Dry-preview a 30-day hot-data window (default; no writes):
 
 ```bash
-docker compose run --rm --profile maintenance maintenance prune --keep-days 30
+docker compose --profile maintenance run --rm maintenance \
+  prune --keep-days 30
 ```
 
 3. Record current ingest checkpoint metadata outside the database so you can
@@ -189,11 +190,17 @@ confirm resumption after the window.
 
 ```bash
 docker compose stop ingest
+```
+
+With optional Wazuh enabled, stop both writers through the combined
+configuration:
+
+```bash
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.wazuh.yml \
   --profile wazuh \
-  stop wazuh-ingest
+  stop ingest wazuh-ingest
 ```
 
 5. Run a backed-up canary prune with the maintenance acknowledgement. The tool
@@ -217,7 +224,7 @@ Human-reviewed verdicts remain protected unless `--include-reviewed` is
 supplied. To apply without a backup, pass both acknowledgements explicitly:
 
 ```bash
-docker compose run --rm --profile maintenance maintenance \
+docker compose --profile maintenance run --rm maintenance \
   prune --keep-days 30 --apply --confirm-writers-stopped --no-backup
 ```
 
@@ -229,11 +236,17 @@ health, and ingest checkpoint resumption after restart.
 
 ```bash
 docker compose start ingest
+```
+
+With optional Wazuh enabled, restart both writers through the combined
+configuration:
+
+```bash
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.wazuh.yml \
   --profile wazuh \
-  start wazuh-ingest
+  start ingest wazuh-ingest
 ```
 
 8. Retain the verified backup. Do not run `VACUUM` as part of this workflow:

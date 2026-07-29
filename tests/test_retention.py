@@ -11,6 +11,7 @@ import stat
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from triagewall.database import connect_database
@@ -477,10 +478,20 @@ class RetentionTests(unittest.TestCase):
             clock=clock,
             report=lambda _message: None,
         )
+        monitor(SQLITE_BUSY, 0, 0)
+        self.assertIsNone(monitor.previous_remaining)
+        clock.advance(25)
+        monitor(SQLITE_LOCKED, 0, 0)
+        self.assertIsNone(monitor.previous_remaining)
+        clock.advance(25)
         monitor(SQLITE_OK, 100, 100)
-        clock.advance(50)
+        self.assertEqual(monitor.previous_remaining, 100)
+        self.assertEqual(monitor.restarts, 0)
+        clock.advance(25)
         monitor(SQLITE_BUSY, 90, 100)
-        clock.advance(50)
+        self.assertEqual(monitor.previous_remaining, 100)
+        self.assertEqual(monitor.restarts, 0)
+        clock.advance(25)
         with self.assertRaises(BackupLimitExceeded) as raised:
             monitor(SQLITE_LOCKED, 80, 100)
         self.assertIn("stalled", str(raised.exception).lower())
@@ -531,6 +542,18 @@ class RetentionTests(unittest.TestCase):
             backup_path.read_text(encoding="utf-8"),
             "do-not-touch",
         )
+
+    def test_permission_failure_removes_owned_backup(self):
+        self.insert_event(age_days=5, signature_id=411)
+        backup_path = Path(self.temp_dir.name) / "permission-failure.db"
+        with mock.patch.object(
+            retention,
+            "_ensure_backup_permissions",
+            side_effect=OSError("permission update failed"),
+        ):
+            with self.assertRaises(OSError):
+                create_online_backup(self.conn, backup_path)
+        self.assertFalse(backup_path.exists())
 
     def test_integrity_timeout_removes_owned_backup(self):
         self.insert_event(age_days=5, signature_id=42)

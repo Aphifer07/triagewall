@@ -206,23 +206,25 @@ class BackupProgressMonitor:
 
         busy_or_locked = status in (SQLITE_BUSY, SQLITE_LOCKED)
 
-        if self.previous_remaining is None:
-            self.previous_remaining = self.remaining
-        elif self.remaining < self.previous_remaining:
-            # Forward progress. BUSY/LOCKED must not refresh the stall timer.
-            if not busy_or_locked:
+        # BUSY/LOCKED callbacks are observations of contention, not page-copy
+        # progress. Do not let their remaining-page values establish or move
+        # the comparison baseline.
+        if not busy_or_locked:
+            if self.previous_remaining is None:
+                self.previous_remaining = self.remaining
+            elif self.remaining < self.previous_remaining:
                 self.last_progress_at = now
-            self.previous_remaining = self.remaining
-        elif self.remaining > self.previous_remaining:
-            self.restarts += 1
-            self.previous_remaining = self.remaining
-            if self.restarts > self.limits.max_restarts:
-                raise BackupLimitExceeded(
-                    "backup copy exceeded maximum restarts of "
-                    f"{self.limits.max_restarts} "
-                    f"(detected {self.restarts}, remaining pages "
-                    f"{self.remaining}/{self.total})"
-                )
+                self.previous_remaining = self.remaining
+            elif self.remaining > self.previous_remaining:
+                self.restarts += 1
+                self.previous_remaining = self.remaining
+                if self.restarts > self.limits.max_restarts:
+                    raise BackupLimitExceeded(
+                        "backup copy exceeded maximum restarts of "
+                        f"{self.limits.max_restarts} "
+                        f"(detected {self.restarts}, remaining pages "
+                        f"{self.remaining}/{self.total})"
+                    )
         # equal remaining: no progress; do not refresh stall timer
 
         stalled_for = now - self.last_progress_at
@@ -291,6 +293,10 @@ class IntegrityCheckMonitor:
     def stop(self) -> None:
         self._stop.set()
         self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            raise BackupLimitExceeded(
+                "backup integrity monitor did not stop cleanly"
+            )
 
     def _run(self) -> None:
         last_report_at = self.started_at
@@ -308,10 +314,14 @@ class IntegrityCheckMonitor:
                 now - last_report_at
                 >= self.limits.integrity_progress_interval_seconds
             ):
-                self.report(
-                    "retention backup progress: phase=integrity "
-                    f"elapsed={elapsed:.1f}s"
-                )
+                try:
+                    self.report(
+                        "retention backup progress: phase=integrity "
+                        f"elapsed={elapsed:.1f}s"
+                    )
+                except Exception:
+                    # A logging failure must not disable timeout enforcement.
+                    pass
                 last_report_at = now
             # Prefer Event.wait so stop() wakes promptly; fall back to sleep
             # when tests inject a fake sleeper for deterministic clocks.
@@ -352,8 +362,8 @@ def _reserve_backup_destination(target: Path) -> None:
 def _unlink_owned_backup(target: Path) -> None:
     try:
         target.unlink()
-    except OSError:
-        pass
+    except FileNotFoundError:
+        return
 
 
 def _ensure_backup_permissions(target: Path) -> None:
@@ -471,17 +481,26 @@ def create_online_backup(
             raise sqlite3.DatabaseError(
                 f"backup integrity check failed: {result}"
             )
-    except Exception:
+        destination.close()
+        destination = None
+        _ensure_backup_permissions(target)
+        return target
+    except Exception as exc:
         if destination is not None:
-            destination.close()
+            try:
+                destination.close()
+            except Exception:
+                pass
             destination = None
         if owned_backup:
-            _unlink_owned_backup(target)
-            owned_backup = False
+            try:
+                _unlink_owned_backup(target)
+            except OSError as cleanup_exc:
+                raise OSError(
+                    "backup failed and the incomplete destination could not "
+                    f"be removed: {target}: {cleanup_exc}"
+                ) from exc
         raise
-    destination.close()
-    _ensure_backup_permissions(target)
-    return target
 
 
 def prune_events(
