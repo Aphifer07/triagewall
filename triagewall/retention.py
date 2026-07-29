@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 
@@ -333,15 +334,34 @@ class IntegrityCheckMonitor:
 
 
 
-def _reserve_backup_destination(target: Path) -> None:
-    """Atomically create an exclusive empty backup file with mode 0600."""
+def _reserve_backup_staging_file(target: Path) -> Path:
+    """Create an unpredictable, exclusive staging file beside the target."""
     if not target.parent.exists():
         raise FileNotFoundError(
             f"backup parent directory does not exist: {target.parent}"
         )
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    fd, staging_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
     try:
-        fd = os.open(target, flags, BACKUP_FILE_MODE)
+        os.chmod(staging_name, BACKUP_FILE_MODE)
+    except OSError as exc:
+        os.close(fd)
+        Path(staging_name).unlink(missing_ok=True)
+        raise OSError(
+            "failed to set backup staging permissions to 0600: "
+            f"{staging_name}"
+        ) from exc
+    os.close(fd)
+    return Path(staging_name)
+
+
+def _publish_backup(staging: Path, target: Path) -> None:
+    """Atomically publish a verified backup without replacing any target."""
+    try:
+        os.link(staging, target)
     except FileExistsError as exc:
         raise FileExistsError(
             f"backup target already exists: {target}"
@@ -352,11 +372,6 @@ def _reserve_backup_destination(target: Path) -> None:
                 f"backup target already exists: {target}"
             ) from exc
         raise
-    os.close(fd)
-    try:
-        os.chmod(target, BACKUP_FILE_MODE)
-    except OSError:
-        pass
 
 
 def _unlink_owned_backup(target: Path) -> None:
@@ -439,6 +454,8 @@ def create_online_backup(
         raise FileNotFoundError(
             f"backup parent directory does not exist: {target.parent}"
         )
+    if os.path.lexists(target):
+        raise FileExistsError(f"backup target already exists: {target}")
     page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
     page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
     backup_bytes = page_size * page_count
@@ -451,12 +468,11 @@ def create_online_backup(
             f"has {free_bytes}"
         )
 
-    owned_backup = False
+    staging: Path | None = None
     destination: sqlite3.Connection | None = None
     try:
-        _reserve_backup_destination(target)
-        owned_backup = True
-        destination = sqlite3.connect(target)
+        staging = _reserve_backup_staging_file(target)
+        destination = sqlite3.connect(staging)
         monitor = progress_monitor or BackupProgressMonitor(
             active_limits,
             clock=clock,
@@ -483,7 +499,10 @@ def create_online_backup(
             )
         destination.close()
         destination = None
-        _ensure_backup_permissions(target)
+        _ensure_backup_permissions(staging)
+        _publish_backup(staging, target)
+        _unlink_owned_backup(staging)
+        staging = None
         return target
     except Exception as exc:
         if destination is not None:
@@ -492,13 +511,13 @@ def create_online_backup(
             except Exception:
                 pass
             destination = None
-        if owned_backup:
+        if staging is not None:
             try:
-                _unlink_owned_backup(target)
+                _unlink_owned_backup(staging)
             except OSError as cleanup_exc:
                 raise OSError(
-                    "backup failed and the incomplete destination could not "
-                    f"be removed: {target}: {cleanup_exc}"
+                    "backup failed and the incomplete staging file could not "
+                    f"be removed: {staging}: {cleanup_exc}"
                 ) from exc
         raise
 

@@ -243,6 +243,10 @@ class RetentionTests(unittest.TestCase):
         created = create_online_backup(self.conn, backup_path)
 
         self.assertEqual(created, backup_path)
+        self.assertEqual(
+            list(backup_path.parent.glob(f".{backup_path.name}.*.tmp")),
+            [],
+        )
         if os.name == "posix":
             self.assertEqual(
                 stat.S_IMODE(backup_path.stat().st_mode),
@@ -541,6 +545,29 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(
             backup_path.read_text(encoding="utf-8"),
             "do-not-touch",
+        )
+
+    def test_target_created_during_backup_is_never_overwritten(self):
+        self.insert_event(age_days=5, signature_id=410)
+        backup_path = Path(self.temp_dir.name) / "late-collision.db"
+
+        def create_late_collision(_conn):
+            backup_path.write_text("do-not-touch", encoding="utf-8")
+            return "ok"
+
+        with self.assertRaises(FileExistsError):
+            create_online_backup(
+                self.conn,
+                backup_path,
+                integrity_check=create_late_collision,
+            )
+        self.assertEqual(
+            backup_path.read_text(encoding="utf-8"),
+            "do-not-touch",
+        )
+        self.assertEqual(
+            list(backup_path.parent.glob(f".{backup_path.name}.*.tmp")),
+            [],
         )
 
     def test_permission_failure_removes_owned_backup(self):
