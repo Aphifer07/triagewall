@@ -186,10 +186,11 @@ docker compose --profile maintenance run --rm maintenance \
 3. Record current ingest checkpoint metadata outside the database so you can
 confirm resumption after the window.
 
-4. Stop writers before apply:
+4. Stop writers before apply. The dashboard is included because human-feedback
+submissions write to the verdict database:
 
 ```bash
-docker compose stop ingest
+docker compose stop dashboard ingest
 ```
 
 With optional Wazuh enabled, stop both writers through the combined
@@ -200,7 +201,7 @@ docker compose \
   -f docker-compose.yml \
   -f docker-compose.wazuh.yml \
   --profile wazuh \
-  stop ingest wazuh-ingest
+  stop dashboard ingest wazuh-ingest
 ```
 
 5. Run a backed-up canary prune with the maintenance acknowledgement. The tool
@@ -235,7 +236,7 @@ health, and ingest checkpoint resumption after restart.
 7. Restart writers:
 
 ```bash
-docker compose start ingest
+docker compose start ingest dashboard
 ```
 
 With optional Wazuh enabled, restart both writers through the combined
@@ -246,7 +247,7 @@ docker compose \
   -f docker-compose.yml \
   -f docker-compose.wazuh.yml \
   --profile wazuh \
-  start ingest wazuh-ingest
+  start ingest wazuh-ingest dashboard
 ```
 
 8. Retain the verified backup. Do not run `VACUUM` as part of this workflow:

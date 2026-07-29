@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -244,6 +245,10 @@ class RetentionTests(unittest.TestCase):
 
         self.assertEqual(created, backup_path)
         self.assertEqual(
+            self.conn.execute("PRAGMA busy_timeout").fetchone()[0],
+            10_000,
+        )
+        self.assertEqual(
             list(backup_path.parent.glob(f".{backup_path.name}.*.tmp")),
             [],
         )
@@ -315,7 +320,8 @@ class RetentionTests(unittest.TestCase):
         self.insert_event(age_days=60, signature_id=36)
         backup_path = Path(self.temp_dir.name) / "missing-ack.db"
         self.conn.close()
-        with redirect_stderr(io.StringIO()):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
             with self.assertRaises(SystemExit) as raised:
                 retention.main(
                     [
@@ -330,6 +336,7 @@ class RetentionTests(unittest.TestCase):
                     ]
                 )
         self.assertEqual(raised.exception.code, 2)
+        self.assertIn("dashboard", stderr.getvalue())
         self.assertFalse(backup_path.exists())
         self.conn = connect_database(self.db_path)
         self.assertEqual(
@@ -517,6 +524,82 @@ class RetentionTests(unittest.TestCase):
         with self.assertRaises(BackupLimitExceeded) as raised:
             monitor(SQLITE_OK, 90, 100)
         self.assertIn("maximum duration", str(raised.exception).lower())
+
+    def test_backup_watchdog_interrupts_without_progress_callback(self):
+        self.insert_event(age_days=5, signature_id=399)
+        backup_path = Path(self.temp_dir.name) / "blocked-copy.db"
+        interrupted = threading.Event()
+
+        class BlockingSource:
+            def execute(self, *args, **kwargs):
+                return self_conn.execute(*args, **kwargs)
+
+            def interrupt(self):
+                interrupted.set()
+
+            def backup(self, _destination, **_kwargs):
+                if not interrupted.wait(timeout=2.0):
+                    raise AssertionError("backup watchdog did not interrupt")
+                raise sqlite3.OperationalError("interrupted")
+
+        self_conn = self.conn
+        started_at = time.monotonic()
+        with self.assertRaises(BackupLimitExceeded) as raised:
+            create_online_backup(
+                BlockingSource(),  # type: ignore[arg-type]
+                backup_path,
+                limits=BackupLimits(
+                    max_copy_seconds=0.05,
+                    stall_seconds=10,
+                    progress_interval_seconds=10,
+                ),
+            )
+        elapsed = time.monotonic() - started_at
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(interrupted.is_set())
+        self.assertIn("maximum duration", str(raised.exception).lower())
+        self.assertFalse(backup_path.exists())
+        self.assertEqual(
+            list(backup_path.parent.glob(f".{backup_path.name}.*.tmp")),
+            [],
+        )
+
+    def test_locked_source_respects_copy_deadline_and_restores_timeout(self):
+        locked_path = Path(self.temp_dir.name) / "locked-source.db"
+        backup_path = Path(self.temp_dir.name) / "locked-backup.db"
+        setup = sqlite3.connect(locked_path)
+        setup.execute("PRAGMA journal_mode=DELETE")
+        setup.execute("CREATE TABLE test_data (value TEXT)")
+        setup.commit()
+        setup.close()
+
+        source = sqlite3.connect(locked_path, timeout=10)
+        source.execute("PRAGMA busy_timeout=10000")
+        blocker = sqlite3.connect(locked_path, timeout=10)
+        blocker.execute("BEGIN EXCLUSIVE")
+        started_at = time.monotonic()
+        try:
+            with self.assertRaises(BackupLimitExceeded):
+                create_online_backup(
+                    source,
+                    backup_path,
+                    limits=BackupLimits(
+                        max_copy_seconds=0.1,
+                        stall_seconds=10,
+                        progress_interval_seconds=10,
+                    ),
+                )
+            elapsed = time.monotonic() - started_at
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(
+                source.execute("PRAGMA busy_timeout").fetchone()[0],
+                10_000,
+            )
+            self.assertFalse(backup_path.exists())
+        finally:
+            blocker.rollback()
+            blocker.close()
+            source.close()
 
     def test_partial_backup_is_removed_after_copy_abort(self):
         self.insert_event(age_days=5, signature_id=40)
