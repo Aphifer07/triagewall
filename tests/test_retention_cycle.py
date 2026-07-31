@@ -35,7 +35,8 @@ class RetentionCycleTests(unittest.TestCase):
         self._write_executable(
             "curl",
             """#!/bin/sh
-printf '%s\n' "$*" >>"$FAKE_CURL_LOG"
+printf '%s' "$*" | tr '\n' ' ' >>"$FAKE_CURL_LOG"
+printf '\n' >>"$FAKE_CURL_LOG"
 status="${FAKE_HEALTH_STATUS:-200}"
 case "$status" in
   200) health=ok ;;
