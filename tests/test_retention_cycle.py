@@ -249,8 +249,12 @@ esac
     def test_recovery_rejects_unexpected_dashboard_status(self):
         completed = self._run(health_status=500)
 
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("dashboard health check failed", completed.stderr)
+        self.assertEqual(completed.returncode, 75)
+        self.assertIn("monitoring recovery failed", completed.stderr)
+        self.assertIn(
+            "CRITICAL: monitoring services could not be restored",
+            completed.stderr,
+        )
 
     def test_dashboard_health_requests_have_connection_and_transfer_limits(self):
         completed = self._run()
