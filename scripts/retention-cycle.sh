@@ -163,12 +163,40 @@ all_writers_running() {
   done
 }
 
+dashboard_reachable() {
+  local dashboard_health_body
+  local dashboard_health_response
+  dashboard_health_response="$(
+    curl -sS -w $'\n%{http_code}' \
+      -H "Host: localhost" "$health_url"
+  )" || return 1
+  dashboard_health_status="${dashboard_health_response##*$'\n'}"
+  dashboard_health_body="${dashboard_health_response%$'\n'*}"
+  python3 - "$dashboard_health_status" "$dashboard_health_body" <<'PY'
+import json
+import sys
+
+http_status = sys.argv[1]
+payload = json.loads(sys.argv[2])
+expected_status = {"200": "ok", "503": "stale"}.get(http_status)
+if (
+    not isinstance(payload, dict)
+    or payload.get("status") != expected_status
+    or not isinstance(payload.get("storage"), dict)
+):
+    raise SystemExit(1)
+PY
+}
+
 wait_for_recovery() {
   local attempt
   for attempt in {1..18}; do
-    if all_writers_running \
-      && curl -fsS -H "Host: localhost" "$health_url" >/dev/null; then
-      echo "retention cycle: monitoring services and dashboard are healthy"
+    if all_writers_running && dashboard_reachable; then
+      if [[ "$dashboard_health_status" == "503" ]]; then
+        echo "retention cycle: services recovered; dashboard reports a stale alert stream"
+      else
+        echo "retention cycle: monitoring services and dashboard are healthy"
+      fi
       return 0
     fi
     sleep 10

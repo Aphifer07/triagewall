@@ -199,6 +199,12 @@ docker compose --profile maintenance run --rm maintenance \
 - waits 30 minutes with monitoring live before another pause if needed; and
 - retains the backup, manifest, and JSON results for operator review.
 
+Recovery requires every selected Compose service to be running and the
+dashboard health endpoint to be reachable. HTTP 503 with Triagewall's normal
+`stale` status is accepted because a quiet sensor may legitimately have no
+recent verdict after a long pause; connection failures and other status codes
+still fail the cycle.
+
 Run it as an SSH-independent transient systemd service. The backup directory
 must already exist on the intended backup filesystem, be owned by the account
 running the cycle, and not be group- or world-writable:

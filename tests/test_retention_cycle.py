@@ -34,6 +34,19 @@ class RetentionCycleTests(unittest.TestCase):
         self._write_executable(
             "curl",
             """#!/bin/sh
+status="${FAKE_HEALTH_STATUS:-200}"
+case "$status" in
+  200) health=ok ;;
+  503) health=stale ;;
+  *) health=error ;;
+esac
+printf '{"status":"%s","storage":{}}\n%s' "$health" "$status"
+exit 0
+""",
+        )
+        self._write_executable(
+            "sleep",
+            """#!/bin/sh
 exit 0
 """,
         )
@@ -80,12 +93,14 @@ esac
         *,
         fail_phase: str | None = None,
         defer_cleanup: bool = False,
+        health_status: int = 200,
         max_cycles: int = 1,
     ) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
         env["FAKE_DOCKER_LOG"] = str(self.docker_log)
         env["FAKE_PRUNE_STATE"] = str(self.root / "prune.state")
+        env["FAKE_HEALTH_STATUS"] = str(health_status)
         env["TRIAGEWALL_RETENTION_LOCK"] = str(self.root / "cycle.lock")
         if fail_phase:
             env["FAKE_FAIL_PHASE"] = fail_phase
@@ -165,6 +180,18 @@ esac
         self.assertEqual(len(prune_calls), 2)
         self.assertIn("orphan cleanup deferred", completed.stdout)
         self.assertIn("retention target exhausted", completed.stdout)
+
+    def test_recovery_accepts_dashboard_stale_status_for_quiet_stream(self):
+        completed = self._run(health_status=503)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("dashboard reports a stale alert stream", completed.stdout)
+
+    def test_recovery_rejects_unexpected_dashboard_status(self):
+        completed = self._run(health_status=500)
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("dashboard health check failed", completed.stderr)
 
 
 if __name__ == "__main__":
