@@ -59,6 +59,7 @@ MAX_PRUNE_SECONDS = 86_400
 
 BACKUP_FILE_MODE = 0o600
 BACKUP_MANIFEST_VERSION = 1
+BACKUP_PROVENANCE_VERSION = 1
 MAX_BACKUP_STEP_BUSY_MS = 100
 
 # sqlite3 backup progress statuses (not always exported by the stdlib module).
@@ -106,6 +107,10 @@ class BackupLimitExceeded(RuntimeError):
     """Raised when a bounded backup or integrity check hits a safety limit."""
 
 
+class RetentionDeadlineExceeded(RuntimeError):
+    """Raised when pre-prune work consumes the bounded maintenance window."""
+
+
 def _retention_predicate(include_reviewed: bool) -> str:
     predicate = "processed_at IS NOT NULL AND processed_at < ?"
     if not include_reviewed:
@@ -118,34 +123,55 @@ def build_retention_plan(
     cutoff: str,
     *,
     include_reviewed: bool = False,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> RetentionPlan:
     """Count exactly what a prune would remove before any write occurs."""
     canonical_cutoff = format_utc_timestamp(cutoff)
-    counts = conn.execute(
-        """SELECT
-               COALESCE(SUM(human_verdict IS NULL), 0),
-               COALESCE(SUM(human_verdict IS NOT NULL), 0)
-           FROM triage_events
-           WHERE processed_at IS NOT NULL AND processed_at < ?""",
-        (canonical_cutoff,),
-    ).fetchone()
-    unreviewed_rows = int(counts[0])
-    reviewed_rows_below_cutoff = int(counts[1])
-    eligible_rows = (
-        unreviewed_rows + reviewed_rows_below_cutoff
-        if include_reviewed
-        else unreviewed_rows
-    )
-    oldest_processed_at, newest_processed_at = _history_bounds(conn)
-    return RetentionPlan(
-        cutoff=canonical_cutoff,
-        include_reviewed=include_reviewed,
-        eligible_rows=eligible_rows,
-        reviewed_rows_below_cutoff=reviewed_rows_below_cutoff,
-        lifetime_rows_inserted=_lifetime_rows_inserted(conn),
-        oldest_processed_at=oldest_processed_at,
-        newest_processed_at=newest_processed_at,
-    )
+    if deadline is not None and clock() >= deadline:
+        raise RetentionDeadlineExceeded(
+            "retention planning exceeded the maintenance deadline"
+        )
+    if deadline is not None:
+        conn.set_progress_handler(
+            lambda: 1 if clock() >= deadline else 0,
+            1_000,
+        )
+    try:
+        counts = conn.execute(
+            """SELECT
+                   COALESCE(SUM(human_verdict IS NULL), 0),
+                   COALESCE(SUM(human_verdict IS NOT NULL), 0)
+               FROM triage_events
+               WHERE processed_at IS NOT NULL AND processed_at < ?""",
+            (canonical_cutoff,),
+        ).fetchone()
+        unreviewed_rows = int(counts[0])
+        reviewed_rows_below_cutoff = int(counts[1])
+        eligible_rows = (
+            unreviewed_rows + reviewed_rows_below_cutoff
+            if include_reviewed
+            else unreviewed_rows
+        )
+        oldest_processed_at, newest_processed_at = _history_bounds(conn)
+        return RetentionPlan(
+            cutoff=canonical_cutoff,
+            include_reviewed=include_reviewed,
+            eligible_rows=eligible_rows,
+            reviewed_rows_below_cutoff=reviewed_rows_below_cutoff,
+            lifetime_rows_inserted=_lifetime_rows_inserted(conn),
+            oldest_processed_at=oldest_processed_at,
+            newest_processed_at=newest_processed_at,
+        )
+    except sqlite3.OperationalError as exc:
+        if deadline is not None and clock() >= deadline:
+            raise RetentionDeadlineExceeded(
+                "retention planning exceeded the maintenance deadline"
+            ) from exc
+        raise
+    finally:
+        if deadline is not None:
+            conn.set_progress_handler(None, 0)
 
 
 def _lifetime_rows_inserted(conn: sqlite3.Connection) -> int:
@@ -735,6 +761,8 @@ def create_backup_copy(
     source: sqlite3.Connection,
     backup_path: str | Path,
     *,
+    source_path: str | Path | None = None,
+    provenance_path: str | Path | None = None,
     limits: BackupLimits | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
@@ -742,10 +770,20 @@ def create_backup_copy(
     progress_monitor: Callable[[int, int, int], None] | None = None,
     copy_watchdog_factory: Callable[..., BackupCopyWatchdog] | None = None,
 ) -> Path:
-    """Create and publish a bounded backup copy for later verification."""
-    return _create_backup(
+    """Create a bounded backup plus provenance for later verification."""
+    target = Path(backup_path)
+    provenance = (
+        Path(provenance_path)
+        if provenance_path is not None
+        else _backup_provenance_path(target)
+    )
+    if os.path.lexists(provenance):
+        raise FileExistsError(
+            f"backup provenance already exists: {provenance}"
+        )
+    created = _create_backup(
         source,
-        backup_path,
+        target,
         limits=limits,
         clock=clock,
         sleep=sleep,
@@ -754,6 +792,25 @@ def create_backup_copy(
         copy_watchdog_factory=copy_watchdog_factory,
         verify_integrity=False,
     )
+    created_identity = _regular_file_identity(created, label="backup")
+    try:
+        _write_backup_provenance(
+            source,
+            source_path or _main_database_path(source),
+            created,
+            provenance,
+        )
+    except Exception as exc:
+        try:
+            if _regular_file_identity(created, label="backup") == created_identity:
+                _unlink_owned_backup(created)
+        except OSError as cleanup_exc:
+            raise OSError(
+                "backup provenance failed and the published backup could not "
+                f"be removed safely: {created}: {cleanup_exc}"
+            ) from exc
+        raise
+    return created
 
 
 def _regular_file_identity(path: Path, *, label: str) -> dict[str, int]:
@@ -869,6 +926,194 @@ def _write_exclusive_manifest(
         raise
 
 
+def _main_database_path(conn: sqlite3.Connection) -> Path:
+    for _, name, path in conn.execute("PRAGMA database_list").fetchall():
+        if name == "main" and path:
+            return Path(path)
+    raise ValueError("source connection is not backed by a database file")
+
+
+def _backup_provenance_path(backup_path: Path) -> Path:
+    return Path(f"{backup_path}.provenance.json")
+
+
+def _write_backup_provenance(
+    source_conn: sqlite3.Connection,
+    source_path: str | Path,
+    backup_path: str | Path,
+    provenance_path: str | Path,
+) -> dict[str, object]:
+    """Record where and when a split-workflow backup was created."""
+    source = Path(source_path).resolve()
+    backup = Path(backup_path).resolve()
+    provenance = Path(provenance_path)
+    source_lifetime_rows = _lifetime_rows_inserted(source_conn)
+    source_page_size = int(
+        source_conn.execute("PRAGMA page_size").fetchone()[0]
+    )
+
+    destination = _connect_immutable_backup(backup)
+    try:
+        backup_lifetime_rows = _lifetime_rows_inserted(destination)
+        backup_page_size = int(
+            destination.execute("PRAGMA page_size").fetchone()[0]
+        )
+        backup_page_count = int(
+            destination.execute("PRAGMA page_count").fetchone()[0]
+        )
+    finally:
+        destination.close()
+
+    if backup_lifetime_rows != source_lifetime_rows:
+        raise ValueError(
+            "source database changed before backup provenance was recorded"
+        )
+
+    unsigned: dict[str, object] = {
+        "version": BACKUP_PROVENANCE_VERSION,
+        "created_at": format_utc_timestamp(utc_now()),
+        "source_database": {
+            "path": str(source),
+            **_source_database_identity(source),
+            "page_size_bytes": source_page_size,
+            "lifetime_rows_inserted": source_lifetime_rows,
+        },
+        "backup": {
+            "path": str(backup),
+            **_regular_file_identity(backup, label="backup"),
+            "page_size_bytes": backup_page_size,
+            "page_count": backup_page_count,
+            "lifetime_rows_inserted": backup_lifetime_rows,
+        },
+    }
+    payload = {
+        **unsigned,
+        "provenance_hash": _manifest_digest(unsigned),
+    }
+    _write_exclusive_manifest(provenance, payload)
+    return payload
+
+
+def _validate_backup_provenance(
+    provenance_path: str | Path,
+    *,
+    source_conn: sqlite3.Connection,
+    source_path: str | Path,
+    backup_path: str | Path,
+) -> dict[str, object]:
+    provenance = Path(provenance_path)
+    _regular_file_identity(provenance, label="backup provenance")
+    if provenance.stat().st_size > MAX_MANIFEST_BYTES:
+        raise ValueError(
+            "backup provenance exceeds "
+            f"{MAX_MANIFEST_BYTES} bytes: {provenance}"
+        )
+    try:
+        payload = json.loads(provenance.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"backup provenance is not valid JSON: {provenance}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("backup provenance root must be an object")
+    expected_keys = {
+        "version",
+        "created_at",
+        "source_database",
+        "backup",
+        "provenance_hash",
+    }
+    if set(payload) != expected_keys:
+        raise ValueError("backup provenance fields do not match version 1")
+    if (
+        type(payload["version"]) is not int
+        or payload["version"] != BACKUP_PROVENANCE_VERSION
+    ):
+        raise ValueError(
+            f"unsupported backup provenance version: {payload['version']}"
+        )
+    parse_utc_timestamp(payload["created_at"])
+    unsigned = dict(payload)
+    provenance_hash = unsigned.pop("provenance_hash")
+    expected_hash = _manifest_digest(unsigned)
+    if not isinstance(provenance_hash, str) or not hmac.compare_digest(
+        provenance_hash,
+        expected_hash,
+    ):
+        raise ValueError("backup provenance hash does not match")
+
+    source_metadata = payload["source_database"]
+    backup_metadata = payload["backup"]
+    if not isinstance(source_metadata, dict) or not isinstance(
+        backup_metadata,
+        dict,
+    ):
+        raise ValueError("backup provenance metadata must be objects")
+    expected_source_keys = {
+        "path",
+        "device",
+        "inode",
+        "page_size_bytes",
+        "lifetime_rows_inserted",
+    }
+    expected_backup_keys = {
+        "path",
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns",
+        "page_size_bytes",
+        "page_count",
+        "lifetime_rows_inserted",
+    }
+    if set(source_metadata) != expected_source_keys:
+        raise ValueError("backup provenance source metadata is invalid")
+    if set(backup_metadata) != expected_backup_keys:
+        raise ValueError("backup provenance backup metadata is invalid")
+
+    source = Path(source_path).resolve()
+    backup = Path(backup_path).resolve()
+    if source_metadata.get("path") != str(source):
+        raise ValueError("backup provenance belongs to a different source database")
+    if backup_metadata.get("path") != str(backup):
+        raise ValueError("backup provenance belongs to a different backup")
+    current_source_identity = _source_database_identity(source)
+    for key in ("device", "inode"):
+        if source_metadata.get(key) != current_source_identity[key]:
+            raise ValueError(
+                "source database identity changed after backup creation"
+            )
+    if source_metadata.get("page_size_bytes") != int(
+        source_conn.execute("PRAGMA page_size").fetchone()[0]
+    ):
+        raise ValueError("source database page size changed after backup creation")
+
+    source_lifetime_rows = source_metadata.get("lifetime_rows_inserted")
+    backup_lifetime_rows = backup_metadata.get("lifetime_rows_inserted")
+    if (
+        not isinstance(source_lifetime_rows, int)
+        or isinstance(source_lifetime_rows, bool)
+        or not isinstance(backup_lifetime_rows, int)
+        or isinstance(backup_lifetime_rows, bool)
+        or source_lifetime_rows != backup_lifetime_rows
+        or _lifetime_rows_inserted(source_conn) < source_lifetime_rows
+    ):
+        raise ValueError("backup provenance database sequence is invalid")
+
+    current_backup_identity = _regular_file_identity(
+        backup,
+        label="provenance-bound backup",
+    )
+    for key in ("device", "inode", "size_bytes", "mtime_ns"):
+        if backup_metadata.get(key) != current_backup_identity[key]:
+            raise ValueError("backup identity changed after backup creation")
+    for key in ("page_size_bytes", "page_count"):
+        value = backup_metadata.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("backup provenance database metadata is invalid")
+    return payload
+
+
 def _connect_immutable_backup(path: Path) -> sqlite3.Connection:
     uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
     return sqlite3.connect(uri, uri=True)
@@ -880,6 +1125,7 @@ def verify_backup(
     *,
     source_conn: sqlite3.Connection,
     source_path: str | Path,
+    provenance_path: str | Path | None = None,
     limits: BackupLimits | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
@@ -891,7 +1137,18 @@ def verify_backup(
     backup = Path(backup_path).resolve()
     manifest = Path(manifest_path)
     source = Path(source_path).resolve()
+    provenance = (
+        Path(provenance_path)
+        if provenance_path is not None
+        else _backup_provenance_path(backup)
+    )
     active_limits = limits or BackupLimits()
+    provenance_payload = _validate_backup_provenance(
+        provenance,
+        source_conn=source_conn,
+        source_path=source,
+        backup_path=backup,
+    )
     backup_identity_before = _regular_file_identity(
         backup,
         label="backup",
@@ -938,6 +1195,15 @@ def verify_backup(
     )
     if backup_identity_after != backup_identity_before:
         raise ValueError("backup changed while it was being verified")
+    provenance_backup = provenance_payload["backup"]
+    if (
+        not isinstance(provenance_backup, dict)
+        or provenance_backup.get("page_size_bytes") != backup_page_size
+        or provenance_backup.get("page_count") != backup_page_count
+        or provenance_backup.get("lifetime_rows_inserted")
+        != backup_lifetime_rows
+    ):
+        raise ValueError("backup contents do not match backup provenance")
 
     source_metadata: dict[str, object] = {
         "path": str(source),
@@ -955,12 +1221,23 @@ def verify_backup(
         "page_count": backup_page_count,
         "lifetime_rows_inserted": backup_lifetime_rows,
     }
+    provenance_identity = _regular_file_identity(
+        provenance,
+        label="backup provenance",
+    )
+    provenance_metadata: dict[str, object] = {
+        "path": str(provenance.resolve()),
+        **provenance_identity,
+        "created_at": provenance_payload["created_at"],
+        "provenance_hash": provenance_payload["provenance_hash"],
+    }
     unsigned: dict[str, object] = {
         "version": BACKUP_MANIFEST_VERSION,
         "verified_at": format_utc_timestamp(utc_now()),
         "integrity_check": "ok",
         "source_database": source_metadata,
         "backup": backup_metadata,
+        "backup_provenance": provenance_metadata,
     }
     payload = {
         **unsigned,
@@ -975,7 +1252,11 @@ def validate_backup_manifest(
     *,
     source_conn: sqlite3.Connection,
     source_path: str | Path,
+    cutoff: str,
+    include_reviewed: bool = False,
     max_age_seconds: float = DEFAULT_MANIFEST_MAX_AGE_SECONDS,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
     """Validate a verified backup manifest without rereading the backup."""
     if max_age_seconds <= 0:
@@ -1001,6 +1282,7 @@ def validate_backup_manifest(
         "integrity_check",
         "source_database",
         "backup",
+        "backup_provenance",
         "manifest_hash",
     }
     if set(payload) != expected_keys:
@@ -1036,10 +1318,11 @@ def validate_backup_manifest(
 
     source_metadata = payload["source_database"]
     backup_metadata = payload["backup"]
+    provenance_metadata = payload["backup_provenance"]
     if not isinstance(source_metadata, dict) or not isinstance(
         backup_metadata,
         dict,
-    ):
+    ) or not isinstance(provenance_metadata, dict):
         raise ValueError("verification manifest metadata must be objects")
     expected_source_keys = {
         "path",
@@ -1059,10 +1342,23 @@ def validate_backup_manifest(
         "page_count",
         "lifetime_rows_inserted",
     }
+    expected_provenance_keys = {
+        "path",
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns",
+        "created_at",
+        "provenance_hash",
+    }
     if set(source_metadata) != expected_source_keys:
         raise ValueError("verification manifest source metadata is invalid")
     if set(backup_metadata) != expected_backup_keys:
         raise ValueError("verification manifest backup metadata is invalid")
+    if set(provenance_metadata) != expected_provenance_keys:
+        raise ValueError(
+            "verification manifest provenance metadata is invalid"
+        )
     source = Path(source_path).resolve()
     if source_metadata.get("path") != str(source):
         raise ValueError(
@@ -1119,6 +1415,76 @@ def validate_backup_manifest(
         )
     ):
         raise ValueError("verification manifest backup hash is invalid")
+
+    provenance_path_value = provenance_metadata.get("path")
+    if not isinstance(provenance_path_value, str):
+        raise ValueError("verification manifest provenance path is invalid")
+    provenance = Path(provenance_path_value)
+    current_provenance_identity = _regular_file_identity(
+        provenance,
+        label="verified backup provenance",
+    )
+    for key in ("device", "inode", "size_bytes", "mtime_ns"):
+        if provenance_metadata.get(key) != current_provenance_identity[key]:
+            raise ValueError(
+                "verified backup provenance identity changed after verification"
+            )
+    provenance_payload = _validate_backup_provenance(
+        provenance,
+        source_conn=source_conn,
+        source_path=source,
+        backup_path=backup,
+    )
+    if provenance_metadata.get("provenance_hash") != provenance_payload.get(
+        "provenance_hash"
+    ):
+        raise ValueError("verified backup provenance hash changed")
+    created_at = parse_utc_timestamp(provenance_payload["created_at"])
+    if provenance_metadata.get("created_at") != provenance_payload.get(
+        "created_at"
+    ):
+        raise ValueError("verified backup provenance timestamp changed")
+    backup_age_seconds = (utc_now() - created_at).total_seconds()
+    if backup_age_seconds < -300:
+        raise ValueError("backup provenance timestamp is in the future")
+    if backup_age_seconds > max_age_seconds:
+        raise ValueError(
+            "verified backup is too old "
+            f"({backup_age_seconds:.0f}s; limit {max_age_seconds:g}s)"
+        )
+
+    provenance_source = provenance_payload["source_database"]
+    if not isinstance(provenance_source, dict):
+        raise ValueError("backup provenance source metadata is invalid")
+    backup_sequence = provenance_source["lifetime_rows_inserted"]
+    canonical_cutoff = format_utc_timestamp(cutoff)
+    predicate = _retention_predicate(include_reviewed)
+    if deadline is not None:
+        source_conn.set_progress_handler(
+            lambda: 1 if clock() >= deadline else 0,
+            1_000,
+        )
+    try:
+        missing_eligible_row = source_conn.execute(
+            f"""SELECT 1
+                FROM triage_events
+                WHERE id > ? AND {predicate}
+                LIMIT 1""",
+            (backup_sequence, canonical_cutoff),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if deadline is not None and clock() >= deadline:
+            raise RetentionDeadlineExceeded(
+                "backup authorization exceeded the maintenance deadline"
+            ) from exc
+        raise
+    finally:
+        if deadline is not None:
+            source_conn.set_progress_handler(None, 0)
+    if missing_eligible_row is not None:
+        raise ValueError(
+            "verified backup does not contain every row eligible for this prune"
+        )
     return payload
 
 
@@ -1131,6 +1497,7 @@ def prune_events(
     pause_ms: int = DEFAULT_PAUSE_MS,
     max_rows: int | None = None,
     max_runtime_seconds: float | None = None,
+    deadline: float | None = None,
     progress: Callable[[int, int], None] | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> PruneResult:
@@ -1153,21 +1520,25 @@ def prune_events(
     deleted_rows = 0
     batches = 0
     started_at = clock()
-    deadline = (
+    runtime_deadline = (
         started_at + max_runtime_seconds
         if max_runtime_seconds is not None
         else None
     )
+    effective_deadline = deadline
+    if runtime_deadline is not None:
+        effective_deadline = (
+            min(effective_deadline, runtime_deadline)
+            if effective_deadline is not None
+            else runtime_deadline
+        )
     stopped_reason = "exhausted"
 
     while True:
         if max_rows is not None and deleted_rows >= max_rows:
             stopped_reason = "max_rows"
             break
-        if (
-            max_runtime_seconds is not None
-            and clock() - started_at >= max_runtime_seconds
-        ):
+        if effective_deadline is not None and clock() >= effective_deadline:
             stopped_reason = "max_runtime"
             break
 
@@ -1176,9 +1547,9 @@ def prune_events(
             current_batch = min(current_batch, max_rows - deleted_rows)
 
         interrupted_for_deadline = False
-        if deadline is not None:
+        if effective_deadline is not None:
             conn.set_progress_handler(
-                lambda: 1 if clock() >= deadline else 0,
+                lambda: 1 if clock() >= effective_deadline else 0,
                 1_000,
             )
         try:
@@ -1198,7 +1569,10 @@ def prune_events(
             conn.commit()
         except sqlite3.OperationalError:
             conn.rollback()
-            if deadline is not None and clock() >= deadline:
+            if (
+                effective_deadline is not None
+                and clock() >= effective_deadline
+            ):
                 interrupted_for_deadline = True
             else:
                 raise
@@ -1206,7 +1580,7 @@ def prune_events(
             conn.rollback()
             raise
         finally:
-            if deadline is not None:
+            if effective_deadline is not None:
                 conn.set_progress_handler(None, 0)
 
         if interrupted_for_deadline:
@@ -1225,26 +1599,46 @@ def prune_events(
         if pause_ms:
             time.sleep(pause_ms / 1_000.0)
 
-    if stopped_reason != "exhausted":
-        remaining = conn.execute(
-            f"""SELECT 1
-                FROM triage_events
-                WHERE {predicate}
-                LIMIT 1""",
-            (canonical_cutoff,),
-        ).fetchone()
-        if remaining is None:
-            stopped_reason = "exhausted"
+    if stopped_reason != "exhausted" and not (
+        effective_deadline is not None and clock() >= effective_deadline
+    ):
+        if effective_deadline is not None:
+            conn.set_progress_handler(
+                lambda: 1 if clock() >= effective_deadline else 0,
+                1_000,
+            )
+        try:
+            remaining = conn.execute(
+                f"""SELECT 1
+                    FROM triage_events
+                    WHERE {predicate}
+                    LIMIT 1""",
+                (canonical_cutoff,),
+            ).fetchone()
+            if remaining is None:
+                stopped_reason = "exhausted"
+        except sqlite3.OperationalError:
+            if not (
+                effective_deadline is not None
+                and clock() >= effective_deadline
+            ):
+                raise
+        finally:
+            if effective_deadline is not None:
+                conn.set_progress_handler(None, 0)
 
     deleted_asset_snapshots = 0
     orphan_cleanup_deferred = stopped_reason != "exhausted"
     if stopped_reason == "exhausted":
-        if deadline is not None and clock() >= deadline:
+        if (
+            effective_deadline is not None
+            and clock() >= effective_deadline
+        ):
             orphan_cleanup_deferred = True
         else:
-            if deadline is not None:
+            if effective_deadline is not None:
                 conn.set_progress_handler(
-                    lambda: 1 if clock() >= deadline else 0,
+                    lambda: 1 if clock() >= effective_deadline else 0,
                     1_000,
                 )
             try:
@@ -1264,7 +1658,10 @@ def prune_events(
                 orphan_cleanup_deferred = False
             except sqlite3.OperationalError:
                 conn.rollback()
-                if deadline is not None and clock() >= deadline:
+                if (
+                    effective_deadline is not None
+                    and clock() >= effective_deadline
+                ):
                     orphan_cleanup_deferred = True
                 else:
                     raise
@@ -1272,10 +1669,31 @@ def prune_events(
                 conn.rollback()
                 raise
             finally:
-                if deadline is not None:
+                if effective_deadline is not None:
                     conn.set_progress_handler(None, 0)
 
-    checkpoint = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    checkpoint = (0, 0, 0)
+    if not (
+        effective_deadline is not None and clock() >= effective_deadline
+    ):
+        if effective_deadline is not None:
+            conn.set_progress_handler(
+                lambda: 1 if clock() >= effective_deadline else 0,
+                1_000,
+            )
+        try:
+            checkpoint = conn.execute(
+                "PRAGMA wal_checkpoint(PASSIVE)"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            if not (
+                effective_deadline is not None
+                and clock() >= effective_deadline
+            ):
+                raise
+        finally:
+            if effective_deadline is not None:
+                conn.set_progress_handler(None, 0)
     return PruneResult(
         deleted_rows=deleted_rows,
         deleted_asset_snapshots=deleted_asset_snapshots,
@@ -1454,6 +1872,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Exclusive destination for the unverified backup copy.",
     )
     backup_copy.add_argument(
+        "--provenance",
+        type=Path,
+        help=(
+            "Exclusive provenance destination (default: "
+            "OUTPUT.provenance.json)."
+        ),
+    )
+    backup_copy.add_argument(
         "--confirm-writers-stopped",
         action="store_true",
         help=(
@@ -1471,6 +1897,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_database_argument(verify)
     verify.add_argument("--backup", type=Path, required=True)
     verify.add_argument("--manifest", type=Path, required=True)
+    verify.add_argument(
+        "--provenance",
+        type=Path,
+        help=(
+            "Backup provenance created by the backup command (default: "
+            "BACKUP.provenance.json)."
+        ),
+    )
     _add_backup_limit_arguments(verify, include_copy=False)
     verify.add_argument("--json", action="store_true")
 
@@ -1511,8 +1945,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "max-runtime-seconds", 1, MAX_PRUNE_SECONDS
         ),
         help=(
-            "Stop at a batch boundary after this many seconds. "
-            "Orphan cleanup is deferred until eligible rows are exhausted."
+            "Bound the full applied prune command, including planning and "
+            "reporting. Orphan cleanup is deferred when time expires."
         ),
     )
     prune.add_argument(
@@ -1588,6 +2022,31 @@ def _database_status(
     }
 
 
+def _storage_metrics_before_deadline(
+    conn: sqlite3.Connection,
+    db_path: Path,
+    *,
+    deadline: float | None,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, int | float | str] | None:
+    if deadline is not None and clock() >= deadline:
+        return None
+    if deadline is not None:
+        conn.set_progress_handler(
+            lambda: 1 if clock() >= deadline else 0,
+            1_000,
+        )
+    try:
+        return get_storage_metrics(conn, db_path)
+    except sqlite3.OperationalError:
+        if deadline is not None and clock() >= deadline:
+            return None
+        raise
+    finally:
+        if deadline is not None:
+            conn.set_progress_handler(None, 0)
+
+
 def _print_human(value: object, *, indent: int = 0) -> None:
     prefix = " " * indent
     if isinstance(value, dict):
@@ -1633,6 +2092,16 @@ def main(argv: list[str] | None = None) -> int:
             "stopped."
         )
     if (
+        args.command == "prune"
+        and args.apply
+        and args.backup
+        and args.max_runtime_seconds is not None
+    ):
+        parser.error(
+            "--max-runtime-seconds cannot bound an inline backup; use the "
+            "split backup, verify-backup, and verified-manifest workflow"
+        )
+    if (
         args.command == "backup"
         and not args.confirm_writers_stopped
     ):
@@ -1641,6 +2110,16 @@ def main(argv: list[str] | None = None) -> int:
             "Suricata ingest, and optional wazuh-ingest first. This flag is "
             "an operator acknowledgement, not proof that all writers are "
             "stopped."
+        )
+
+    maintenance_deadline = None
+    if (
+        args.command == "prune"
+        and args.apply
+        and args.max_runtime_seconds is not None
+    ):
+        maintenance_deadline = (
+            time.monotonic() + args.max_runtime_seconds
         )
 
     readonly = args.command in {"status", "backup", "verify-backup"} or (
@@ -1658,13 +2137,21 @@ def main(argv: list[str] | None = None) -> int:
             output = create_backup_copy(
                 conn,
                 args.output,
+                source_path=args.db,
+                provenance_path=args.provenance,
                 limits=_backup_limits_from_args(args),
+            )
+            provenance = (
+                args.provenance
+                if args.provenance is not None
+                else _backup_provenance_path(args.output)
             )
             _print_payload(
                 {
                     "mode": "backup",
                     "database": str(args.db),
                     "backup": str(output),
+                    "provenance": str(provenance),
                     "verified": False,
                 },
                 args.json,
@@ -1676,6 +2163,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.manifest,
                 source_conn=conn,
                 source_path=args.db,
+                provenance_path=args.provenance,
                 limits=_backup_limits_from_args(args),
             )
             _print_payload(
@@ -1696,6 +2184,8 @@ def main(argv: list[str] | None = None) -> int:
                 conn,
                 cutoff,
                 include_reviewed=args.include_reviewed,
+                deadline=maintenance_deadline,
+                clock=time.monotonic,
             )
         except (TypeError, ValueError) as exc:
             parser.error(str(exc))
@@ -1704,8 +2194,17 @@ def main(argv: list[str] | None = None) -> int:
             "mode": "apply" if args.apply else "dry_run",
             "database": str(args.db),
             "plan": asdict(plan),
-            "storage_before": get_storage_metrics(conn, args.db),
+            "storage_before": _storage_metrics_before_deadline(
+                conn,
+                args.db,
+                deadline=maintenance_deadline,
+                clock=time.monotonic,
+            ),
         }
+        if args.apply and payload["storage_before"] is None:
+            raise RetentionDeadlineExceeded(
+                "retention preflight consumed the maintenance deadline"
+            )
         if not args.apply:
             _print_payload(payload, args.json)
             return 0
@@ -1723,9 +2222,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.verified_backup_manifest,
                 source_conn=conn,
                 source_path=args.db,
+                cutoff=cutoff,
+                include_reviewed=args.include_reviewed,
                 max_age_seconds=float(
                     args.verified_backup_max_age_seconds
                 ),
+                deadline=maintenance_deadline,
+                clock=time.monotonic,
             )
             payload["verified_backup"] = verification["backup"]
             payload["verification_manifest"] = str(
@@ -1746,15 +2249,22 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             pause_ms=args.pause_ms,
             max_rows=args.max_rows,
-            max_runtime_seconds=args.max_runtime_seconds,
+            deadline=maintenance_deadline,
             progress=report_progress,
+            clock=time.monotonic,
         )
         payload["result"] = asdict(result)
-        payload["storage_after"] = get_storage_metrics(conn, args.db)
+        payload["storage_after"] = _storage_metrics_before_deadline(
+            conn,
+            args.db,
+            deadline=maintenance_deadline,
+            clock=time.monotonic,
+        )
         _print_payload(payload, args.json)
         return 0
     except (
         BackupLimitExceeded,
+        RetentionDeadlineExceeded,
         FileExistsError,
         FileNotFoundError,
         OSError,

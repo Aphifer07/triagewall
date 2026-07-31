@@ -259,6 +259,77 @@ class RetentionTests(unittest.TestCase):
             1,
         )
 
+    def test_applied_cli_deadline_includes_planning_time(self):
+        self.conn.close()
+        clock = FakeClock(100)
+        observed: dict[str, float | None] = {}
+        plan = retention.RetentionPlan(
+            cutoff=format_utc_timestamp(self.now - timedelta(days=30)),
+            include_reviewed=False,
+            eligible_rows=1,
+            reviewed_rows_below_cutoff=0,
+            lifetime_rows_inserted=1,
+            oldest_processed_at=None,
+            newest_processed_at=None,
+        )
+
+        def build_plan(*_args, deadline=None, **_kwargs):
+            observed["plan_deadline"] = deadline
+            clock.advance(4)
+            return plan
+
+        def prune(*_args, deadline=None, **_kwargs):
+            observed["prune_deadline"] = deadline
+            return retention.PruneResult(
+                deleted_rows=1,
+                deleted_asset_snapshots=0,
+                orphan_cleanup_deferred=True,
+                batches=1,
+                checkpoint_busy_frames=0,
+                checkpoint_log_frames=0,
+                checkpointed_frames=0,
+                stopped_reason="max_runtime",
+            )
+
+        with (
+            mock.patch.object(retention.time, "monotonic", side_effect=clock),
+            mock.patch.object(retention, "build_retention_plan", build_plan),
+            mock.patch.object(retention, "prune_events", prune),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = retention.main(
+                [
+                    "prune",
+                    "--db",
+                    str(self.db_path),
+                    "--keep-days",
+                    "30",
+                    "--apply",
+                    "--confirm-writers-stopped",
+                    "--no-backup",
+                    "--max-runtime-seconds",
+                    "10",
+                    "--json",
+                ]
+            )
+
+        self.conn = connect_database(self.db_path)
+        self.assertEqual(result, 0)
+        self.assertEqual(observed["plan_deadline"], 110)
+        self.assertEqual(observed["prune_deadline"], 110)
+
+    def test_plan_rejects_an_already_expired_deadline(self):
+        with self.assertRaisesRegex(
+            retention.RetentionDeadlineExceeded,
+            "planning exceeded",
+        ):
+            build_retention_plan(
+                self.conn,
+                format_utc_timestamp(self.now - timedelta(days=30)),
+                deadline=1,
+                clock=lambda: 1,
+            )
+
     def test_bounded_exhausted_prune_cleans_orphans_within_deadline(self):
         self.insert_snapshot(1)
         self.insert_event(
@@ -345,6 +416,7 @@ class RetentionTests(unittest.TestCase):
         manifest_path = Path(self.temp_dir.name) / "split.manifest.json"
 
         created = create_backup_copy(self.conn, backup_path)
+        provenance_path = Path(f"{backup_path}.provenance.json")
         payload = verify_backup(
             created,
             manifest_path,
@@ -355,11 +427,17 @@ class RetentionTests(unittest.TestCase):
             manifest_path,
             source_conn=self.conn,
             source_path=self.db_path,
+            cutoff=format_utc_timestamp(self.now - timedelta(days=30)),
         )
 
         self.assertEqual(payload, validated)
         self.assertEqual(payload["version"], 1)
         self.assertEqual(payload["integrity_check"], "ok")
+        self.assertTrue(provenance_path.is_file())
+        self.assertEqual(
+            payload["backup_provenance"]["path"],
+            str(provenance_path.resolve()),
+        )
         self.assertEqual(payload["backup"]["path"], str(backup_path.resolve()))
         self.assertRegex(
             payload["backup"]["sha256"],
@@ -382,6 +460,57 @@ class RetentionTests(unittest.TestCase):
                 stat.S_IMODE(manifest_path.stat().st_mode),
                 BACKUP_FILE_MODE,
             )
+            self.assertEqual(
+                stat.S_IMODE(provenance_path.stat().st_mode),
+                BACKUP_FILE_MODE,
+            )
+
+    def test_manifest_rejects_eligible_rows_inserted_after_backup(self):
+        self.insert_event(age_days=60, signature_id=330)
+        backup_path = Path(self.temp_dir.name) / "stale.db"
+        manifest_path = Path(self.temp_dir.name) / "stale.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        self.insert_event(age_days=60, signature_id=331)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "does not contain every row eligible",
+        ):
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+                cutoff=format_utc_timestamp(
+                    self.now - timedelta(days=30)
+                ),
+            )
+
+    def test_verify_rejects_backup_provenance_from_another_database(self):
+        other_path = Path(self.temp_dir.name) / "other.db"
+        other_conn = connect_database(other_path)
+        other_conn.executescript(
+            (PROJECT_ROOT / "triagewall" / "schema.sql").read_text()
+        )
+        backup_path = Path(self.temp_dir.name) / "unrelated.db"
+        manifest_path = Path(self.temp_dir.name) / "unrelated.manifest.json"
+        try:
+            create_backup_copy(other_conn, backup_path)
+        finally:
+            other_conn.close()
+
+        with self.assertRaisesRegex(ValueError, "different source database"):
+            verify_backup(
+                backup_path,
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+            )
 
     def test_manifest_rejects_backup_mutation_and_manifest_tampering(self):
         self.insert_event(age_days=60, signature_id=34)
@@ -402,6 +531,9 @@ class RetentionTests(unittest.TestCase):
                 manifest_path,
                 source_conn=self.conn,
                 source_path=self.db_path,
+                cutoff=format_utc_timestamp(
+                    self.now - timedelta(days=30)
+                ),
             )
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -412,6 +544,9 @@ class RetentionTests(unittest.TestCase):
                 manifest_path,
                 source_conn=self.conn,
                 source_path=self.db_path,
+                cutoff=format_utc_timestamp(
+                    self.now - timedelta(days=30)
+                ),
             )
 
     def test_manifest_freshness_is_enforced(self):
@@ -436,6 +571,9 @@ class RetentionTests(unittest.TestCase):
                     manifest_path,
                     source_conn=self.conn,
                     source_path=self.db_path,
+                    cutoff=format_utc_timestamp(
+                        self.now - timedelta(days=30)
+                    ),
                 )
 
     def test_split_cli_flow_prunes_from_verified_manifest(self):

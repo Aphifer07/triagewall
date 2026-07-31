@@ -8,7 +8,7 @@ Usage:
 
 Options:
   --keep-days DAYS             Retain this many days (default: 60)
-  --max-runtime-seconds SEC    Maximum deletion time per pause (default: 900)
+  --max-runtime-seconds SEC    Maximum full prune pause (default: 900)
   --cooldown-seconds SEC       Live catch-up time between pauses (default: 1800)
   --max-cycles COUNT           Maximum deletion pauses (default: 12)
   --wazuh                      Include docker-compose.wazuh.yml and wazuh-ingest
@@ -186,13 +186,16 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 cutoff="$(date -u -d "$keep_days days ago" +%Y-%m-%dT%H:%M:%S.000000Z)"
 backup_name="triage-before-retention-${stamp}.db"
 manifest_name="${backup_name}.manifest.json"
+provenance_name="${backup_name}.provenance.json"
 backup_host_path="$backup_dir/$backup_name"
 manifest_host_path="$backup_dir/$manifest_name"
+provenance_host_path="$backup_dir/$provenance_name"
 backup_container_path="/var/backups/triagewall/$backup_name"
 manifest_container_path="/var/backups/triagewall/$manifest_name"
 
-if [[ -e "$backup_host_path" || -e "$manifest_host_path" ]]; then
-  echo "retention cycle: generated backup or manifest name already exists" >&2
+if [[ -e "$backup_host_path" || -e "$manifest_host_path" \
+  || -e "$provenance_host_path" ]]; then
+  echo "retention cycle: generated backup, provenance, or manifest name already exists" >&2
   exit 1
 fi
 
@@ -274,3 +277,4 @@ if ((cycle > max_cycles)); then
 fi
 
 echo "retention cycle: completed; verified backup retained at $backup_host_path"
+echo "retention cycle: backup provenance retained at $provenance_host_path"

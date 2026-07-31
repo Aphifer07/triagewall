@@ -190,10 +190,10 @@ docker compose --profile maintenance run --rm maintenance \
 - acquires a host lock so two cycles cannot overlap;
 - captures one fixed UTC cutoff for safe resume;
 - stops dashboard, Suricata ingest, and optional Wazuh ingest;
-- creates a bounded, exclusive mode-0600 backup copy;
+- creates a bounded, exclusive mode-0600 backup copy and provenance record;
 - restores and health-checks monitoring before verifying that backup;
 - writes a mode-0600 manifest bound to the backup and source database;
-- applies deletion at batch boundaries for at most 15 minutes per pause;
+- bounds planning, authorization, deletion, and reporting to 15 minutes per pause;
 - restores and health-checks services after every pause and on failure;
 - waits 30 minutes with monitoring live before another pause if needed; and
 - retains the backup, manifest, and JSON results for operator review.
@@ -233,7 +233,8 @@ only this host-side script controls Compose.
 The CLI also exposes the three phases independently:
 
 1. With writers stopped, use `maintenance backup --output PATH
-   --confirm-writers-stopped`.
+   --confirm-writers-stopped`. This also creates
+   `PATH.provenance.json`; retain both files.
 2. Restart writers, then use `maintenance verify-backup --backup PATH
    --manifest PATH`.
 3. Stop writers again and use `maintenance prune --apply
@@ -241,15 +242,18 @@ The CLI also exposes the three phases independently:
    --max-runtime-seconds 900`.
 
 Applied prune still requires an explicit writer-stopped acknowledgement. The
-manifest is fresh for 24 hours by default. Verification records the backup's
-SHA-256 and integrity result. Prune validates the manifest's canonical hash,
-exact file identities, source database identity, and SQLite sequence
-relationship instead of rereading the entire backup while monitoring is
-stopped.
+backup and manifest are fresh for 24 hours by default. Verification records
+the backup's SHA-256 and integrity result. Prune validates the manifest's
+canonical hash, creation-time provenance, exact file identities, source
+database identity, and SQLite sequence relationship. It also refuses to
+delete eligible rows inserted after the backup was created. These checks avoid
+rereading the entire backup while monitoring is stopped.
 
 The original one-command `prune --backup PATH` workflow remains available for
-small databases. Applying without a backup requires `--no-backup`; it is not
-used by the automated cycle.
+small databases, but it cannot be combined with `--max-runtime-seconds`; use
+the split workflow when a full-command maintenance deadline is required.
+Applying without a backup requires `--no-backup`; it is not used by the
+automated cycle.
 
 Human-reviewed verdicts remain protected unless `--include-reviewed` is
 supplied. Retain the verified backup. Do not run `VACUUM` as part of this
@@ -259,11 +263,12 @@ and should only be planned as a separate maintenance operation with all writers
 stopped and adequate free space verified.
 
 Applied pruning uses short indexed transactions, pauses between batches, and
-uses SQLite progress interruption to enforce the deletion deadline. It cleans
-source-context rows and attempts orphaned asset-snapshot cleanup within the same
-deadline. The JSON result reports when that cleanup was deferred. This control
-applies to verdict history; it does not reset SPC baselines or remove
-ingest-failure quarantine records.
+uses SQLite progress interruption to enforce one deadline across planning,
+backup authorization, deletion, cleanup, checkpointing, and storage reporting.
+The JSON result reports when orphan cleanup was deferred; storage-after metrics
+are `null` when the deadline is already exhausted. This control applies to
+verdict history; it does not reset SPC baselines or remove ingest-failure
+quarantine records.
 
 ### Recommended models by VRAM
 
