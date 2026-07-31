@@ -31,9 +31,11 @@ class RetentionCycleTests(unittest.TestCase):
         self.fake_bin = self.root / "bin"
         self.fake_bin.mkdir()
         self.docker_log = self.root / "docker.log"
+        self.curl_log = self.root / "curl.log"
         self._write_executable(
             "curl",
             """#!/bin/sh
+printf '%s\n' "$*" >>"$FAKE_CURL_LOG"
 status="${FAKE_HEALTH_STATUS:-200}"
 case "$status" in
   200) health=ok ;;
@@ -99,6 +101,7 @@ esac
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
         env["FAKE_DOCKER_LOG"] = str(self.docker_log)
+        env["FAKE_CURL_LOG"] = str(self.curl_log)
         env["FAKE_PRUNE_STATE"] = str(self.root / "prune.state")
         env["FAKE_HEALTH_STATUS"] = str(health_status)
         env["TRIAGEWALL_RETENTION_LOCK"] = str(self.root / "cycle.lock")
@@ -192,6 +195,16 @@ esac
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("dashboard health check failed", completed.stderr)
+
+    def test_dashboard_health_requests_have_connection_and_transfer_limits(self):
+        completed = self._run()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.curl_log.read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(calls), 2)
+        for call in calls:
+            self.assertIn("--connect-timeout 3", call)
+            self.assertIn("--max-time 5", call)
 
 
 if __name__ == "__main__":

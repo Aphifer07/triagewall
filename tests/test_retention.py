@@ -520,6 +520,47 @@ class RetentionTests(unittest.TestCase):
                 ),
             )
 
+    def test_manifest_rejects_review_feedback_added_after_backup(self):
+        event_id = self.insert_event(age_days=60, signature_id=332)
+        backup_path = Path(self.temp_dir.name) / "feedback.db"
+        manifest_path = Path(self.temp_dir.name) / "feedback.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        provenance = json.loads(
+            Path(f"{backup_path}.provenance.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.conn.execute(
+            """UPDATE triage_events
+               SET human_verdict = 'real', human_notes = 'reviewed later',
+                   agreed = 0, reviewed_at = ?
+               WHERE id = ?""",
+            (provenance["created_at"], event_id),
+        )
+        self.conn.commit()
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+
+        validate_backup_manifest(
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+            cutoff=cutoff,
+        )
+        with self.assertRaisesRegex(ValueError, "latest feedback"):
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+                cutoff=cutoff,
+                include_reviewed=True,
+            )
+
     def test_verify_rejects_backup_provenance_from_another_database(self):
         other_path = Path(self.temp_dir.name) / "other.db"
         other_conn = connect_database(other_path)

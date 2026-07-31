@@ -26,6 +26,8 @@ cooldown_seconds=1800
 max_cycles=12
 with_wazuh=false
 health_url="http://127.0.0.1:8084/api/health"
+health_connect_timeout_seconds=3
+health_request_timeout_seconds=5
 backup_dir=""
 
 while (($#)); do
@@ -167,7 +169,10 @@ dashboard_reachable() {
   local dashboard_health_body
   local dashboard_health_response
   dashboard_health_response="$(
-    curl -sS -w $'\n%{http_code}' \
+    curl -sS \
+      --connect-timeout "$health_connect_timeout_seconds" \
+      --max-time "$health_request_timeout_seconds" \
+      -w $'\n%{http_code}' \
       -H "Host: localhost" "$health_url"
   )" || return 1
   dashboard_health_status="${dashboard_health_response##*$'\n'}"

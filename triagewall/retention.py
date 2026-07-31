@@ -1472,6 +1472,22 @@ def validate_backup_manifest(
                 LIMIT 1""",
             (backup_sequence, canonical_cutoff),
         ).fetchone()
+        post_backup_feedback = None
+        if include_reviewed:
+            post_backup_feedback = source_conn.execute(
+                f"""SELECT 1
+                    FROM triage_events
+                    WHERE id <= ? AND {predicate}
+                      AND human_verdict IS NOT NULL
+                      AND reviewed_at IS NOT NULL
+                      AND reviewed_at >= ?
+                    LIMIT 1""",
+                (
+                    backup_sequence,
+                    canonical_cutoff,
+                    format_utc_timestamp(created_at),
+                ),
+            ).fetchone()
     except sqlite3.OperationalError as exc:
         if deadline is not None and clock() >= deadline:
             raise RetentionDeadlineExceeded(
@@ -1484,6 +1500,11 @@ def validate_backup_manifest(
     if missing_eligible_row is not None:
         raise ValueError(
             "verified backup does not contain every row eligible for this prune"
+        )
+    if post_backup_feedback is not None:
+        raise ValueError(
+            "verified backup does not contain the latest feedback on every "
+            "reviewed row eligible for this prune"
         )
     return payload
 

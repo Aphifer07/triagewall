@@ -203,7 +203,8 @@ Recovery requires every selected Compose service to be running and the
 dashboard health endpoint to be reachable. HTTP 503 with Triagewall's normal
 `stale` status is accepted because a quiet sensor may legitimately have no
 recent verdict after a long pause; connection failures and other status codes
-still fail the cycle.
+still fail the cycle. Each request has separate connection and total-transfer
+timeouts so a stalled endpoint cannot block the unattended recovery loop.
 
 Run it as an SSH-independent transient systemd service. The backup directory
 must already exist on the intended backup filesystem, be owned by the account
@@ -253,8 +254,10 @@ backup and manifest are fresh for 24 hours by default. Verification records
 the backup's SHA-256 and integrity result. Prune validates the manifest's
 canonical hash, creation-time provenance, exact file identities, source
 database identity, and SQLite sequence relationship. It also refuses to
-delete eligible rows inserted after the backup was created. These checks avoid
-rereading the entire backup while monitoring is stopped.
+delete eligible rows inserted after the backup was created. When
+`--include-reviewed` is selected, authorization also rejects eligible feedback
+written after backup creation. These checks avoid rereading the entire backup
+while monitoring is stopped.
 
 The original one-command `prune --backup PATH` workflow remains available for
 small databases, but it cannot be combined with `--max-runtime-seconds`; use
