@@ -32,6 +32,7 @@ class RetentionCycleTests(unittest.TestCase):
         self.fake_bin.mkdir()
         self.docker_log = self.root / "docker.log"
         self.curl_log = self.root / "curl.log"
+        self.timeout_log = self.root / "timeout.log"
         self._write_executable(
             "curl",
             """#!/bin/sh
@@ -54,10 +55,32 @@ exit 0
 """,
         )
         self._write_executable(
+            "timeout",
+            """#!/bin/sh
+printf '%s\n' "$*" >>"$FAKE_TIMEOUT_LOG"
+while [ "${1#--}" != "$1" ]; do
+  shift
+done
+shift
+exec "$@"
+""",
+        )
+        self._write_executable(
             "docker",
             """#!/bin/sh
 printf '%s\n' "$*" >>"$FAKE_DOCKER_LOG"
 case " $* " in
+  *" start "*)
+    attempts=0
+    if [ -f "$FAKE_START_STATE" ]; then
+      attempts="$(cat "$FAKE_START_STATE")"
+    fi
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" >"$FAKE_START_STATE"
+    if [ "$attempts" -le "${FAKE_START_FAILURES:-0}" ]; then
+      exit 43
+    fi
+    ;;
   *" ps --status running --services "*)
     printf '%s\n' dashboard ingest
     ;;
@@ -98,12 +121,16 @@ esac
         defer_cleanup: bool = False,
         health_status: int = 200,
         max_cycles: int = 1,
+        start_failures: int = 0,
     ) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
         env["FAKE_DOCKER_LOG"] = str(self.docker_log)
         env["FAKE_CURL_LOG"] = str(self.curl_log)
+        env["FAKE_TIMEOUT_LOG"] = str(self.timeout_log)
         env["FAKE_PRUNE_STATE"] = str(self.root / "prune.state")
+        env["FAKE_START_STATE"] = str(self.root / "start.state")
+        env["FAKE_START_FAILURES"] = str(start_failures)
         env["FAKE_HEALTH_STATUS"] = str(health_status)
         env["TRIAGEWALL_RETENTION_LOCK"] = str(self.root / "cycle.lock")
         if fail_phase:
@@ -173,6 +200,34 @@ esac
         self.assertTrue(any(" start " in f" {call} " for call in calls))
         self.assertIn("restoring monitoring services", completed.stderr)
 
+    def test_failure_trap_retries_transient_writer_startup_failures(self):
+        completed = self._run(fail_phase="backup", start_failures=2)
+
+        self.assertEqual(completed.returncode, 42)
+        calls = self.docker_log.read_text(encoding="utf-8").splitlines()
+        start_calls = [
+            call for call in calls if " start " in f" {call} "
+        ]
+        self.assertEqual(len(start_calls), 3)
+        self.assertIn(
+            "monitoring services and dashboard are healthy",
+            completed.stdout,
+        )
+
+    def test_failure_trap_surfaces_unrecoverable_writer_startup(self):
+        completed = self._run(fail_phase="backup", start_failures=99)
+
+        self.assertEqual(completed.returncode, 75)
+        calls = self.docker_log.read_text(encoding="utf-8").splitlines()
+        start_calls = [
+            call for call in calls if " start " in f" {call} "
+        ]
+        self.assertEqual(len(start_calls), 18)
+        self.assertIn(
+            "CRITICAL: monitoring services could not be restored",
+            completed.stderr,
+        )
+
     def test_cycle_continues_until_deferred_orphan_cleanup_completes(self):
         completed = self._run(defer_cleanup=True, max_cycles=2)
 
@@ -206,6 +261,25 @@ esac
         for call in calls:
             self.assertIn("--connect-timeout 3", call)
             self.assertIn("--max-time 5", call)
+
+    def test_compose_recovery_commands_have_host_side_limits(self):
+        completed = self._run()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.timeout_log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(
+            any("75s docker compose" in call and " stop " in call for call in calls)
+        )
+        self.assertTrue(
+            any("30s docker compose" in call and " start " in call for call in calls)
+        )
+        self.assertTrue(
+            any(
+                "10s docker compose" in call
+                and " ps --status running --services" in call
+                for call in calls
+            )
+        )
 
 
 if __name__ == "__main__":

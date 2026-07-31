@@ -67,6 +67,22 @@ class DatabaseConnectionTests(unittest.TestCase):
             finally:
                 reader.close()
 
+    def test_connection_accepts_a_shorter_busy_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "triage.db"
+
+            conn = connect_database(db_path, busy_timeout_ms=250)
+            try:
+                self.assertEqual(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0],
+                    250,
+                )
+            finally:
+                conn.close()
+
+        with self.assertRaises(ValueError):
+            connect_database(":memory:", busy_timeout_ms=-1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

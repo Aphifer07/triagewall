@@ -288,6 +288,36 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(result.deleted_rows, 1)
         self.assertEqual(result.stopped_reason, "max_runtime")
 
+    def test_sqlite_lock_wait_is_capped_at_remaining_deadline(self):
+        self.insert_event(age_days=60, signature_id=302)
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        original_busy_timeout = int(
+            self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        )
+        blocker = connect_database(self.db_path)
+        blocker.execute("BEGIN IMMEDIATE")
+        started_at = time.monotonic()
+        try:
+            result = prune_events(
+                self.conn,
+                cutoff,
+                batch_size=1,
+                pause_ms=0,
+                max_runtime_seconds=0.2,
+            )
+        finally:
+            blocker.rollback()
+            blocker.close()
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result.deleted_rows, 0)
+        self.assertEqual(result.stopped_reason, "max_runtime")
+        self.assertEqual(
+            self.conn.execute("PRAGMA busy_timeout").fetchone()[0],
+            original_busy_timeout,
+        )
+
     def test_applied_cli_deadline_includes_planning_time(self):
         self.conn.close()
         clock = FakeClock(100)

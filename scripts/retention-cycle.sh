@@ -28,6 +28,9 @@ with_wazuh=false
 health_url="http://127.0.0.1:8084/api/health"
 health_connect_timeout_seconds=3
 health_request_timeout_seconds=5
+writer_start_timeout_seconds=30
+writer_status_timeout_seconds=10
+writer_stop_timeout_seconds=75
 backup_dir=""
 
 while (($#)); do
@@ -92,7 +95,7 @@ if [[ ! -f docker-compose.yml ]]; then
   echo "retention cycle: run from the Triagewall repository root" >&2
   exit 2
 fi
-for required_command in curl date docker flock id python3 realpath stat; do
+for required_command in curl date docker flock id python3 realpath stat timeout; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
     echo "retention cycle: $required_command is required" >&2
     exit 2
@@ -132,32 +135,26 @@ fi
 
 compose_with_profiles=("${compose[@]}" "${profiles[@]}")
 writers_stopped=false
-
-start_writers() {
-  "${compose_with_profiles[@]}" start "${writers[@]}"
-  writers_stopped=false
-}
-
-recover_writers() {
-  status=$?
-  trap - EXIT INT TERM HUP
-  if "$writers_stopped"; then
-    echo "retention cycle: restoring monitoring services after exit" >&2
-    "${compose_with_profiles[@]}" start "${writers[@]}" || true
-  fi
-  exit "$status"
-}
-trap recover_writers EXIT INT TERM HUP
+writer_recovery_attempted=false
+writer_recovery_attempts=18
+writer_recovery_delay_seconds=10
 
 stop_writers() {
   writers_stopped=true
-  "${compose_with_profiles[@]}" stop -t 60 "${writers[@]}"
+  writer_recovery_attempted=false
+  timeout --signal=TERM --kill-after=5s \
+    "${writer_stop_timeout_seconds}s" \
+    "${compose_with_profiles[@]}" stop -t 60 "${writers[@]}"
 }
 
 all_writers_running() {
   local running_services
   local writer
-  running_services="$("${compose_with_profiles[@]}" ps --status running --services)"
+  running_services="$(
+    timeout --signal=TERM --kill-after=5s \
+      "${writer_status_timeout_seconds}s" \
+      "${compose_with_profiles[@]}" ps --status running --services
+  )"
   for writer in "${writers[@]}"; do
     if ! grep -Fxq "$writer" <<<"$running_services"; then
       return 1
@@ -193,10 +190,16 @@ if (
 PY
 }
 
-wait_for_recovery() {
+restore_writers() {
   local attempt
-  for attempt in {1..18}; do
-    if all_writers_running && dashboard_reachable; then
+  writer_recovery_attempted=true
+  for ((attempt=1; attempt<=writer_recovery_attempts; attempt++)); do
+    if timeout --signal=TERM --kill-after=5s \
+      "${writer_start_timeout_seconds}s" \
+      "${compose_with_profiles[@]}" start "${writers[@]}" \
+      && all_writers_running \
+      && dashboard_reachable; then
+      writers_stopped=false
       if [[ "$dashboard_health_status" == "503" ]]; then
         echo "retention cycle: services recovered; dashboard reports a stale alert stream"
       else
@@ -204,11 +207,34 @@ wait_for_recovery() {
       fi
       return 0
     fi
-    sleep 10
+    if ((attempt < writer_recovery_attempts)); then
+      sleep "$writer_recovery_delay_seconds"
+    fi
   done
-  echo "retention cycle: dashboard health check failed: $health_url" >&2
+  echo \
+    "retention cycle: monitoring recovery failed after $writer_recovery_attempts attempts" \
+    >&2
   return 1
 }
+
+recover_writers_on_exit() {
+  local original_status=$?
+  trap - EXIT INT TERM HUP
+  if "$writers_stopped"; then
+    echo "retention cycle: restoring monitoring services after exit" >&2
+    if ! "$writer_recovery_attempted"; then
+      restore_writers || true
+    fi
+    if "$writers_stopped"; then
+      echo \
+        "retention cycle: CRITICAL: monitoring services could not be restored; original exit status was $original_status" \
+        >&2
+      exit 75
+    fi
+  fi
+  exit "$original_status"
+}
+trap recover_writers_on_exit EXIT INT TERM HUP
 
 if ! all_writers_running; then
   echo "retention cycle: all selected writers must be running before start" >&2
@@ -242,8 +268,7 @@ stop_writers
   --json
 
 echo "retention cycle: backup copy complete; restoring monitoring"
-start_writers
-wait_for_recovery
+restore_writers
 
 echo "retention cycle: verifying immutable backup while monitoring is live"
 "${compose_with_profiles[@]}" run --rm --no-deps maintenance \
@@ -270,8 +295,7 @@ while ((cycle <= max_cycles)); do
     exit 1
   fi
 
-  start_writers
-  wait_for_recovery
+  restore_writers
 
   read -r eligible_rows deleted_rows stopped_reason orphan_cleanup_deferred < <(
     python3 - "$result_host_path" <<'PY'

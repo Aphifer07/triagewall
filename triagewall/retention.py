@@ -11,6 +11,7 @@ import errno
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -22,7 +23,7 @@ import threading
 import time
 
 try:
-    from .database import connect_database
+    from .database import SQLITE_BUSY_TIMEOUT_MS, connect_database
     from .storage import get_storage_metrics
     from .time_utils import (
         format_utc_timestamp,
@@ -30,7 +31,7 @@ try:
         utc_now,
     )
 except ImportError:  # Direct script-style execution inside the ingest image.
-    from database import connect_database
+    from database import SQLITE_BUSY_TIMEOUT_MS, connect_database
     from storage import get_storage_metrics
     from time_utils import (
         format_utc_timestamp,
@@ -111,6 +112,48 @@ class RetentionDeadlineExceeded(RuntimeError):
     """Raised when pre-prune work consumes the bounded maintenance window."""
 
 
+def _remaining_busy_timeout_ms(
+    deadline: float | None,
+    clock: Callable[[], float],
+) -> int | None:
+    if deadline is None:
+        return None
+    remaining_seconds = deadline - clock()
+    if remaining_seconds <= 0:
+        return 0
+    return min(
+        SQLITE_BUSY_TIMEOUT_MS,
+        max(1, math.ceil(remaining_seconds * 1_000)),
+    )
+
+
+def _set_bounded_sqlite_busy_timeout(
+    conn: sqlite3.Connection,
+    deadline: float | None,
+    clock: Callable[[], float],
+) -> int | None:
+    """Cap SQLite lock waits to the time left in a maintenance window."""
+    bounded_timeout_ms = _remaining_busy_timeout_ms(deadline, clock)
+    if bounded_timeout_ms is None:
+        return None
+
+    previous_timeout_ms = int(
+        conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    )
+    conn.execute(
+        f"PRAGMA busy_timeout={min(previous_timeout_ms, bounded_timeout_ms)}"
+    )
+    return previous_timeout_ms
+
+
+def _restore_sqlite_busy_timeout(
+    conn: sqlite3.Connection,
+    previous_timeout_ms: int | None,
+) -> None:
+    if previous_timeout_ms is not None:
+        conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+
+
 def _retention_predicate(include_reviewed: bool) -> str:
     predicate = "processed_at IS NOT NULL AND processed_at < ?"
     if not include_reviewed:
@@ -132,6 +175,11 @@ def build_retention_plan(
         raise RetentionDeadlineExceeded(
             "retention planning exceeded the maintenance deadline"
         )
+    previous_busy_timeout_ms = _set_bounded_sqlite_busy_timeout(
+        conn,
+        deadline,
+        clock,
+    )
     if deadline is not None:
         conn.set_progress_handler(
             lambda: 1 if clock() >= deadline else 0,
@@ -172,6 +220,7 @@ def build_retention_plan(
     finally:
         if deadline is not None:
             conn.set_progress_handler(None, 0)
+        _restore_sqlite_busy_timeout(conn, previous_busy_timeout_ms)
 
 
 def _lifetime_rows_inserted(conn: sqlite3.Connection) -> int:
@@ -1459,6 +1508,11 @@ def validate_backup_manifest(
     backup_sequence = provenance_source["lifetime_rows_inserted"]
     canonical_cutoff = format_utc_timestamp(cutoff)
     predicate = _retention_predicate(include_reviewed)
+    previous_busy_timeout_ms = _set_bounded_sqlite_busy_timeout(
+        source_conn,
+        deadline,
+        clock,
+    )
     if deadline is not None:
         source_conn.set_progress_handler(
             lambda: 1 if clock() >= deadline else 0,
@@ -1497,6 +1551,10 @@ def validate_backup_manifest(
     finally:
         if deadline is not None:
             source_conn.set_progress_handler(None, 0)
+        _restore_sqlite_busy_timeout(
+            source_conn,
+            previous_busy_timeout_ms,
+        )
     if missing_eligible_row is not None:
         raise ValueError(
             "verified backup does not contain every row eligible for this prune"
@@ -1569,6 +1627,11 @@ def prune_events(
             current_batch = min(current_batch, max_rows - deleted_rows)
 
         interrupted_for_deadline = False
+        previous_busy_timeout_ms = _set_bounded_sqlite_busy_timeout(
+            conn,
+            effective_deadline,
+            clock,
+        )
         if effective_deadline is not None:
             conn.set_progress_handler(
                 lambda: 1 if clock() >= effective_deadline else 0,
@@ -1604,6 +1667,7 @@ def prune_events(
         finally:
             if effective_deadline is not None:
                 conn.set_progress_handler(None, 0)
+            _restore_sqlite_busy_timeout(conn, previous_busy_timeout_ms)
 
         if interrupted_for_deadline:
             stopped_reason = "max_runtime"
@@ -1631,6 +1695,11 @@ def prune_events(
     if stopped_reason != "exhausted" and not (
         effective_deadline is not None and clock() >= effective_deadline
     ):
+        previous_busy_timeout_ms = _set_bounded_sqlite_busy_timeout(
+            conn,
+            effective_deadline,
+            clock,
+        )
         if effective_deadline is not None:
             conn.set_progress_handler(
                 lambda: 1 if clock() >= effective_deadline else 0,
@@ -1655,6 +1724,7 @@ def prune_events(
         finally:
             if effective_deadline is not None:
                 conn.set_progress_handler(None, 0)
+            _restore_sqlite_busy_timeout(conn, previous_busy_timeout_ms)
 
     deleted_asset_snapshots = 0
     orphan_cleanup_deferred = stopped_reason != "exhausted"
@@ -1665,6 +1735,11 @@ def prune_events(
         ):
             orphan_cleanup_deferred = True
         else:
+            previous_busy_timeout_ms = _set_bounded_sqlite_busy_timeout(
+                conn,
+                effective_deadline,
+                clock,
+            )
             if effective_deadline is not None:
                 conn.set_progress_handler(
                     lambda: 1 if clock() >= effective_deadline else 0,
@@ -1700,11 +1775,20 @@ def prune_events(
             finally:
                 if effective_deadline is not None:
                     conn.set_progress_handler(None, 0)
+                _restore_sqlite_busy_timeout(
+                    conn,
+                    previous_busy_timeout_ms,
+                )
 
     checkpoint = (0, 0, 0)
     if not (
         effective_deadline is not None and clock() >= effective_deadline
     ):
+        previous_busy_timeout_ms = _set_bounded_sqlite_busy_timeout(
+            conn,
+            effective_deadline,
+            clock,
+        )
         if effective_deadline is not None:
             conn.set_progress_handler(
                 lambda: 1 if clock() >= effective_deadline else 0,
@@ -1723,6 +1807,7 @@ def prune_events(
         finally:
             if effective_deadline is not None:
                 conn.set_progress_handler(None, 0)
+            _restore_sqlite_busy_timeout(conn, previous_busy_timeout_ms)
     return PruneResult(
         deleted_rows=deleted_rows,
         deleted_asset_snapshots=deleted_asset_snapshots,
@@ -2060,6 +2145,11 @@ def _storage_metrics_before_deadline(
 ) -> dict[str, int | float | str] | None:
     if deadline is not None and clock() >= deadline:
         return None
+    previous_busy_timeout_ms = _set_bounded_sqlite_busy_timeout(
+        conn,
+        deadline,
+        clock,
+    )
     if deadline is not None:
         conn.set_progress_handler(
             lambda: 1 if clock() >= deadline else 0,
@@ -2074,6 +2164,7 @@ def _storage_metrics_before_deadline(
     finally:
         if deadline is not None:
             conn.set_progress_handler(None, 0)
+        _restore_sqlite_busy_timeout(conn, previous_busy_timeout_ms)
 
 
 def _print_human(value: object, *, indent: int = 0) -> None:
@@ -2154,8 +2245,21 @@ def main(argv: list[str] | None = None) -> int:
     readonly = args.command in {"status", "backup", "verify-backup"} or (
         args.command == "prune" and not args.apply
     )
-    conn = connect_database(args.db, readonly=readonly)
+    conn: sqlite3.Connection | None = None
     try:
+        connect_busy_timeout_ms = _remaining_busy_timeout_ms(
+            maintenance_deadline,
+            time.monotonic,
+        )
+        if connect_busy_timeout_ms == 0:
+            raise RetentionDeadlineExceeded(
+                "database connection exceeded the maintenance deadline"
+            )
+        conn = connect_database(
+            args.db,
+            readonly=readonly,
+            busy_timeout_ms=connect_busy_timeout_ms,
+        )
         if args.command == "status":
             _print_payload(
                 _database_status(conn, args.db),
@@ -2303,7 +2407,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"retention failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == "__main__":

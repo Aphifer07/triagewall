@@ -205,6 +205,12 @@ dashboard health endpoint to be reachable. HTTP 503 with Triagewall's normal
 recent verdict after a long pause; connection failures and other status codes
 still fail the cycle. Each request has separate connection and total-transfer
 timeouts so a stalled endpoint cannot block the unattended recovery loop.
+Transient Compose startup failures are retried for the same bounded recovery
+window. Monitoring is marked restored only after every selected service and
+the dashboard database health check succeed; exhausted recovery exits with
+status 75 and a critical operator message. Compose start, status, and stop
+commands also have host-side deadlines so a stalled Docker client cannot hold
+the recovery path indefinitely.
 
 Run it as an SSH-independent transient systemd service. The backup directory
 must already exist on the intended backup filesystem, be owned by the account
@@ -273,8 +279,9 @@ and should only be planned as a separate maintenance operation with all writers
 stopped and adequate free space verified.
 
 Applied pruning uses short indexed transactions, pauses between batches, and
-uses SQLite progress interruption to enforce one deadline across planning,
-backup authorization, deletion, cleanup, checkpointing, and storage reporting.
+uses SQLite progress interruption plus remaining-time lock waits to enforce one
+deadline across database connection, planning, backup authorization, deletion,
+cleanup, checkpointing, and storage reporting.
 The JSON result reports when orphan cleanup was deferred; storage-after metrics
 are `null` when the deadline is already exhausted. This control applies to
 verdict history; it does not reset SPC baselines or remove ingest-failure
