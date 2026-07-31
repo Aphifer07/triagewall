@@ -55,7 +55,13 @@ case " $* " in
     printf '%s\n' '{"mode":"verify_backup"}'
     ;;
   *" run "*" maintenance prune "*)
-    printf '%s\n' '{"plan":{"eligible_rows":1},"result":{"deleted_rows":1,"stopped_reason":"exhausted"}}'
+    if [ "${FAKE_DEFER_CLEANUP:-}" = "1" ] \
+      && [ ! -e "$FAKE_PRUNE_STATE" ]; then
+      : >"$FAKE_PRUNE_STATE"
+      printf '%s\n' '{"plan":{"eligible_rows":1},"result":{"deleted_rows":1,"stopped_reason":"exhausted","orphan_cleanup_deferred":true}}'
+    else
+      printf '%s\n' '{"plan":{"eligible_rows":0},"result":{"deleted_rows":0,"stopped_reason":"exhausted","orphan_cleanup_deferred":false}}'
+    fi
     ;;
 esac
 """,
@@ -69,13 +75,22 @@ esac
         path.write_text(textwrap.dedent(content), encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
-    def _run(self, *, fail_phase: str | None = None) -> subprocess.CompletedProcess:
+    def _run(
+        self,
+        *,
+        fail_phase: str | None = None,
+        defer_cleanup: bool = False,
+        max_cycles: int = 1,
+    ) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
         env["FAKE_DOCKER_LOG"] = str(self.docker_log)
+        env["FAKE_PRUNE_STATE"] = str(self.root / "prune.state")
         env["TRIAGEWALL_RETENTION_LOCK"] = str(self.root / "cycle.lock")
         if fail_phase:
             env["FAKE_FAIL_PHASE"] = fail_phase
+        if defer_cleanup:
+            env["FAKE_DEFER_CLEANUP"] = "1"
         return subprocess.run(
             [
                 "/bin/bash",
@@ -89,7 +104,7 @@ esac
                 "--cooldown-seconds",
                 "1",
                 "--max-cycles",
-                "1",
+                str(max_cycles),
             ],
             cwd=self.root,
             env=env,
@@ -138,6 +153,18 @@ esac
         self.assertTrue(any(" stop " in f" {call} " for call in calls))
         self.assertTrue(any(" start " in f" {call} " for call in calls))
         self.assertIn("restoring monitoring services", completed.stderr)
+
+    def test_cycle_continues_until_deferred_orphan_cleanup_completes(self):
+        completed = self._run(defer_cleanup=True, max_cycles=2)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.docker_log.read_text(encoding="utf-8").splitlines()
+        prune_calls = [
+            call for call in calls if " maintenance prune " in call
+        ]
+        self.assertEqual(len(prune_calls), 2)
+        self.assertIn("orphan cleanup deferred", completed.stdout)
+        self.assertIn("retention target exhausted", completed.stdout)
 
 
 if __name__ == "__main__":

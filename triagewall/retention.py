@@ -1500,6 +1500,7 @@ def prune_events(
     deadline: float | None = None,
     progress: Callable[[int, int], None] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> PruneResult:
     """Delete eligible verdicts in short transactions and clean orphans."""
     if not 1 <= batch_size <= MAX_BATCH_SIZE:
@@ -1597,7 +1598,14 @@ def prune_events(
             stopped_reason = "exhausted"
             break
         if pause_ms:
-            time.sleep(pause_ms / 1_000.0)
+            pause_seconds = pause_ms / 1_000.0
+            if effective_deadline is not None:
+                pause_seconds = min(
+                    pause_seconds,
+                    max(0.0, effective_deadline - clock()),
+                )
+            if pause_seconds > 0:
+                sleep(pause_seconds)
 
     if stopped_reason != "exhausted" and not (
         effective_deadline is not None and clock() >= effective_deadline

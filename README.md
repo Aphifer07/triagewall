@@ -195,6 +195,7 @@ docker compose --profile maintenance run --rm maintenance \
 - writes a mode-0600 manifest bound to the backup and source database;
 - bounds planning, authorization, deletion, and reporting to 15 minutes per pause;
 - restores and health-checks services after every pause and on failure;
+- schedules another bounded pause when orphan cleanup was deferred;
 - waits 30 minutes with monitoring live before another pause if needed; and
 - retains the backup, manifest, and JSON results for operator review.
 

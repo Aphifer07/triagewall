@@ -240,26 +240,32 @@ while ((cycle <= max_cycles)); do
   start_writers
   wait_for_recovery
 
-  read -r eligible_rows deleted_rows stopped_reason < <(
+  read -r eligible_rows deleted_rows stopped_reason orphan_cleanup_deferred < <(
     python3 - "$result_host_path" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     payload = json.load(handle)
+orphan_cleanup_deferred = payload["result"]["orphan_cleanup_deferred"]
+if not isinstance(orphan_cleanup_deferred, bool):
+    raise TypeError("orphan_cleanup_deferred must be a boolean")
 print(
     int(payload["plan"]["eligible_rows"]),
     int(payload["result"]["deleted_rows"]),
     payload["result"]["stopped_reason"],
+    "true" if orphan_cleanup_deferred else "false",
 )
 PY
   )
-  echo "retention cycle: pause=$cycle eligible=$eligible_rows deleted=$deleted_rows reason=$stopped_reason"
+  echo "retention cycle: pause=$cycle eligible=$eligible_rows deleted=$deleted_rows reason=$stopped_reason orphan_cleanup_deferred=$orphan_cleanup_deferred"
   if [[ "$stopped_reason" == "exhausted" ]]; then
-    echo "retention cycle: retention target exhausted successfully"
-    break
-  fi
-  if ((deleted_rows < 1)); then
+    if [[ "$orphan_cleanup_deferred" == "false" ]]; then
+      echo "retention cycle: retention target exhausted successfully"
+      break
+    fi
+    echo "retention cycle: orphan cleanup deferred; scheduling another pause"
+  elif ((deleted_rows < 1)); then
     echo "retention cycle: no forward deletion progress; refusing to loop" >&2
     exit 1
   fi

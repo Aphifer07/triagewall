@@ -259,6 +259,35 @@ class RetentionTests(unittest.TestCase):
             1,
         )
 
+    def test_batch_pause_is_capped_at_remaining_deadline(self):
+        self.insert_event(age_days=60, signature_id=300)
+        self.insert_event(age_days=60, signature_id=301)
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        clock = FakeClock()
+        pauses: list[float] = []
+
+        def advance_after_batch(_rows: int, _batches: int) -> None:
+            clock.advance(0.75)
+
+        def bounded_sleep(seconds: float) -> None:
+            pauses.append(seconds)
+            clock.advance(seconds)
+
+        result = prune_events(
+            self.conn,
+            cutoff,
+            batch_size=1,
+            pause_ms=60_000,
+            max_runtime_seconds=1,
+            progress=advance_after_batch,
+            clock=clock,
+            sleep=bounded_sleep,
+        )
+
+        self.assertEqual(pauses, [0.25])
+        self.assertEqual(result.deleted_rows, 1)
+        self.assertEqual(result.stopped_reason, "max_runtime")
+
     def test_applied_cli_deadline_includes_planning_time(self):
         self.conn.close()
         clock = FakeClock(100)
