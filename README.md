@@ -140,7 +140,7 @@ Triagewall has been running on a homelab production network for multi-day contin
 | LLM latency | 7–10 seconds per call (Foundation-Sec-8B Q5_K_M on RTX 4060) |
 | End-to-end lag | under 2 minutes at steady state with healthy prefilter |
 | Daemon RAM footprint (excluding Ollama) | ~17 MB |
-| Database growth | Workload-dependent; one long-running deployment reached ~14.7 GB. Automated retention is not shipped yet. |
+| Database growth | Workload-dependent; one long-running deployment reached ~14.7 GB. Bounded, backup-first retention is available through the maintenance profile. |
 | Classifier accuracy (v0.2, 265-alert gold set) | Cohen's κ = 0.687, true-positive recall = 83% |
 
 Throughput scales primarily with prefilter ratio. The two-tier design means prefiltered alerts are processed in microseconds; only LLM-classified alerts (typically 0.3–3% after tuning) are bound by Ollama latency.
@@ -153,10 +153,10 @@ reuse. Reusable space is not the same as filesystem free space: with the
 default `auto_vacuum=none` policy, deleted pages are reused by future writes but
 the main database file does not shrink automatically.
 
-Use a controlled maintenance window. SQLite online backup can fail to converge
-under sustained ingest writes; the retention tool now bounds copy/integrity
-progress and still requires an explicit operator acknowledgement that writers
-are stopped before any applied prune.
+Use a controlled maintenance cycle. SQLite online backup can fail to converge
+under sustained ingest writes, so the production workflow briefly stops all
+SQLite writers for the copy. It restarts monitoring before the longer integrity
+check, then uses short, automatically recovered deletion pauses.
 
 1. Inspect allocation and history bounds (read-only):
 
@@ -176,87 +176,114 @@ docker compose \
   run --rm maintenance status
 ```
 
-2. Dry-preview a 30-day hot-data window (default; no writes):
+2. Dry-preview a 60-day hot-data window (default; no writes):
 
 ```bash
 docker compose --profile maintenance run --rm maintenance \
-  prune --keep-days 30
+  prune --keep-days 60
 ```
 
-3. Record current ingest checkpoint metadata outside the database so you can
-confirm resumption after the window.
+### Automated production cycle
 
-4. Stop writers before apply. The dashboard is included because human-feedback
-submissions write to the verdict database:
+`scripts/retention-cycle.sh` is the recommended production entry point. It:
+
+- acquires a host lock so two cycles cannot overlap;
+- captures one fixed UTC cutoff for safe resume;
+- stops dashboard, Suricata ingest, and optional Wazuh ingest;
+- creates a bounded, exclusive mode-0600 backup copy and provenance record;
+- restores and health-checks monitoring before verifying that backup;
+- writes a mode-0600 manifest bound to the backup and source database;
+- bounds planning, authorization, deletion, and reporting to 15 minutes per pause;
+- restores and health-checks services after every pause and on failure;
+- schedules another bounded pause when orphan cleanup was deferred;
+- waits 30 minutes with monitoring live before another pause if needed; and
+- retains the backup, manifest, and JSON results for operator review.
+
+Recovery requires every selected Compose service to be running and the
+dashboard health endpoint to be reachable. HTTP 503 with Triagewall's normal
+`stale` status is accepted because a quiet sensor may legitimately have no
+recent verdict after a long pause; connection failures and other status codes
+still fail the cycle. Each request has separate connection and total-transfer
+timeouts so a stalled endpoint cannot block the unattended recovery loop.
+Transient Compose startup failures are retried for the same bounded recovery
+window. Monitoring is marked restored only after every selected service and
+the dashboard database health check succeed; exhausted recovery exits with
+status 75 and a critical operator message. Compose start, status, and stop
+commands also have host-side deadlines so a stalled Docker client cannot hold
+the recovery path indefinitely.
+
+Run it as an SSH-independent transient systemd service. The backup directory
+must already exist on the intended backup filesystem, be owned by the account
+running the cycle, and not be group- or world-writable:
 
 ```bash
-docker compose stop dashboard ingest
+sudo systemd-run \
+  --unit=triagewall-retention-cycle \
+  --collect \
+  --property=Type=exec \
+  --property=WorkingDirectory=/opt/triagewall \
+  /opt/triagewall/scripts/retention-cycle.sh \
+  --backup-dir /mnt/triagewall-backups \
+  --keep-days 60 \
+  --wazuh
 ```
 
-With optional Wazuh enabled, stop both writers through the combined
-configuration:
+Replace both example paths with the actual deployment and backup locations.
+Omit `--wazuh` when the optional connector is disabled. A Wi-Fi or SSH
+disconnect does not stop the systemd service.
 
 ```bash
-docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.wazuh.yml \
-  --profile wazuh \
-  stop dashboard ingest wazuh-ingest
+systemctl status triagewall-retention-cycle
+journalctl -fu triagewall-retention-cycle
 ```
 
-5. Run a backed-up canary prune with the maintenance acknowledgement. The tool
-checks free space, creates an exclusive backup destination, verifies integrity,
-then deletes. `--confirm-writers-stopped` is an operator acknowledgement, not
-proof that the program can observe all writers:
+The exit trap attempts to restart every selected service after an ordinary
+error, signal, or failed maintenance command. Container restart policies cover
+a host reboot. The maintenance container never receives the Docker socket;
+only this host-side script controls Compose.
 
-```bash
-HOST_BACKUP_DIR=/mnt/triagewall-backups docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.wazuh.yml \
-  --profile wazuh \
-  --profile maintenance \
-  run --rm maintenance \
-  prune --keep-days 30 --apply --confirm-writers-stopped \
-  --max-rows 10000 \
-  --backup /var/backups/triagewall/triage-before-retention.db
-```
+### Manual split workflow
+
+The CLI also exposes the three phases independently:
+
+1. With writers stopped, use `maintenance backup --output PATH
+   --confirm-writers-stopped`. This also creates
+   `PATH.provenance.json`; retain both files.
+2. Restart writers, then use `maintenance verify-backup --backup PATH
+   --manifest PATH`.
+3. Stop writers again and use `maintenance prune --apply
+   --confirm-writers-stopped --verified-backup-manifest PATH
+   --max-runtime-seconds 900`.
+
+Applied prune still requires an explicit writer-stopped acknowledgement. The
+backup and manifest are fresh for 24 hours by default. Verification records
+the backup's SHA-256 and integrity result. Prune validates the manifest's
+canonical hash, creation-time provenance, exact file identities, source
+database identity, and SQLite sequence relationship. It also refuses to
+delete eligible rows inserted after the backup was created. When
+`--include-reviewed` is selected, authorization also rejects eligible feedback
+written after backup creation. These checks avoid rereading the entire backup
+while monitoring is stopped.
+
+The original one-command `prune --backup PATH` workflow remains available for
+small databases, but it cannot be combined with `--max-runtime-seconds`; use
+the split workflow when a full-command maintenance deadline is required.
+Applying without a backup requires `--no-backup`; it is not used by the
+automated cycle.
 
 Human-reviewed verdicts remain protected unless `--include-reviewed` is
-supplied. To apply without a backup, pass both acknowledgements explicitly:
-
-```bash
-docker compose --profile maintenance run --rm maintenance \
-  prune --keep-days 30 --apply --confirm-writers-stopped --no-backup
-```
-
-6. Verify the canary before a larger prune: process exit code, `deleted_rows`,
-backup integrity, WAL checkpoint fields in the JSON result, dashboard/API
-health, and ingest checkpoint resumption after restart.
-
-7. Restart writers:
-
-```bash
-docker compose start ingest dashboard
-```
-
-With optional Wazuh enabled, restart both writers through the combined
-configuration:
-
-```bash
-docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.wazuh.yml \
-  --profile wazuh \
-  start ingest wazuh-ingest dashboard
-```
-
-8. Retain the verified backup. Do not run `VACUUM` as part of this workflow:
+supplied. Retain the verified backup. Do not run `VACUUM` as part of this
+workflow:
 rebuilding a large live database can require substantial temporary disk space
 and should only be planned as a separate maintenance operation with all writers
 stopped and adequate free space verified.
 
 Applied pruning uses short indexed transactions, pauses between batches, and
-cleans source-context rows and orphaned asset snapshots. This control applies to
+uses SQLite progress interruption plus remaining-time lock waits to enforce one
+deadline across database connection, planning, backup authorization, deletion,
+cleanup, checkpointing, and storage reporting.
+The JSON result reports when orphan cleanup was deferred; storage-after metrics
+are `null` when the deadline is already exhausted. This control applies to
 verdict history; it does not reset SPC baselines or remove ingest-failure
 quarantine records.
 
