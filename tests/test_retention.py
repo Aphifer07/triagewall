@@ -27,8 +27,11 @@ from triagewall.retention import (
     BackupProgressMonitor,
     IntegrityCheckMonitor,
     build_retention_plan,
+    create_backup_copy,
     create_online_backup,
     prune_events,
+    validate_backup_manifest,
+    verify_backup,
 )
 from triagewall.storage import get_storage_metrics
 from triagewall.time_utils import format_utc_timestamp
@@ -221,6 +224,68 @@ class RetentionTests(unittest.TestCase):
             3,
         )
 
+    def test_max_runtime_stops_at_batch_boundary_and_defers_cleanup(self):
+        self.insert_snapshot(1)
+        self.insert_event(
+            age_days=60,
+            signature_id=30,
+            src_snapshot_id=1,
+        )
+        self.insert_event(age_days=60, signature_id=31)
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        clock = FakeClock()
+
+        def advance_after_batch(_rows: int, _batches: int) -> None:
+            clock.advance(2)
+
+        result = prune_events(
+            self.conn,
+            cutoff,
+            batch_size=1,
+            pause_ms=0,
+            max_runtime_seconds=1,
+            progress=advance_after_batch,
+            clock=clock,
+        )
+
+        self.assertEqual(result.deleted_rows, 1)
+        self.assertEqual(result.stopped_reason, "max_runtime")
+        self.assertTrue(result.orphan_cleanup_deferred)
+        self.assertEqual(result.deleted_asset_snapshots, 0)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM triage_events"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_bounded_exhausted_prune_cleans_orphans_within_deadline(self):
+        self.insert_snapshot(1)
+        self.insert_event(
+            age_days=60,
+            signature_id=32,
+            src_snapshot_id=1,
+        )
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+
+        result = prune_events(
+            self.conn,
+            cutoff,
+            batch_size=10,
+            pause_ms=0,
+            max_runtime_seconds=60,
+        )
+
+        self.assertEqual(result.stopped_reason, "exhausted")
+        self.assertFalse(result.orphan_cleanup_deferred)
+        self.assertEqual(result.deleted_asset_snapshots, 1)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM asset_snapshots"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_prune_rejects_unbounded_batch_parameters(self):
         cutoff = format_utc_timestamp(self.now - timedelta(days=30))
 
@@ -273,6 +338,181 @@ class RetentionTests(unittest.TestCase):
             backup.close()
         with self.assertRaises(FileExistsError):
             create_online_backup(self.conn, backup_path)
+
+    def test_split_backup_verification_manifest_binds_exact_files(self):
+        self.insert_event(age_days=60, signature_id=33)
+        backup_path = Path(self.temp_dir.name) / "split.db"
+        manifest_path = Path(self.temp_dir.name) / "split.manifest.json"
+
+        created = create_backup_copy(self.conn, backup_path)
+        payload = verify_backup(
+            created,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        validated = validate_backup_manifest(
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+
+        self.assertEqual(payload, validated)
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["integrity_check"], "ok")
+        self.assertEqual(payload["backup"]["path"], str(backup_path.resolve()))
+        self.assertRegex(
+            payload["backup"]["sha256"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            payload["manifest_hash"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            list(
+                manifest_path.parent.glob(
+                    f".{manifest_path.name}.*.tmp"
+                )
+            ),
+            [],
+        )
+        if os.name == "posix":
+            self.assertEqual(
+                stat.S_IMODE(manifest_path.stat().st_mode),
+                BACKUP_FILE_MODE,
+            )
+
+    def test_manifest_rejects_backup_mutation_and_manifest_tampering(self):
+        self.insert_event(age_days=60, signature_id=34)
+        backup_path = Path(self.temp_dir.name) / "bound.db"
+        manifest_path = Path(self.temp_dir.name) / "bound.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+
+        with backup_path.open("ab") as handle:
+            handle.write(b"changed")
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+            )
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["verified_at"] = "2020-01-01T00:00:00.000000Z"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "hash does not match"):
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+            )
+
+    def test_manifest_freshness_is_enforced(self):
+        self.insert_event(age_days=60, signature_id=39)
+        backup_path = Path(self.temp_dir.name) / "fresh.db"
+        manifest_path = Path(self.temp_dir.name) / "fresh.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+
+        with mock.patch.object(
+            retention,
+            "utc_now",
+            return_value=self.now + timedelta(days=2),
+        ):
+            with self.assertRaisesRegex(ValueError, "too old"):
+                validate_backup_manifest(
+                    manifest_path,
+                    source_conn=self.conn,
+                    source_path=self.db_path,
+                )
+
+    def test_split_cli_flow_prunes_from_verified_manifest(self):
+        self.insert_event(age_days=60, signature_id=38)
+        backup_path = Path(self.temp_dir.name) / "flow.db"
+        manifest_path = Path(self.temp_dir.name) / "flow.manifest.json"
+        self.conn.close()
+
+        with redirect_stdout(io.StringIO()):
+            backup_result = retention.main(
+                [
+                    "backup",
+                    "--db",
+                    str(self.db_path),
+                    "--output",
+                    str(backup_path),
+                    "--confirm-writers-stopped",
+                    "--json",
+                ]
+            )
+            verify_result = retention.main(
+                [
+                    "verify-backup",
+                    "--db",
+                    str(self.db_path),
+                    "--backup",
+                    str(backup_path),
+                    "--manifest",
+                    str(manifest_path),
+                    "--json",
+                ]
+            )
+            prune_result = retention.main(
+                [
+                    "prune",
+                    "--db",
+                    str(self.db_path),
+                    "--keep-days",
+                    "30",
+                    "--apply",
+                    "--confirm-writers-stopped",
+                    "--verified-backup-manifest",
+                    str(manifest_path),
+                    "--max-runtime-seconds",
+                    "60",
+                    "--pause-ms",
+                    "0",
+                    "--json",
+                ]
+            )
+
+        self.conn = connect_database(self.db_path)
+        self.assertEqual((backup_result, verify_result, prune_result), (0, 0, 0))
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM triage_events"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_backup_command_requires_writers_stopped_acknowledgement(self):
+        backup_path = Path(self.temp_dir.name) / "missing-copy-ack.db"
+        self.conn.close()
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                retention.main(
+                    [
+                        "backup",
+                        "--db",
+                        str(self.db_path),
+                        "--output",
+                        str(backup_path),
+                    ]
+                )
+        self.assertEqual(raised.exception.code, 2)
+        self.assertFalse(backup_path.exists())
+        self.conn = connect_database(self.db_path)
 
     def test_cli_is_dry_run_by_default_and_requires_apply_acknowledgement(self):
         self.insert_event(age_days=60, signature_id=35)

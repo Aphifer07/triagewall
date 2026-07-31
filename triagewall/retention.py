@@ -8,11 +8,14 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 import errno
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -47,10 +50,15 @@ DEFAULT_BACKUP_MAX_RESTARTS = 3
 DEFAULT_BACKUP_PROGRESS_SECONDS = 30
 DEFAULT_INTEGRITY_MAX_SECONDS = 10_800
 DEFAULT_INTEGRITY_PROGRESS_SECONDS = 30
+DEFAULT_MANIFEST_MAX_AGE_SECONDS = 86_400
 MAX_BACKUP_BOUND_SECONDS = 86_400
 MAX_BACKUP_RESTARTS = 100
+MAX_MANIFEST_BYTES = 64 * 1024
+MAX_MANIFEST_AGE_SECONDS = 7 * 86_400
+MAX_PRUNE_SECONDS = 86_400
 
 BACKUP_FILE_MODE = 0o600
+BACKUP_MANIFEST_VERSION = 1
 MAX_BACKUP_STEP_BUSY_MS = 100
 
 # sqlite3 backup progress statuses (not always exported by the stdlib module).
@@ -74,10 +82,12 @@ class RetentionPlan:
 class PruneResult:
     deleted_rows: int
     deleted_asset_snapshots: int
+    orphan_cleanup_deferred: bool
     batches: int
     checkpoint_busy_frames: int
     checkpoint_log_frames: int
     checkpointed_frames: int
+    stopped_reason: str
 
 
 @dataclass(frozen=True)
@@ -551,7 +561,7 @@ def _run_integrity_check(
         monitor.stop()
 
 
-def create_online_backup(
+def _create_backup(
     source: sqlite3.Connection,
     backup_path: str | Path,
     *,
@@ -563,8 +573,9 @@ def create_online_backup(
     copy_watchdog_factory: Callable[..., BackupCopyWatchdog] | None = None,
     integrity_check: Callable[[sqlite3.Connection], str] | None = None,
     monitor_factory: Callable[..., IntegrityCheckMonitor] | None = None,
+    verify_integrity: bool,
 ) -> Path:
-    """Create and integrity-check a new SQLite backup without overwriting."""
+    """Create a bounded SQLite backup without overwriting."""
     target = Path(backup_path)
     active_limits = limits or BackupLimits()
     if not target.parent.exists():
@@ -650,19 +661,20 @@ def create_online_backup(
                 raise copy_watchdog.failure
         finally:
             copy_watchdog.stop()
-        result = _run_integrity_check(
-            destination,
-            active_limits,
-            clock=clock,
-            sleep=sleep,
-            report=report,
-            integrity_check=integrity_check,
-            monitor_factory=monitor_factory,
-        )
-        if result != "ok":
-            raise sqlite3.DatabaseError(
-                f"backup integrity check failed: {result}"
+        if verify_integrity:
+            result = _run_integrity_check(
+                destination,
+                active_limits,
+                clock=clock,
+                sleep=sleep,
+                report=report,
+                integrity_check=integrity_check,
+                monitor_factory=monitor_factory,
             )
+            if result != "ok":
+                raise sqlite3.DatabaseError(
+                    f"backup integrity check failed: {result}"
+                )
         destination.close()
         destination = None
         _ensure_backup_permissions(staging)
@@ -690,6 +702,426 @@ def create_online_backup(
         _restore_busy_timeout(source, previous_busy_timeout)
 
 
+def create_online_backup(
+    source: sqlite3.Connection,
+    backup_path: str | Path,
+    *,
+    limits: BackupLimits | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    report: Callable[[str], None] = _default_backup_report,
+    progress_monitor: Callable[[int, int, int], None] | None = None,
+    copy_watchdog_factory: Callable[..., BackupCopyWatchdog] | None = None,
+    integrity_check: Callable[[sqlite3.Connection], str] | None = None,
+    monitor_factory: Callable[..., IntegrityCheckMonitor] | None = None,
+) -> Path:
+    """Create and integrity-check a new SQLite backup without overwriting."""
+    return _create_backup(
+        source,
+        backup_path,
+        limits=limits,
+        clock=clock,
+        sleep=sleep,
+        report=report,
+        progress_monitor=progress_monitor,
+        copy_watchdog_factory=copy_watchdog_factory,
+        integrity_check=integrity_check,
+        monitor_factory=monitor_factory,
+        verify_integrity=True,
+    )
+
+
+def create_backup_copy(
+    source: sqlite3.Connection,
+    backup_path: str | Path,
+    *,
+    limits: BackupLimits | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    report: Callable[[str], None] = _default_backup_report,
+    progress_monitor: Callable[[int, int, int], None] | None = None,
+    copy_watchdog_factory: Callable[..., BackupCopyWatchdog] | None = None,
+) -> Path:
+    """Create and publish a bounded backup copy for later verification."""
+    return _create_backup(
+        source,
+        backup_path,
+        limits=limits,
+        clock=clock,
+        sleep=sleep,
+        report=report,
+        progress_monitor=progress_monitor,
+        copy_watchdog_factory=copy_watchdog_factory,
+        verify_integrity=False,
+    )
+
+
+def _regular_file_identity(path: Path, *, label: str) -> dict[str, int]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{label} does not exist: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{label} must be a regular file: {path}")
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != BACKUP_FILE_MODE:
+        raise PermissionError(f"{label} must have mode 0600: {path}")
+    return {
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "size_bytes": int(metadata.st_size),
+        "mtime_ns": int(metadata.st_mtime_ns),
+    }
+
+
+def _source_database_identity(path: Path) -> dict[str, int]:
+    try:
+        metadata = path.stat()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"source database does not exist: {path}"
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"source database must be a regular file: {path}")
+    return {
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+    }
+
+
+def _hash_file(
+    path: Path,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    report: Callable[[str], None] = _default_backup_report,
+    progress_interval_seconds: float = DEFAULT_INTEGRITY_PROGRESS_SECONDS,
+    max_seconds: float = DEFAULT_INTEGRITY_MAX_SECONDS,
+) -> str:
+    digest = hashlib.sha256()
+    started_at = clock()
+    last_report_at = started_at
+    bytes_read = 0
+    with path.open("rb") as source:
+        while True:
+            block = source.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            bytes_read += len(block)
+            now = clock()
+            if now - started_at >= max_seconds:
+                raise BackupLimitExceeded(
+                    "backup hash exceeded maximum duration of "
+                    f"{max_seconds:g} seconds"
+                )
+            if now - last_report_at >= progress_interval_seconds:
+                report(
+                    "retention backup progress: phase=hash "
+                    f"elapsed={now - started_at:.1f}s "
+                    f"bytes_read={bytes_read}"
+                )
+                last_report_at = now
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _manifest_digest(payload: dict[str, object]) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _write_exclusive_manifest(
+    manifest_path: Path,
+    payload: dict[str, object],
+) -> Path:
+    if not manifest_path.parent.exists():
+        raise FileNotFoundError(
+            "manifest parent directory does not exist: "
+            f"{manifest_path.parent}"
+        )
+    if os.path.lexists(manifest_path):
+        raise FileExistsError(
+            f"verification manifest already exists: {manifest_path}"
+        )
+
+    staging = _reserve_backup_staging_file(manifest_path)
+    try:
+        with staging.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _ensure_backup_permissions(staging)
+        _publish_backup(staging, manifest_path)
+        _unlink_owned_backup(staging)
+        return manifest_path
+    except Exception as exc:
+        try:
+            _unlink_owned_backup(staging)
+        except OSError as cleanup_exc:
+            raise OSError(
+                "manifest creation failed and its staging file could not "
+                f"be removed: {staging}: {cleanup_exc}"
+            ) from exc
+        raise
+
+
+def _connect_immutable_backup(path: Path) -> sqlite3.Connection:
+    uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+    return sqlite3.connect(uri, uri=True)
+
+
+def verify_backup(
+    backup_path: str | Path,
+    manifest_path: str | Path,
+    *,
+    source_conn: sqlite3.Connection,
+    source_path: str | Path,
+    limits: BackupLimits | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    report: Callable[[str], None] = _default_backup_report,
+    integrity_check: Callable[[sqlite3.Connection], str] | None = None,
+    monitor_factory: Callable[..., IntegrityCheckMonitor] | None = None,
+) -> dict[str, object]:
+    """Verify an immutable backup and publish a bound mode-0600 manifest."""
+    backup = Path(backup_path).resolve()
+    manifest = Path(manifest_path)
+    source = Path(source_path).resolve()
+    active_limits = limits or BackupLimits()
+    backup_identity_before = _regular_file_identity(
+        backup,
+        label="backup",
+    )
+    source_identity = _source_database_identity(source)
+
+    destination = _connect_immutable_backup(backup)
+    try:
+        result = _run_integrity_check(
+            destination,
+            active_limits,
+            clock=clock,
+            sleep=sleep,
+            report=report,
+            integrity_check=integrity_check,
+            monitor_factory=monitor_factory,
+        )
+        if result != "ok":
+            raise sqlite3.DatabaseError(
+                f"backup integrity check failed: {result}"
+            )
+        backup_page_size = int(
+            destination.execute("PRAGMA page_size").fetchone()[0]
+        )
+        backup_page_count = int(
+            destination.execute("PRAGMA page_count").fetchone()[0]
+        )
+        backup_lifetime_rows = _lifetime_rows_inserted(destination)
+    finally:
+        destination.close()
+
+    backup_hash = _hash_file(
+        backup,
+        clock=clock,
+        report=report,
+        progress_interval_seconds=(
+            active_limits.integrity_progress_interval_seconds
+        ),
+        max_seconds=active_limits.integrity_max_seconds,
+    )
+    backup_identity_after = _regular_file_identity(
+        backup,
+        label="backup",
+    )
+    if backup_identity_after != backup_identity_before:
+        raise ValueError("backup changed while it was being verified")
+
+    source_metadata: dict[str, object] = {
+        "path": str(source),
+        **source_identity,
+        "page_size_bytes": int(
+            source_conn.execute("PRAGMA page_size").fetchone()[0]
+        ),
+        "lifetime_rows_inserted": _lifetime_rows_inserted(source_conn),
+    }
+    backup_metadata: dict[str, object] = {
+        "path": str(backup),
+        **backup_identity_after,
+        "sha256": backup_hash,
+        "page_size_bytes": backup_page_size,
+        "page_count": backup_page_count,
+        "lifetime_rows_inserted": backup_lifetime_rows,
+    }
+    unsigned: dict[str, object] = {
+        "version": BACKUP_MANIFEST_VERSION,
+        "verified_at": format_utc_timestamp(utc_now()),
+        "integrity_check": "ok",
+        "source_database": source_metadata,
+        "backup": backup_metadata,
+    }
+    payload = {
+        **unsigned,
+        "manifest_hash": _manifest_digest(unsigned),
+    }
+    _write_exclusive_manifest(manifest, payload)
+    return payload
+
+
+def validate_backup_manifest(
+    manifest_path: str | Path,
+    *,
+    source_conn: sqlite3.Connection,
+    source_path: str | Path,
+    max_age_seconds: float = DEFAULT_MANIFEST_MAX_AGE_SECONDS,
+) -> dict[str, object]:
+    """Validate a verified backup manifest without rereading the backup."""
+    if max_age_seconds <= 0:
+        raise ValueError("manifest max age must be greater than zero")
+    manifest = Path(manifest_path)
+    _regular_file_identity(manifest, label="verification manifest")
+    if manifest.stat().st_size > MAX_MANIFEST_BYTES:
+        raise ValueError(
+            "verification manifest exceeds "
+            f"{MAX_MANIFEST_BYTES} bytes: {manifest}"
+        )
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"verification manifest is not valid JSON: {manifest}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("verification manifest root must be an object")
+    expected_keys = {
+        "version",
+        "verified_at",
+        "integrity_check",
+        "source_database",
+        "backup",
+        "manifest_hash",
+    }
+    if set(payload) != expected_keys:
+        raise ValueError("verification manifest fields do not match version 1")
+    if (
+        type(payload["version"]) is not int
+        or payload["version"] != BACKUP_MANIFEST_VERSION
+    ):
+        raise ValueError(
+            f"unsupported verification manifest version: {payload['version']}"
+        )
+    if payload["integrity_check"] != "ok":
+        raise ValueError("verification manifest does not record a clean check")
+
+    unsigned = dict(payload)
+    manifest_hash = unsigned.pop("manifest_hash")
+    expected_hash = _manifest_digest(unsigned)
+    if not isinstance(manifest_hash, str) or not hmac.compare_digest(
+        manifest_hash,
+        expected_hash,
+    ):
+        raise ValueError("verification manifest hash does not match")
+
+    verified_at = parse_utc_timestamp(payload["verified_at"])
+    age_seconds = (utc_now() - verified_at).total_seconds()
+    if age_seconds < -300:
+        raise ValueError("verification manifest timestamp is in the future")
+    if age_seconds > max_age_seconds:
+        raise ValueError(
+            "verification manifest is too old "
+            f"({age_seconds:.0f}s; limit {max_age_seconds:g}s)"
+        )
+
+    source_metadata = payload["source_database"]
+    backup_metadata = payload["backup"]
+    if not isinstance(source_metadata, dict) or not isinstance(
+        backup_metadata,
+        dict,
+    ):
+        raise ValueError("verification manifest metadata must be objects")
+    expected_source_keys = {
+        "path",
+        "device",
+        "inode",
+        "page_size_bytes",
+        "lifetime_rows_inserted",
+    }
+    expected_backup_keys = {
+        "path",
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns",
+        "sha256",
+        "page_size_bytes",
+        "page_count",
+        "lifetime_rows_inserted",
+    }
+    if set(source_metadata) != expected_source_keys:
+        raise ValueError("verification manifest source metadata is invalid")
+    if set(backup_metadata) != expected_backup_keys:
+        raise ValueError("verification manifest backup metadata is invalid")
+    source = Path(source_path).resolve()
+    if source_metadata.get("path") != str(source):
+        raise ValueError(
+            "verification manifest belongs to a different source database"
+        )
+    current_source_identity = _source_database_identity(source)
+    for key in ("device", "inode"):
+        if source_metadata.get(key) != current_source_identity[key]:
+            raise ValueError(
+                "source database identity changed after backup verification"
+            )
+    if source_metadata.get("page_size_bytes") != int(
+        source_conn.execute("PRAGMA page_size").fetchone()[0]
+    ):
+        raise ValueError("source database page size no longer matches")
+
+    source_lifetime_rows = source_metadata.get("lifetime_rows_inserted")
+    backup_lifetime_rows = backup_metadata.get("lifetime_rows_inserted")
+    if (
+        not isinstance(source_lifetime_rows, int)
+        or isinstance(source_lifetime_rows, bool)
+        or not isinstance(backup_lifetime_rows, int)
+        or isinstance(backup_lifetime_rows, bool)
+        or source_lifetime_rows < backup_lifetime_rows
+    ):
+        raise ValueError("verification manifest database sequence is invalid")
+    current_lifetime_rows = _lifetime_rows_inserted(source_conn)
+    if current_lifetime_rows < source_lifetime_rows:
+        raise ValueError(
+            "source database sequence predates the verified backup"
+        )
+
+    backup_path_value = backup_metadata.get("path")
+    if not isinstance(backup_path_value, str):
+        raise ValueError("verification manifest backup path is invalid")
+    backup = Path(backup_path_value)
+    current_backup_identity = _regular_file_identity(
+        backup,
+        label="verified backup",
+    )
+    for key in ("device", "inode", "size_bytes", "mtime_ns"):
+        if backup_metadata.get(key) != current_backup_identity[key]:
+            raise ValueError(
+                "verified backup identity changed after verification"
+            )
+    backup_hash = backup_metadata.get("sha256")
+    if (
+        not isinstance(backup_hash, str)
+        or not backup_hash.startswith("sha256:")
+        or len(backup_hash) != 71
+        or any(
+            character not in "0123456789abcdef"
+            for character in backup_hash[7:]
+        )
+    ):
+        raise ValueError("verification manifest backup hash is invalid")
+    return payload
+
+
 def prune_events(
     conn: sqlite3.Connection,
     cutoff: str,
@@ -698,7 +1130,9 @@ def prune_events(
     batch_size: int = DEFAULT_BATCH_SIZE,
     pause_ms: int = DEFAULT_PAUSE_MS,
     max_rows: int | None = None,
+    max_runtime_seconds: float | None = None,
     progress: Callable[[int, int], None] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> PruneResult:
     """Delete eligible verdicts in short transactions and clean orphans."""
     if not 1 <= batch_size <= MAX_BATCH_SIZE:
@@ -711,19 +1145,44 @@ def prune_events(
         )
     if max_rows is not None and max_rows < 1:
         raise ValueError("max_rows must be at least 1")
+    if max_runtime_seconds is not None and max_runtime_seconds <= 0:
+        raise ValueError("max_runtime_seconds must be greater than zero")
 
     canonical_cutoff = format_utc_timestamp(cutoff)
     predicate = _retention_predicate(include_reviewed)
     deleted_rows = 0
     batches = 0
+    started_at = clock()
+    deadline = (
+        started_at + max_runtime_seconds
+        if max_runtime_seconds is not None
+        else None
+    )
+    stopped_reason = "exhausted"
 
-    while max_rows is None or deleted_rows < max_rows:
+    while True:
+        if max_rows is not None and deleted_rows >= max_rows:
+            stopped_reason = "max_rows"
+            break
+        if (
+            max_runtime_seconds is not None
+            and clock() - started_at >= max_runtime_seconds
+        ):
+            stopped_reason = "max_runtime"
+            break
+
         current_batch = batch_size
         if max_rows is not None:
             current_batch = min(current_batch, max_rows - deleted_rows)
 
-        conn.execute("BEGIN IMMEDIATE")
+        interrupted_for_deadline = False
+        if deadline is not None:
+            conn.set_progress_handler(
+                lambda: 1 if clock() >= deadline else 0,
+                1_000,
+            )
         try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 f"""DELETE FROM triage_events
                     WHERE id IN (
@@ -737,9 +1196,22 @@ def prune_events(
             )
             deleted = int(conn.execute("SELECT changes()").fetchone()[0])
             conn.commit()
+        except sqlite3.OperationalError:
+            conn.rollback()
+            if deadline is not None and clock() >= deadline:
+                interrupted_for_deadline = True
+            else:
+                raise
         except Exception:
             conn.rollback()
             raise
+        finally:
+            if deadline is not None:
+                conn.set_progress_handler(None, 0)
+
+        if interrupted_for_deadline:
+            stopped_reason = "max_runtime"
+            break
 
         if deleted == 0:
             break
@@ -748,36 +1220,71 @@ def prune_events(
         if progress is not None:
             progress(deleted_rows, batches)
         if deleted < current_batch:
+            stopped_reason = "exhausted"
             break
         if pause_ms:
             time.sleep(pause_ms / 1_000.0)
 
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute(
-            """DELETE FROM asset_snapshots
-               WHERE NOT EXISTS (
-                   SELECT 1 FROM triage_events
-                   WHERE src_asset_snapshot_id = asset_snapshots.id
-                      OR dest_asset_snapshot_id = asset_snapshots.id
-               )"""
-        )
-        deleted_asset_snapshots = int(
-            conn.execute("SELECT changes()").fetchone()[0]
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    if stopped_reason != "exhausted":
+        remaining = conn.execute(
+            f"""SELECT 1
+                FROM triage_events
+                WHERE {predicate}
+                LIMIT 1""",
+            (canonical_cutoff,),
+        ).fetchone()
+        if remaining is None:
+            stopped_reason = "exhausted"
+
+    deleted_asset_snapshots = 0
+    orphan_cleanup_deferred = stopped_reason != "exhausted"
+    if stopped_reason == "exhausted":
+        if deadline is not None and clock() >= deadline:
+            orphan_cleanup_deferred = True
+        else:
+            if deadline is not None:
+                conn.set_progress_handler(
+                    lambda: 1 if clock() >= deadline else 0,
+                    1_000,
+                )
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """DELETE FROM asset_snapshots
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM triage_events
+                           WHERE src_asset_snapshot_id = asset_snapshots.id
+                              OR dest_asset_snapshot_id = asset_snapshots.id
+                       )"""
+                )
+                deleted_asset_snapshots = int(
+                    conn.execute("SELECT changes()").fetchone()[0]
+                )
+                conn.commit()
+                orphan_cleanup_deferred = False
+            except sqlite3.OperationalError:
+                conn.rollback()
+                if deadline is not None and clock() >= deadline:
+                    orphan_cleanup_deferred = True
+                else:
+                    raise
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                if deadline is not None:
+                    conn.set_progress_handler(None, 0)
 
     checkpoint = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
     return PruneResult(
         deleted_rows=deleted_rows,
         deleted_asset_snapshots=deleted_asset_snapshots,
+        orphan_cleanup_deferred=orphan_cleanup_deferred,
         batches=batches,
         checkpoint_busy_frames=int(checkpoint[0]),
         checkpoint_log_frames=int(checkpoint[1]),
         checkpointed_frames=int(checkpoint[2]),
+        stopped_reason=stopped_reason,
     )
 
 
@@ -836,6 +1343,92 @@ def _backup_limits_from_args(args: argparse.Namespace) -> BackupLimits:
     )
 
 
+def _add_backup_limit_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_copy: bool = True,
+    include_integrity: bool = True,
+) -> None:
+    if include_copy:
+        parser.add_argument(
+            "--backup-max-seconds",
+            type=_bounded_int(
+                "backup-max-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+            ),
+            default=DEFAULT_BACKUP_MAX_SECONDS,
+            help=(
+                "Abort online backup copy after this many seconds "
+                f"(default: {DEFAULT_BACKUP_MAX_SECONDS})."
+            ),
+        )
+        parser.add_argument(
+            "--backup-stall-seconds",
+            type=_bounded_int(
+                "backup-stall-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+            ),
+            default=DEFAULT_BACKUP_STALL_SECONDS,
+            help=(
+                "Abort when backup makes no forward page progress for this "
+                f"long (default: {DEFAULT_BACKUP_STALL_SECONDS})."
+            ),
+        )
+        parser.add_argument(
+            "--backup-max-restarts",
+            type=_bounded_int("backup-max-restarts", 0, MAX_BACKUP_RESTARTS),
+            default=DEFAULT_BACKUP_MAX_RESTARTS,
+            help=(
+                "Abort after this many backup remaining-page resets "
+                f"(default: {DEFAULT_BACKUP_MAX_RESTARTS})."
+            ),
+        )
+        parser.add_argument(
+            "--backup-progress-seconds",
+            type=_bounded_int(
+                "backup-progress-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+            ),
+            default=DEFAULT_BACKUP_PROGRESS_SECONDS,
+            help=(
+                "Seconds between backup copy progress lines on stderr "
+                f"(default: {DEFAULT_BACKUP_PROGRESS_SECONDS})."
+            ),
+        )
+    else:
+        parser.set_defaults(
+            backup_max_seconds=DEFAULT_BACKUP_MAX_SECONDS,
+            backup_stall_seconds=DEFAULT_BACKUP_STALL_SECONDS,
+            backup_max_restarts=DEFAULT_BACKUP_MAX_RESTARTS,
+            backup_progress_seconds=DEFAULT_BACKUP_PROGRESS_SECONDS,
+        )
+    if not include_integrity:
+        parser.set_defaults(
+            integrity_check_max_seconds=DEFAULT_INTEGRITY_MAX_SECONDS,
+            integrity_progress_seconds=DEFAULT_INTEGRITY_PROGRESS_SECONDS,
+        )
+        return
+    parser.add_argument(
+        "--integrity-check-max-seconds",
+        type=_bounded_int(
+            "integrity-check-max-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+        ),
+        default=DEFAULT_INTEGRITY_MAX_SECONDS,
+        help=(
+            "Abort backup integrity checking after this many seconds "
+            f"(default: {DEFAULT_INTEGRITY_MAX_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--integrity-progress-seconds",
+        type=_bounded_int(
+            "integrity-progress-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+        ),
+        default=DEFAULT_INTEGRITY_PROGRESS_SECONDS,
+        help=(
+            "Seconds between integrity/hash progress lines on stderr "
+            f"(default: {DEFAULT_INTEGRITY_PROGRESS_SECONDS})."
+        ),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Inspect and safely prune Triagewall verdict history."
@@ -848,6 +1441,38 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_database_argument(status)
     status.add_argument("--json", action="store_true")
+
+    backup_copy = subparsers.add_parser(
+        "backup",
+        help="Create a bounded backup copy without holding writers for verification.",
+    )
+    _add_database_argument(backup_copy)
+    backup_copy.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Exclusive destination for the unverified backup copy.",
+    )
+    backup_copy.add_argument(
+        "--confirm-writers-stopped",
+        action="store_true",
+        help=(
+            "Operator acknowledgement that dashboard and ingest writers are "
+            "stopped for a convergent production backup."
+        ),
+    )
+    _add_backup_limit_arguments(backup_copy, include_integrity=False)
+    backup_copy.add_argument("--json", action="store_true")
+
+    verify = subparsers.add_parser(
+        "verify-backup",
+        help="Verify a backup while live monitoring continues and write a manifest.",
+    )
+    _add_database_argument(verify)
+    verify.add_argument("--backup", type=Path, required=True)
+    verify.add_argument("--manifest", type=Path, required=True)
+    _add_backup_limit_arguments(verify, include_copy=False)
+    verify.add_argument("--json", action="store_true")
 
     prune = subparsers.add_parser(
         "prune",
@@ -881,6 +1506,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Canary limit for one applied run.",
     )
     prune.add_argument(
+        "--max-runtime-seconds",
+        type=_bounded_int(
+            "max-runtime-seconds", 1, MAX_PRUNE_SECONDS
+        ),
+        help=(
+            "Stop at a batch boundary after this many seconds. "
+            "Orphan cleanup is deferred until eligible rows are exhausted."
+        ),
+    )
+    prune.add_argument(
         "--apply",
         action="store_true",
         help="Perform the planned deletion.",
@@ -905,70 +1540,24 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly acknowledge applying without a backup.",
     )
+    backup.add_argument(
+        "--verified-backup-manifest",
+        type=Path,
+        help=(
+            "Use a fresh verification manifest instead of repeating backup "
+            "copy and integrity checking."
+        ),
+    )
     prune.add_argument(
-        "--backup-max-seconds",
+        "--verified-backup-max-age-seconds",
         type=_bounded_int(
-            "backup-max-seconds", 1, MAX_BACKUP_BOUND_SECONDS
+            "verified-backup-max-age-seconds",
+            1,
+            MAX_MANIFEST_AGE_SECONDS,
         ),
-        default=DEFAULT_BACKUP_MAX_SECONDS,
-        help=(
-            "Abort online backup copy after this many seconds "
-            f"(default: {DEFAULT_BACKUP_MAX_SECONDS})."
-        ),
+        default=DEFAULT_MANIFEST_MAX_AGE_SECONDS,
     )
-    prune.add_argument(
-        "--backup-stall-seconds",
-        type=_bounded_int(
-            "backup-stall-seconds", 1, MAX_BACKUP_BOUND_SECONDS
-        ),
-        default=DEFAULT_BACKUP_STALL_SECONDS,
-        help=(
-            "Abort when backup makes no forward page progress for this long "
-            f"(default: {DEFAULT_BACKUP_STALL_SECONDS})."
-        ),
-    )
-    prune.add_argument(
-        "--backup-max-restarts",
-        type=_bounded_int("backup-max-restarts", 0, MAX_BACKUP_RESTARTS),
-        default=DEFAULT_BACKUP_MAX_RESTARTS,
-        help=(
-            "Abort after this many backup remaining-page resets "
-            f"(default: {DEFAULT_BACKUP_MAX_RESTARTS})."
-        ),
-    )
-    prune.add_argument(
-        "--backup-progress-seconds",
-        type=_bounded_int(
-            "backup-progress-seconds", 1, MAX_BACKUP_BOUND_SECONDS
-        ),
-        default=DEFAULT_BACKUP_PROGRESS_SECONDS,
-        help=(
-            "Seconds between backup copy progress lines on stderr "
-            f"(default: {DEFAULT_BACKUP_PROGRESS_SECONDS})."
-        ),
-    )
-    prune.add_argument(
-        "--integrity-check-max-seconds",
-        type=_bounded_int(
-            "integrity-check-max-seconds", 1, MAX_BACKUP_BOUND_SECONDS
-        ),
-        default=DEFAULT_INTEGRITY_MAX_SECONDS,
-        help=(
-            "Abort backup integrity checking after this many seconds "
-            f"(default: {DEFAULT_INTEGRITY_MAX_SECONDS})."
-        ),
-    )
-    prune.add_argument(
-        "--integrity-progress-seconds",
-        type=_bounded_int(
-            "integrity-progress-seconds", 1, MAX_BACKUP_BOUND_SECONDS
-        ),
-        default=DEFAULT_INTEGRITY_PROGRESS_SECONDS,
-        help=(
-            "Seconds between integrity-check heartbeats on stderr "
-            f"(default: {DEFAULT_INTEGRITY_PROGRESS_SECONDS})."
-        ),
-    )
+    _add_backup_limit_arguments(prune)
     prune.add_argument("--json", action="store_true")
     return parser
 
@@ -1030,9 +1619,11 @@ def main(argv: list[str] | None = None) -> int:
         and args.apply
         and not args.backup
         and not args.no_backup
+        and not args.verified_backup_manifest
     ):
         parser.error(
-            "--apply requires either --backup PATH or --no-backup"
+            "--apply requires --backup PATH, --verified-backup-manifest "
+            "PATH, or --no-backup"
         )
     if args.command == "prune" and args.apply and not args.confirm_writers_stopped:
         parser.error(
@@ -1041,8 +1632,18 @@ def main(argv: list[str] | None = None) -> int:
             "an operator acknowledgement, not proof that all writers are "
             "stopped."
         )
+    if (
+        args.command == "backup"
+        and not args.confirm_writers_stopped
+    ):
+        parser.error(
+            "backup requires --confirm-writers-stopped: stop the dashboard, "
+            "Suricata ingest, and optional wazuh-ingest first. This flag is "
+            "an operator acknowledgement, not proof that all writers are "
+            "stopped."
+        )
 
-    readonly = args.command == "status" or (
+    readonly = args.command in {"status", "backup", "verify-backup"} or (
         args.command == "prune" and not args.apply
     )
     conn = connect_database(args.db, readonly=readonly)
@@ -1050,6 +1651,41 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             _print_payload(
                 _database_status(conn, args.db),
+                args.json,
+            )
+            return 0
+        if args.command == "backup":
+            output = create_backup_copy(
+                conn,
+                args.output,
+                limits=_backup_limits_from_args(args),
+            )
+            _print_payload(
+                {
+                    "mode": "backup",
+                    "database": str(args.db),
+                    "backup": str(output),
+                    "verified": False,
+                },
+                args.json,
+            )
+            return 0
+        if args.command == "verify-backup":
+            verification = verify_backup(
+                args.backup,
+                args.manifest,
+                source_conn=conn,
+                source_path=args.db,
+                limits=_backup_limits_from_args(args),
+            )
+            _print_payload(
+                {
+                    "mode": "verify_backup",
+                    "database": str(args.db),
+                    "backup": str(args.backup),
+                    "manifest": str(args.manifest),
+                    "verification": verification,
+                },
                 args.json,
             )
             return 0
@@ -1082,6 +1718,19 @@ def main(argv: list[str] | None = None) -> int:
                     limits=_backup_limits_from_args(args),
                 )
             )
+        elif args.verified_backup_manifest:
+            verification = validate_backup_manifest(
+                args.verified_backup_manifest,
+                source_conn=conn,
+                source_path=args.db,
+                max_age_seconds=float(
+                    args.verified_backup_max_age_seconds
+                ),
+            )
+            payload["verified_backup"] = verification["backup"]
+            payload["verification_manifest"] = str(
+                args.verified_backup_manifest
+            )
 
         def report_progress(rows: int, batches: int) -> None:
             if batches == 1 or batches % 10 == 0:
@@ -1097,6 +1746,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             pause_ms=args.pause_ms,
             max_rows=args.max_rows,
+            max_runtime_seconds=args.max_runtime_seconds,
             progress=report_progress,
         )
         payload["result"] = asdict(result)
