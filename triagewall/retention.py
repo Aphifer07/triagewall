@@ -1519,9 +1519,12 @@ def validate_backup_manifest(
             1_000,
         )
     try:
+        # This safety check is about rows inserted after the backup. Without
+        # NOT INDEXED, SQLite can choose idx_triage_processed and scan the
+        # multi-million-row expired cohort instead of the small rowid tail.
         missing_eligible_row = source_conn.execute(
             f"""SELECT 1
-                FROM triage_events
+                FROM triage_events NOT INDEXED
                 WHERE id > ? AND {predicate}
                 LIMIT 1""",
             (backup_sequence, canonical_cutoff),

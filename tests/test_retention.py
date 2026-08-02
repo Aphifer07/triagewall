@@ -550,6 +550,46 @@ class RetentionTests(unittest.TestCase):
                 ),
             )
 
+    def test_manifest_authorization_scans_only_post_backup_rowid_tail(self):
+        self.insert_event(age_days=60, signature_id=333)
+        backup_path = Path(self.temp_dir.name) / "tail.db"
+        manifest_path = Path(self.temp_dir.name) / "tail.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        self.insert_event(age_days=1, signature_id=334)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+        try:
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+                cutoff=format_utc_timestamp(
+                    self.now - timedelta(days=30)
+                ),
+            )
+        finally:
+            self.conn.set_trace_callback(None)
+
+        authorization_sql = next(
+            statement
+            for statement in statements
+            if "FROM triage_events NOT INDEXED" in statement
+            and "id >" in statement
+        )
+        plan = self.conn.execute(
+            f"EXPLAIN QUERY PLAN {authorization_sql}"
+        ).fetchall()
+        details = " ".join(str(row[-1]) for row in plan)
+        self.assertIn("INTEGER PRIMARY KEY", details)
+        self.assertNotIn("idx_triage_processed", details)
+
     def test_manifest_rejects_review_feedback_added_after_backup(self):
         event_id = self.insert_event(age_days=60, signature_id=332)
         backup_path = Path(self.temp_dir.name) / "feedback.db"
