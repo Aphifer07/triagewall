@@ -28,6 +28,10 @@ class RetentionCycleTests(unittest.TestCase):
             "services: {}\n",
             encoding="utf-8",
         )
+        (self.root / "docker-compose.wazuh.yml").write_text(
+            "services: {}\n",
+            encoding="utf-8",
+        )
         self.fake_bin = self.root / "bin"
         self.fake_bin.mkdir()
         self.docker_log = self.root / "docker.log"
@@ -61,7 +65,17 @@ printf '%s\n' "$*" >>"$FAKE_TIMEOUT_LOG"
 while [ "${1#--}" != "$1" ]; do
   shift
 done
+duration="$1"
 shift
+case " $* " in
+  *" stop "*)
+    minimum="${FAKE_MIN_STOP_TIMEOUT_SECONDS:-0}"
+    seconds="${duration%s}"
+    if [ "$seconds" -lt "$minimum" ]; then
+      exit 124
+    fi
+    ;;
+esac
 exec "$@"
 """,
         )
@@ -82,7 +96,7 @@ case " $* " in
     fi
     ;;
   *" ps --status running --services "*)
-    printf '%s\n' dashboard ingest
+    printf '%s\n' dashboard ingest wazuh-ingest
     ;;
   *" run "*" maintenance backup "*)
     if [ "${FAKE_FAIL_PHASE:-}" = "backup" ]; then
@@ -122,6 +136,8 @@ esac
         health_status: int = 200,
         max_cycles: int = 1,
         start_failures: int = 0,
+        with_wazuh: bool = False,
+        min_stop_timeout_seconds: int = 0,
     ) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
@@ -132,26 +148,32 @@ esac
         env["FAKE_START_STATE"] = str(self.root / "start.state")
         env["FAKE_START_FAILURES"] = str(start_failures)
         env["FAKE_HEALTH_STATUS"] = str(health_status)
+        env["FAKE_MIN_STOP_TIMEOUT_SECONDS"] = str(
+            min_stop_timeout_seconds
+        )
         env["TRIAGEWALL_RETENTION_LOCK"] = str(self.root / "cycle.lock")
         if fail_phase:
             env["FAKE_FAIL_PHASE"] = fail_phase
         if defer_cleanup:
             env["FAKE_DEFER_CLEANUP"] = "1"
+        command = [
+            "/bin/bash",
+            str(SCRIPT),
+            "--backup-dir",
+            str(self.backup_dir),
+            "--keep-days",
+            "60",
+            "--max-runtime-seconds",
+            "1",
+            "--cooldown-seconds",
+            "1",
+            "--max-cycles",
+            str(max_cycles),
+        ]
+        if with_wazuh:
+            command.append("--wazuh")
         return subprocess.run(
-            [
-                "/bin/bash",
-                str(SCRIPT),
-                "--backup-dir",
-                str(self.backup_dir),
-                "--keep-days",
-                "60",
-                "--max-runtime-seconds",
-                "1",
-                "--cooldown-seconds",
-                "1",
-                "--max-cycles",
-                str(max_cycles),
-            ],
+            command,
             cwd=self.root,
             env=env,
             capture_output=True,
@@ -272,7 +294,7 @@ esac
         self.assertEqual(completed.returncode, 0, completed.stderr)
         calls = self.timeout_log.read_text(encoding="utf-8").splitlines()
         self.assertTrue(
-            any("75s docker compose" in call and " stop " in call for call in calls)
+            any("150s docker compose" in call and " stop " in call for call in calls)
         )
         self.assertTrue(
             any("30s docker compose" in call and " start " in call for call in calls)
@@ -284,6 +306,20 @@ esac
                 for call in calls
             )
         )
+
+    def test_stop_deadline_covers_dependency_ordered_wazuh_shutdown(self):
+        completed = self._run(
+            with_wazuh=True,
+            min_stop_timeout_seconds=180,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.timeout_log.read_text(encoding="utf-8").splitlines()
+        stop_calls = [call for call in calls if " stop " in f" {call} "]
+        self.assertEqual(len(stop_calls), 2)
+        self.assertTrue(all("210s docker compose" in call for call in stop_calls))
+        self.assertTrue(all("-t 60" in call for call in stop_calls))
+        self.assertTrue(all("wazuh-ingest" in call for call in stop_calls))
 
 
 if __name__ == "__main__":
