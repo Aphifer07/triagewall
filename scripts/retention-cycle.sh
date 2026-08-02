@@ -30,7 +30,11 @@ health_connect_timeout_seconds=3
 health_request_timeout_seconds=5
 writer_start_timeout_seconds=30
 writer_status_timeout_seconds=10
-writer_stop_timeout_seconds=75
+# Compose can honor dependency order by stopping selected services sequentially.
+# Give every selected writer its full container grace period plus bounded
+# Docker/Compose overhead instead of applying one grace period to the graph.
+writer_stop_grace_seconds=60
+writer_stop_overhead_seconds=30
 backup_dir=""
 
 while (($#)); do
@@ -132,6 +136,10 @@ if "$with_wazuh"; then
   profiles+=(--profile wazuh)
   writers+=(wazuh-ingest)
 fi
+writer_stop_timeout_seconds=$((
+  writer_stop_grace_seconds * ${#writers[@]}
+  + writer_stop_overhead_seconds
+))
 
 compose_with_profiles=("${compose[@]}" "${profiles[@]}")
 writers_stopped=false
@@ -144,7 +152,8 @@ stop_writers() {
   writer_recovery_attempted=false
   timeout --signal=TERM --kill-after=5s \
     "${writer_stop_timeout_seconds}s" \
-    "${compose_with_profiles[@]}" stop -t 60 "${writers[@]}"
+    "${compose_with_profiles[@]}" stop \
+    -t "$writer_stop_grace_seconds" "${writers[@]}"
 }
 
 all_writers_running() {
