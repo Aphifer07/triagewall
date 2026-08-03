@@ -138,6 +138,7 @@ esac
         start_failures: int = 0,
         with_wazuh: bool = False,
         min_stop_timeout_seconds: int = 0,
+        batch_size: int | str = 500,
     ) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env['PATH']}"
@@ -163,6 +164,8 @@ esac
             str(self.backup_dir),
             "--keep-days",
             "60",
+            "--batch-size",
+            str(batch_size),
             "--max-runtime-seconds",
             "1",
             "--cooldown-seconds",
@@ -261,6 +264,34 @@ esac
         self.assertEqual(len(prune_calls), 2)
         self.assertIn("orphan cleanup deferred", completed.stdout)
         self.assertIn("retention target exhausted", completed.stdout)
+
+    def test_cycle_passes_configured_batch_size_to_every_prune(self):
+        completed = self._run(
+            defer_cleanup=True,
+            max_cycles=2,
+            batch_size=2000,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.docker_log.read_text(encoding="utf-8").splitlines()
+        prune_calls = [
+            call for call in calls if " maintenance prune " in call
+        ]
+        self.assertEqual(len(prune_calls), 2)
+        self.assertTrue(
+            all("--batch-size 2000" in call for call in prune_calls)
+        )
+
+    def test_cycle_rejects_batch_sizes_outside_retention_cli_bounds(self):
+        for value in (0, 10001, "not-a-number"):
+            with self.subTest(value=value):
+                completed = self._run(batch_size=value)
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn(
+                    "batch_size must be an integer from 1 through 10000",
+                    completed.stderr,
+                )
 
     def test_recovery_accepts_dashboard_stale_status_for_quiet_stream(self):
         completed = self._run(health_status=503)

@@ -8,6 +8,7 @@ Usage:
 
 Options:
   --keep-days DAYS             Retain this many days (default: 60)
+  --batch-size ROWS            Rows per delete transaction (default: 500; max: 10000)
   --max-runtime-seconds SEC    Maximum full prune pause (default: 900)
   --cooldown-seconds SEC       Live catch-up time between pauses (default: 1800)
   --max-cycles COUNT           Maximum deletion pauses (default: 12)
@@ -21,6 +22,7 @@ EOF
 }
 
 keep_days=60
+batch_size=500
 max_runtime_seconds=900
 cooldown_seconds=1800
 max_cycles=12
@@ -45,6 +47,10 @@ while (($#)); do
       ;;
     --keep-days)
       keep_days="${2:-}"
+      shift 2
+      ;;
+    --batch-size)
+      batch_size="${2:-}"
       shift 2
       ;;
     --max-runtime-seconds)
@@ -86,6 +92,11 @@ for value_name in keep_days max_runtime_seconds cooldown_seconds max_cycles; do
     exit 2
   fi
 done
+
+if [[ ! "$batch_size" =~ ^[0-9]+$ ]] || ((batch_size < 1 || batch_size > 10000)); then
+  echo "retention cycle: batch_size must be an integer from 1 through 10000" >&2
+  exit 2
+fi
 
 if [[ -z "$backup_dir" ]]; then
   echo "retention cycle: --backup-dir is required" >&2
@@ -298,6 +309,7 @@ while ((cycle <= max_cycles)); do
     --apply \
     --confirm-writers-stopped \
     --verified-backup-manifest "$result_container_manifest" \
+    --batch-size "$batch_size" \
     --max-runtime-seconds "$max_runtime_seconds" \
     --json >"$result_host_path"; then
     echo "retention cycle: prune pause $cycle failed" >&2

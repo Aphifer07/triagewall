@@ -225,12 +225,19 @@ sudo systemd-run \
   /opt/triagewall/scripts/retention-cycle.sh \
   --backup-dir /mnt/triagewall-backups \
   --keep-days 60 \
+  --batch-size 500 \
   --wazuh
 ```
 
 Replace both example paths with the actual deployment and backup locations.
 Omit `--wazuh` when the optional connector is disabled. A Wi-Fi or SSH
 disconnect does not stop the systemd service.
+
+The host runner defaults to 500 rows per delete transaction. Operators may set
+`--batch-size` from 1 through 10,000 after benchmarking a disposable database
+copy on the deployment storage. Larger batches can reduce repeated query work,
+but increase each transaction's WAL use and rollback unit; do not copy a tuning
+value from another installation without measuring it locally.
 
 ```bash
 systemctl status triagewall-retention-cycle
