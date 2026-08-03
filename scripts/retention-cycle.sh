@@ -93,7 +93,16 @@ for value_name in keep_days max_runtime_seconds cooldown_seconds max_cycles; do
   fi
 done
 
-if [[ ! "$batch_size" =~ ^[0-9]+$ ]] || ((batch_size < 1 || batch_size > 10000)); then
+batch_size_decimal=""
+if [[ "$batch_size" =~ ^0*([1-9][0-9]*|0)$ ]]; then
+  batch_size_decimal="${BASH_REMATCH[1]}"
+fi
+if [[ -z "$batch_size_decimal" ]] || ((${#batch_size_decimal} > 5)); then
+  echo "retention cycle: batch_size must be an integer from 1 through 10000" >&2
+  exit 2
+fi
+batch_size=$((10#$batch_size_decimal))
+if ((batch_size < 1 || batch_size > 10000)); then
   echo "retention cycle: batch_size must be an integer from 1 through 10000" >&2
   exit 2
 fi

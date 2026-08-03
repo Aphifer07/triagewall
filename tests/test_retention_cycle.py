@@ -282,8 +282,18 @@ esac
             all("--batch-size 2000" in call for call in prune_calls)
         )
 
+    def test_cycle_normalizes_leading_zero_batch_size_as_decimal(self):
+        completed = self._run(batch_size="00002000")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        calls = self.docker_log.read_text(encoding="utf-8").splitlines()
+        prune_call = next(
+            call for call in calls if " maintenance prune " in call
+        )
+        self.assertIn("--batch-size 2000", prune_call)
+
     def test_cycle_rejects_batch_sizes_outside_retention_cli_bounds(self):
-        for value in (0, 10001, "not-a-number"):
+        for value in (0, 10001, "010001", "not-a-number"):
             with self.subTest(value=value):
                 completed = self._run(batch_size=value)
 
