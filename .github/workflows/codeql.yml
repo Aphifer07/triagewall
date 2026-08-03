@@ -23,13 +23,13 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@v4.37.4
         with:
           languages: python
           # security-extended adds more security queries than the default suite
           queries: security-extended
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@v4.37.4
         with:
           category: "/language:python"
