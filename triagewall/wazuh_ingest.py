@@ -22,10 +22,10 @@ from ingest import (
     CHECKPOINT_LINE,
     PROCESSED_LINE,
     RETRY_LINE,
-    ensure_db_initialized,
     insert_with_retry,
     quarantine_line,
 )
+from migrations import verify_db_initialized
 from triage import MODEL, call_ollama_wazuh, get_asset_context
 from wazuh_event import (
     WazuhValidationError,
@@ -506,9 +506,15 @@ def process_available(conn, state: dict) -> StreamResult:
 def tail_wazuh() -> int:
     try:
         validate_config()
-        ensure_db_initialized(DB_PATH)
+        verify_db_initialized(DB_PATH)
         state = load_position() or initialize_position()
-    except (OSError, ValueError, WazuhCheckpointError) as exc:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        sqlite3.Error,
+        WazuhCheckpointError,
+    ) as exc:
         log.critical("Wazuh ingest startup failed: %s", exc)
         return 1
 

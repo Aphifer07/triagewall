@@ -12,7 +12,7 @@ import os
 import json
 import ipaddress
 import sqlite3
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urlsplit
@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from triagewall.dashboard.stats import get_dashboard_stats
 from triagewall.database import connect_database
 from triagewall.environment import parse_boolean
+from triagewall.migrations import verify_db_initialized
 from triagewall.storage import get_storage_metrics
 from triagewall.time_utils import (
     format_utc_timestamp,
@@ -90,7 +91,14 @@ TRUSTED_HOSTS = {
     if host.strip()
 }
 
-app = FastAPI(title="Triage Dashboard")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Refuse to serve from a database that the migration owner did not prepare."""
+    verify_db_initialized(DB_PATH)
+    yield
+
+
+app = FastAPI(title="Triage Dashboard", lifespan=lifespan)
 
 # --- Helpers -----------------------------------------------------------------
 

@@ -167,14 +167,19 @@ when the network between Core and Ollama is not fully trusted.
 authentication. Do not port-forward the dashboard; use a VPN or authenticated
 reverse proxy for remote access.
 
-**Retention is not automated.** Long-running, high-volume deployments can
-produce large SQLite databases. Operators must monitor storage until a bounded,
-tested retention and archival workflow ships.
+**Retention remains an operator-controlled maintenance action.** The bounded,
+backup-first host runner restores monitoring between short deletion pauses and
+fails closed when its safety evidence is missing. It does not choose a site's
+retention window, delete reviewed verdicts by default, shrink the database
+file, or replace off-host backup policy. High-volume installations should use
+SSD-class active storage and keep verified backups on a separate failure
+domain.
 
-**Concurrent startup migrations currently retry rather than use one explicit
-migration owner.** This is fail-closed, but optional ingest services can contend
-for SQLite schema work on startup. A serialized migration phase is planned for
-release closeout.
+**Startup serialization depends on the Compose boundary.** The one-shot
+`migrate` service is the sole schema owner and all shipped consumers wait for
+its successful completion. Directly launching an ingest script outside
+Compose requires the operator to run `triagewall/migrate.py` first; consumers
+then verify the schema read-only and fail closed rather than repairing it.
 
 ## Assumptions
 

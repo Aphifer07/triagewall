@@ -43,10 +43,11 @@ CodeQL coverage are implemented.
 
 The release is in closeout rather than tagged as complete. The current
 multi-sensor build has been exercised against live Suricata and Wazuh streams;
-remaining work is concentrated on release preparation, a deliberate retention
-policy for long-running databases, and serializing startup migrations so
-optional ingest services do not compete for schema work. The existing Core
-installation remains the supported operational product throughout this work.
+bounded backup-first retention and a single-owner startup migration phase are
+implemented. Remaining work is concentrated on multi-source security and
+accuracy gates plus fresh-install, upgrade, rollback, Core-only, and
+Core-plus-Wazuh release evidence. The existing Core installation remains the
+supported operational product throughout this work.
 
 ### Foundation from v0.2
 
@@ -86,8 +87,6 @@ cp .env.example .env
 # Try it without real data first:
 # Set DEMO_MODE=true in .env, then:
 docker compose up -d        # Docker Compose v2+
-# OR
-docker-compose up -d        # Older Docker / Compose v1
 
 # Open http://localhost:8084 to see the dashboard with sample alerts.
 
@@ -105,6 +104,31 @@ docker-compose up -d        # Older Docker / Compose v1
 ```
 
 You'll need [Ollama](https://ollama.com) running somewhere reachable on your network, with at least one compatible model pulled. The Ollama instance can be on the same host or a separate GPU node.
+
+### Serialized database startup
+
+Docker Compose runs a one-shot `migrate` service before dashboard, Suricata
+ingest, or optional Wazuh ingest can start. It is the only startup process that
+creates tables, adds columns, or builds indexes. The consumers perform a
+read-only schema check and fail closed if the migration did not complete.
+Docker Compose v2 is required because startup uses
+`service_completed_successfully` dependency conditions.
+
+On a fresh installation, `docker compose up -d` creates the database through
+this migration phase automatically. On an existing large database, index work
+may take several minutes; do not interrupt the migration just because its log
+output is quiet. Inspect it with:
+
+```bash
+docker compose ps -a migrate
+docker compose logs migrate
+```
+
+A migration failure blocks the dependent services instead of allowing them to
+race or run against a partial schema. Correct the reported storage, permission,
+or database problem, then run `docker compose up -d` again. Direct, non-Compose
+ingest use must run `python3 triagewall/migrate.py` once before starting either
+ingest process.
 
 The asset inventory follows the versioned contract in
 [`triagewall/config/assets.example.json`](triagewall/config/assets.example.json).
@@ -238,6 +262,11 @@ The host runner defaults to 500 rows per delete transaction. Operators may set
 copy on the deployment storage. Larger batches can reduce repeated query work,
 but increase each transaction's WAL use and rollback unit; do not copy a tuning
 value from another installation without measuring it locally.
+
+Large or sustained installations should place `HOST_DATA_DIR` on SSD-class
+storage. Bounded deletion remains safe on rotational disks, but indexed delete
+work can be substantially slower even when the SQLite file is not fragmented.
+Keep verified backups on a different failure domain from the active database.
 
 ```bash
 systemctl status triagewall-retention-cycle
@@ -416,8 +445,8 @@ See [ROADMAP.md](ROADMAP.md) for the full plan. Highlights:
 **Core v0.3 closeout:** prepare the production release that unifies Suricata
 and actionable Wazuh alerts with source provenance, trusted asset context,
 hostile-field isolation, durable recovery, and source-aware dashboard output.
-Closeout now focuses on retention, serialized startup migrations, and release
-evidence rather than new sensor scope.
+Closeout now focuses on multi-source Garak coverage, gold-set validation, and
+release evidence rather than new sensor scope.
 
 **Core operational usability:** add a bounded alert-detail view, source and
 time filtering, IP and asset filtering, saved views, and structured JSON

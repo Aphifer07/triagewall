@@ -60,6 +60,8 @@ replays the current live file.
 docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh config --quiet
 docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh up -d --build
 docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh ps
+docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh ps -a migrate
+docker compose -f docker-compose.yml -f docker-compose.wazuh.yml logs migrate
 docker compose -f docker-compose.yml -f docker-compose.wazuh.yml logs --tail=100 wazuh-ingest
 ```
 
