@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 """
-Triagewall v0.2 model benchmark.
+Triagewall v0.2 model benchmark. NOT a release gate -- see scripts/gold_gate.py.
+
+This script compares candidate models against each other. It does NOT measure
+the shipping pipeline, and its results must never be used as release evidence
+or as a performance baseline. It diverges from production in ways that each
+change the measured outcome:
+
+  - it carries a stale copy of the v0.2 system prompt, missing the security
+    policy and untrusted-field convention sections production sends;
+  - it sends the raw alert JSON instead of the isolated projection from
+    field_isolation.format_alert_for_llm, so free text production base64-wraps
+    reaches the model as plaintext;
+  - it does not run the prefilter, so alerts production never sends to a model
+    are scored as if the model had decided them;
+  - it coerces invalid model output into "uncertain" rather than failing
+    closed, and it does not enforce the response schema or check the canary;
+  - it uses num_predict=250 against production's 512, and covers Suricata only.
+
+The published v0.2-alpha figures (Cohen's kappa 0.687, 83% true-positive
+recall) come from this harness and therefore describe the v0.2 pipeline, not
+the multi-source v0.3 pipeline. Use scripts/gold_gate.py for anything that
+gates a release.
 
 Evaluates multiple Ollama models against the human-labeled ground-truth set
 in triage.db. Produces per-model CSVs and a summary markdown report.
