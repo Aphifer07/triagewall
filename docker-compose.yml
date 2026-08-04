@@ -1,4 +1,26 @@
 services:
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command:
+      - python3
+      - triagewall/migrate.py
+    environment:
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONDONTWRITEBYTECODE: "1"
+      DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    restart: "no"
+
   ingest:
     build:
       context: .
@@ -26,6 +48,9 @@ services:
       - ${HOST_EVE_DIR:-./data}:/var/log/suricata:ro
       - ./triagewall/config/prefilter.json:/app/triagewall/config/prefilter.json:ro
       - ${HOST_ASSET_INVENTORY:-./triagewall/config/assets.example.json}:/app/triagewall/config/assets.json:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   dashboard:
@@ -54,7 +79,10 @@ services:
     ports:
       - "${DASHBOARD_PORT:-8084}:${DASHBOARD_PORT:-8084}"
     depends_on:
-      - ingest
+      migrate:
+        condition: service_completed_successfully
+      ingest:
+        condition: service_started
     restart: unless-stopped
 
   maintenance:

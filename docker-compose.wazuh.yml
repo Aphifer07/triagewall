@@ -41,6 +41,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:

@@ -102,10 +102,10 @@ complete.
 
 #### Closeout
 
-- [ ] **Retention policy and storage visibility.** Define a safe hot-data
+- [x] **Retention policy and storage visibility.** Define a safe hot-data
   window, archive or prune workflow, operator controls, and database-size
   reporting. Do not apply an unbounded delete to a live database.
-- [ ] **Serialized migration phase.** Ensure one startup owner performs schema
+- [x] **Serialized migration phase.** Ensure one startup owner performs schema
   work before Suricata and optional Wazuh ingest begin, avoiding lock races on
   large databases.
 - [ ] **Release evidence.** Record supported fresh-install, upgrade, rollback,

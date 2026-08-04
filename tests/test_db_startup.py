@@ -2,9 +2,9 @@
 """Regression tests for database schema setup during ingest startup."""
 
 import sqlite3
+import re
 import sys
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +13,7 @@ from unittest.mock import patch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "triagewall"))
 
-import ingest
+import migrations
 
 
 EXPECTED_INDEXES = {
@@ -100,25 +100,11 @@ def create_legacy_database_without_asset_columns(db_path: Path) -> None:
 
 
 class DatabaseStartupTests(unittest.TestCase):
-    def test_concurrent_startup_creates_sensor_schema_once(self):
+    def test_migration_owner_creates_complete_schema(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "triage.db"
-            errors = []
-
-            def initialize():
-                try:
-                    with patch.object(ingest, "DB_PATH", db_path):
-                        ingest.ensure_db_initialized()
-                except Exception as exc:  # pragma: no cover - assertion reports it
-                    errors.append(exc)
-
-            workers = [threading.Thread(target=initialize) for _ in range(2)]
-            for worker in workers:
-                worker.start()
-            for worker in workers:
-                worker.join()
-
-            self.assertEqual(errors, [])
+            migrations.ensure_db_initialized(db_path)
+            migrations.verify_db_initialized(db_path)
             conn = sqlite3.connect(db_path)
             try:
                 context_table = conn.execute(
@@ -135,21 +121,25 @@ class DatabaseStartupTests(unittest.TestCase):
                     row[1]
                     for row in conn.execute("PRAGMA table_info('ingest_failures')")
                 }
+                spc_table = conn.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type = 'table' AND name = 'spc_anomalies'"""
+                ).fetchone()
             finally:
                 conn.close()
 
             self.assertEqual(context_table, ("sensor_event_context",))
             self.assertIn(SENSOR_IDENTITY_INDEX, context_indexes)
             self.assertIn("source_type", failure_columns)
+            self.assertEqual(spc_table, ("spc_anomalies",))
 
     def test_existing_database_receives_idempotent_asset_metadata_migration(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "triage.db"
             create_legacy_database_without_asset_columns(db_path)
 
-            with patch.object(ingest, "DB_PATH", db_path):
-                ingest.ensure_db_initialized()
-                ingest.ensure_db_initialized()
+            migrations.ensure_db_initialized(db_path)
+            migrations.ensure_db_initialized(db_path)
 
             conn = sqlite3.connect(db_path)
             try:
@@ -195,9 +185,8 @@ class DatabaseStartupTests(unittest.TestCase):
             db_path = Path(temp_dir) / "triage.db"
             create_existing_database_without_indexes(db_path)
 
-            with patch.object(ingest, "DB_PATH", db_path):
-                ingest.ensure_db_initialized()
-                ingest.ensure_db_initialized()
+            migrations.ensure_db_initialized(db_path)
+            migrations.ensure_db_initialized(db_path)
 
             conn = sqlite3.connect(db_path)
             try:
@@ -223,6 +212,79 @@ class DatabaseStartupTests(unittest.TestCase):
                 existing_row,
                 (999999, "Existing test alert", "uncertain"),
             )
+
+    def test_non_owner_fails_closed_on_uninitialized_database(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "triage.db"
+            sqlite3.connect(db_path).close()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "run the migration owner first",
+            ):
+                migrations.verify_db_initialized(db_path)
+
+    def test_failed_schema_step_rolls_back_legacy_column_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "triage.db"
+            create_legacy_database_without_asset_columns(db_path)
+            original_execute = migrations._execute_statements
+            calls = 0
+
+            def fail_second_script(conn, script):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise sqlite3.OperationalError("simulated schema failure")
+                original_execute(conn, script)
+
+            with patch.object(
+                migrations,
+                "_execute_statements",
+                side_effect=fail_second_script,
+            ), self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "simulated schema failure",
+            ):
+                migrations.ensure_db_initialized(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info('triage_events')")
+                }
+            finally:
+                conn.close()
+
+            self.assertNotIn("src_asset_snapshot_id", columns)
+            self.assertNotIn("dest_asset_snapshot_id", columns)
+
+    def test_compose_assigns_one_migration_owner_before_consumers(self):
+        base = (PROJECT_ROOT / "docker-compose.yml").read_text()
+        wazuh = (PROJECT_ROOT / "docker-compose.wazuh.yml").read_text()
+        ingest_source = (PROJECT_ROOT / "triagewall" / "ingest.py").read_text()
+        dashboard_source = (
+            PROJECT_ROOT / "triagewall" / "dashboard" / "app.py"
+        ).read_text()
+        wazuh_source = (
+            PROJECT_ROOT / "triagewall" / "wazuh_ingest.py"
+        ).read_text()
+
+        self.assertEqual(
+            len(re.findall(r"^  migrate:$", base, flags=re.MULTILINE)),
+            1,
+        )
+        self.assertIn("triagewall/migrate.py", base)
+        self.assertGreaterEqual(
+            base.count("condition: service_completed_successfully"),
+            2,
+        )
+        self.assertIn("condition: service_completed_successfully", wazuh)
+        self.assertNotIn("ensure_db_initialized", ingest_source)
+        self.assertNotIn("ensure_spc_schema", ingest_source)
+        self.assertNotIn("ensure_db_initialized", wazuh_source)
+        self.assertIn("verify_db_initialized(DB_PATH)", dashboard_source)
 
 
 if __name__ == "__main__":

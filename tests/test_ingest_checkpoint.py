@@ -16,6 +16,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "triagewall"))
 
 import ingest
+import migrations
 import triage
 from sensor_event import (
     normalize_suricata_event,
@@ -132,6 +133,7 @@ class IngestCheckpointTests(unittest.TestCase):
             position_path.write_text(json.dumps({"offset": 0, "inode": None, "size": 0}))
             verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
             calls = []
+            migrations.ensure_db_initialized(db_path)
 
             def return_verdict(event, asset_context=None):
                 self.assertEqual(
@@ -210,6 +212,7 @@ class IngestCheckpointTests(unittest.TestCase):
             eve_path.write_text(first + second)
             position_path.write_text(json.dumps({"offset": 0, "inode": None, "size": 0}))
             calls = []
+            migrations.ensure_db_initialized(db_path)
 
             def process_once(conn, line):
                 calls.append(line)
@@ -264,6 +267,7 @@ class IngestCheckpointTests(unittest.TestCase):
                 expected_offset = handle.tell()
             position_path.write_text(json.dumps({"offset": 0, "inode": None, "size": 0}))
             calls = []
+            migrations.ensure_db_initialized(db_path)
 
             def fail_then_succeed(conn, line):
                 calls.append(line)

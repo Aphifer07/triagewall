@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from database import connect_database
 from environment import parse_boolean
+from migrations import verify_db_initialized
 from time_utils import format_utc_timestamp, utc_now_iso
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -110,69 +111,6 @@ def _handle_signal(signum, frame):
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
-
-
-def ensure_db_initialized(db_path=None):
-    """Create the database if needed and apply idempotent schema updates."""
-    target_path = Path(db_path) if db_path is not None else DB_PATH
-    os.makedirs(target_path.parent, exist_ok=True)
-
-    schema_path = Path(__file__).parent / "schema.sql"
-    schema_sql = schema_path.read_text()
-
-    for attempt in range(5):
-        conn = None
-        try:
-            conn = connect_database(target_path)
-            conn.execute("BEGIN IMMEDIATE")
-            event_table_exists = conn.execute(
-                """SELECT 1 FROM sqlite_master
-                   WHERE type = 'table' AND name = 'triage_events'"""
-            ).fetchone()
-            if event_table_exists:
-                event_columns = {
-                    row[1]
-                    for row in conn.execute("PRAGMA table_info('triage_events')")
-                }
-                for column_name in (
-                    "src_asset_snapshot_id",
-                    "dest_asset_snapshot_id",
-                ):
-                    if column_name not in event_columns:
-                        conn.execute(
-                            f"ALTER TABLE triage_events "
-                            f"ADD COLUMN {column_name} INTEGER"
-                        )
-            failure_table_exists = conn.execute(
-                """SELECT 1 FROM sqlite_master
-                   WHERE type = 'table' AND name = 'ingest_failures'"""
-            ).fetchone()
-            if failure_table_exists:
-                failure_columns = {
-                    row[1]
-                    for row in conn.execute(
-                        "PRAGMA table_info('ingest_failures')"
-                    )
-                }
-                if "source_type" not in failure_columns:
-                    conn.execute(
-                        "ALTER TABLE ingest_failures ADD COLUMN source_type TEXT "
-                        "NOT NULL DEFAULT 'suricata'"
-                    )
-            conn.commit()
-            conn.executescript(schema_sql)
-            break
-        except sqlite3.OperationalError as exc:
-            if conn is not None:
-                conn.rollback()
-            if "locked" not in str(exc).lower() or attempt == 4:
-                raise
-            time.sleep(0.1 * (2**attempt))
-        finally:
-            if conn is not None:
-                conn.close()
-
-    log.info("Ensured database schema and indexes from schema.sql")
 
 
 def load_position():
@@ -386,11 +324,10 @@ def demo_loop():
         log.error("Demo fixtures file is empty (expected JSON-Lines).")
         sys.exit(1)
 
-    ensure_db_initialized()
+    verify_db_initialized(DB_PATH)
 
     log.info(f"Demo fixtures loaded: {len(demo_lines)} alerts")
     conn = connect_database(DB_PATH)
-    spc.ensure_spc_schema(conn)
 
     try:
         while not _stop:
@@ -413,7 +350,7 @@ def tail_file():
         log.error("  3. Make sure the file exists on the host before starting the container")
         sys.exit(1)
 
-    ensure_db_initialized()
+    verify_db_initialized(DB_PATH)
 
     log.info(f"Starting ingest daemon")
     log.info(f"  eve.json: {EVE_PATH}")
@@ -423,7 +360,6 @@ def tail_file():
 
     state = load_position()
     conn = connect_database(DB_PATH)
-    spc.ensure_spc_schema(conn)
     last_line_seen_ts = time.time()
     last_stall_warning_ts = 0.0
 
@@ -549,9 +485,18 @@ def tail_file():
     log.info("Ingest daemon stopped cleanly")
 
 
+def main() -> int:
+    try:
+        if DEMO_MODE:
+            log.info("Running in DEMO MODE using local fixtures...")
+            demo_loop()
+        else:
+            tail_file()
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        log.critical("Suricata ingest startup failed: %s", exc)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    if DEMO_MODE:
-        log.info("Running in DEMO MODE using local fixtures...")
-        demo_loop()
-    else:
-        tail_file()
+    sys.exit(main())
