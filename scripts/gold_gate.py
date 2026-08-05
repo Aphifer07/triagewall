@@ -496,6 +496,26 @@ def _require_keys(value, expected: set[str], location: str) -> None:
     _require(not unknown, f"{location} has unknown keys {sorted(unknown)}")
 
 
+def _round_floats(value, places: int = 9):
+    """
+    Round nested floats so recomputed metrics compare stably.
+
+    Derived metrics are recomputed from the confusion matrix and compared
+    against the recorded values. Rounding keeps that comparison robust to
+    float formatting across platforms while staying far tighter than any
+    change that could hide a real regression.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return round(value, places)
+    if isinstance(value, dict):
+        return {key: _round_floats(item, places) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_round_floats(item, places) for item in value]
+    return value
+
+
 def _require_number(value, location: str) -> None:
     _require(
         isinstance(value, (int, float)) and not isinstance(value, bool),
@@ -543,6 +563,22 @@ def _validate_metrics(value, location: str) -> None:
         )
         _require_counts(row, f"{location}.confusion.{label}")
 
+    # Every scalar here is a function of the confusion matrix, so trusting the
+    # recorded values would let a stale or hand-edited manifest report approved
+    # numbers over degraded results. Derive them again and reject any
+    # disagreement.
+    derived = summarize(value["confusion"])
+    for key in ("scored", "accuracy", "kappa", "true_positive_recall"):
+        _require(
+            _round_floats(value[key]) == _round_floats(derived[key]),
+            f"{location}.{key} does not match the recorded confusion matrix "
+            f"(recorded {value[key]!r}, derived {derived[key]!r})",
+        )
+    _require(
+        _round_floats(value["classes"]) == _round_floats(derived["classes"]),
+        f"{location}.classes does not match the recorded confusion matrix",
+    )
+
 
 def validate_evidence(manifest) -> dict:
     """Validate an evidence manifest strictly. Unknown or missing keys fail."""
@@ -585,6 +621,15 @@ def validate_evidence(manifest) -> dict:
             isinstance(value, str) and value.startswith("sha256:"),
             f"behavior_fingerprint.components.{name} must be a sha256 digest",
         )
+    # `verify_baseline` decides whether evidence is current from `combined`
+    # alone. Recompute it from the components so the digest cannot be edited
+    # to look current while the components and metrics stay stale.
+    _require(
+        digest(fingerprint["components"]) == fingerprint["combined"],
+        "behavior_fingerprint.combined does not match its components; "
+        "evidence cannot be edited to appear current without a fresh "
+        "operator evaluation",
+    )
 
     _require_keys(manifest["asset_inventory"], {"revision", "count"}, "asset_inventory")
     _require_keys(
@@ -608,6 +653,15 @@ def validate_evidence(manifest) -> dict:
     _require_keys(manifest["metrics"], {"pipeline", "model_only"}, "metrics")
     _validate_metrics(manifest["metrics"]["pipeline"], "metrics.pipeline")
     _validate_metrics(manifest["metrics"]["model_only"], "metrics.model_only")
+
+    # An evaluation scores exactly the rows in the pipeline confusion matrix,
+    # so a run block claiming a different total has been edited or truncated.
+    _require(
+        manifest["run"]["scored"] == manifest["metrics"]["pipeline"]["scored"],
+        "run.scored disagrees with metrics.pipeline.scored "
+        f"({manifest['run']['scored']} vs "
+        f"{manifest['metrics']['pipeline']['scored']})",
+    )
     return manifest
 
 

@@ -347,38 +347,65 @@ class MetricsTests(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
-def sample_evidence(**overrides):
-    metrics = gold_gate.summarize(
-        {
-            "real": {"real": 8, "false_positive": 2},
-            "false_positive": {"false_positive": 20},
-        }
+# Confusion matrices used to build consistent evidence. Scalar metrics are
+# derived from these rather than written by hand, because validation now
+# recomputes them and rejects any disagreement.
+BASELINE_CONFUSION = {
+    "real": {"real": 80, "false_positive": 20},
+    "false_positive": {"false_positive": 200},
+}
+SLIGHTLY_WORSE_CONFUSION = {
+    "real": {"real": 78, "false_positive": 22},
+    "false_positive": {"false_positive": 200},
+}
+MUCH_WORSE_CONFUSION = {
+    "real": {"real": 40, "false_positive": 60},
+    "false_positive": {"false_positive": 200},
+}
+BETTER_CONFUSION = {
+    "real": {"real": 95, "false_positive": 5},
+    "false_positive": {"false_positive": 200},
+}
+
+
+def fingerprint_block(components=None):
+    """Build an internally consistent fingerprint block."""
+    components = components or {"model_identity": "sha256:" + "1" * 64}
+    return {
+        "combined": gold_gate.digest(components),
+        "components": components,
+        "coverage": {},
+    }
+
+
+def sample_evidence(pipeline=None, model_only=None, **overrides):
+    pipeline_metrics = gold_gate.summarize(
+        copy.deepcopy(pipeline or BASELINE_CONFUSION)
+    )
+    model_only_metrics = gold_gate.summarize(
+        copy.deepcopy(model_only or pipeline or BASELINE_CONFUSION)
     )
     evidence = {
         "manifest_version": 1,
         "kind": gold_gate.EVIDENCE_KIND,
         "generated_at": "2026-08-04T00:00:00+00:00",
         "commit": "a7bb499",
-        "behavior_fingerprint": {
-            "combined": "sha256:" + "0" * 64,
-            "components": {"model_identity": "sha256:" + "1" * 64},
-            "coverage": {},
-        },
+        "behavior_fingerprint": fingerprint_block(),
         "asset_inventory": {"revision": "sha256:" + "2" * 64, "count": 1},
         "dataset": {
             "revision": "sha256:" + "3" * 64,
-            "total": 30,
-            "class_counts": {"real": 10, "false_positive": 20},
-            "source_counts": {"suricata": 30},
+            "total": 320,
+            "class_counts": {"real": 100, "false_positive": 220},
+            "source_counts": {"suricata": 300, "wazuh": 20},
         },
         "run": {
             "completed": True,
-            "scored": 30,
-            "prefilter_resolved": 4,
+            "scored": pipeline_metrics["scored"],
+            "prefilter_resolved": 40,
             "errors": {"transport": 0, "unexpected": 0},
             "invalid_output": 0,
         },
-        "metrics": {"pipeline": metrics, "model_only": copy.deepcopy(metrics)},
+        "metrics": {"pipeline": pipeline_metrics, "model_only": model_only_metrics},
     }
     evidence.update(overrides)
     return evidence
@@ -463,6 +490,53 @@ class EvidenceSchemaTests(unittest.TestCase):
         with self.assertRaises(GoldGateError):
             gold_gate.validate_evidence(evidence)
 
+    def test_edited_combined_digest_is_rejected(self):
+        """
+        The combined digest decides whether evidence is current, so it must be
+        recomputed. Pointing it at the live fingerprint while leaving stale
+        components behind must not make the gate look satisfied.
+        """
+        evidence = sample_evidence()
+        evidence["behavior_fingerprint"]["combined"] = "sha256:" + "a" * 64
+        with self.assertRaises(GoldGateError) as ctx:
+            gold_gate.validate_evidence(evidence)
+        self.assertIn("does not match its components", str(ctx.exception))
+
+    def test_edited_kappa_inconsistent_with_confusion_is_rejected(self):
+        """A degraded matrix must not be shipped under approved scalars."""
+        evidence = sample_evidence(pipeline=MUCH_WORSE_CONFUSION)
+        approved = gold_gate.summarize(BASELINE_CONFUSION)
+        evidence["metrics"]["pipeline"]["kappa"] = approved["kappa"]
+        with self.assertRaises(GoldGateError) as ctx:
+            gold_gate.validate_evidence(evidence)
+        self.assertIn("does not match the recorded confusion matrix", str(ctx.exception))
+
+    def test_edited_true_positive_recall_is_rejected(self):
+        evidence = sample_evidence()
+        evidence["metrics"]["pipeline"]["true_positive_recall"] = 0.99
+        with self.assertRaises(GoldGateError):
+            gold_gate.validate_evidence(evidence)
+
+    def test_edited_per_class_metrics_are_rejected(self):
+        evidence = sample_evidence()
+        evidence["metrics"]["pipeline"]["classes"]["real"]["recall"] = 0.99
+        with self.assertRaises(GoldGateError) as ctx:
+            gold_gate.validate_evidence(evidence)
+        self.assertIn("classes does not match", str(ctx.exception))
+
+    def test_run_scored_must_agree_with_pipeline_metrics(self):
+        evidence = sample_evidence()
+        evidence["run"]["scored"] = evidence["run"]["scored"] + 5
+        with self.assertRaises(GoldGateError) as ctx:
+            gold_gate.validate_evidence(evidence)
+        self.assertIn("run.scored disagrees", str(ctx.exception))
+
+    def test_consistent_evidence_from_a_real_evaluation_validates(self):
+        """The recomputation must accept genuine output, not just reject edits."""
+        self.assertIsNotNone(
+            gold_gate.validate_evidence(sample_evidence(pipeline=BETTER_CONFUSION))
+        )
+
 
 class BaselineSchemaTests(unittest.TestCase):
     def test_committed_baseline_validates(self):
@@ -533,11 +607,16 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(gold_gate.verify_baseline(baseline, self.fingerprint), [])
 
     def test_stale_evidence_is_rejected_and_names_the_changed_component(self):
+        """
+        Evidence recorded before a model change: internally consistent, so it
+        passes schema validation, but no longer describes the live pipeline.
+        """
         evidence = sample_evidence()
         stale = copy.deepcopy(self.fingerprint)
         stale["components"]["model_identity"] = "sha256:" + "f" * 64
-        stale["combined"] = "sha256:" + "e" * 64
+        stale["combined"] = gold_gate.digest(stale["components"])
         evidence["behavior_fingerprint"] = stale
+        gold_gate.validate_evidence(evidence)  # consistent, just out of date
         failures = gold_gate.verify_baseline(approved_baseline(evidence), self.fingerprint)
         self.assertEqual(len(failures), 1)
         self.assertIn("guarded production inputs changed", failures[0])
@@ -557,39 +636,36 @@ class CompareTests(unittest.TestCase):
             gold_gate.compare_evidence(approved_baseline(), sample_evidence()), []
         )
 
-    def test_kappa_drop_within_tolerance_passes(self):
-        candidate = sample_evidence()
-        candidate["metrics"]["pipeline"]["kappa"] -= 0.04
+    def test_small_degradation_within_tolerance_passes(self):
+        candidate = sample_evidence(pipeline=SLIGHTLY_WORSE_CONFUSION)
         self.assertEqual(
             gold_gate.compare_evidence(approved_baseline(), candidate), []
         )
 
     def test_kappa_drop_beyond_tolerance_fails(self):
-        candidate = sample_evidence()
-        candidate["metrics"]["pipeline"]["kappa"] -= 0.2
+        candidate = sample_evidence(pipeline=MUCH_WORSE_CONFUSION)
         failures = gold_gate.compare_evidence(approved_baseline(), candidate)
         self.assertTrue(any("Cohen's kappa fell" in f for f in failures))
 
-    def test_kappa_improvement_never_fails(self):
-        candidate = sample_evidence()
-        candidate["metrics"]["pipeline"]["kappa"] += 0.3
-        candidate["metrics"]["model_only"]["kappa"] += 0.3
+    def test_improvement_never_fails(self):
+        candidate = sample_evidence(pipeline=BETTER_CONFUSION)
         self.assertEqual(
             gold_gate.compare_evidence(approved_baseline(), candidate), []
         )
 
     def test_true_positive_recall_drop_fails(self):
-        candidate = sample_evidence()
-        candidate["metrics"]["pipeline"]["true_positive_recall"] -= 0.2
+        candidate = sample_evidence(pipeline=MUCH_WORSE_CONFUSION)
         failures = gold_gate.compare_evidence(approved_baseline(), candidate)
         self.assertTrue(any("true-positive recall fell" in f for f in failures))
 
     def test_model_only_regression_is_caught_even_if_pipeline_holds(self):
         """The prefilter can mask a model regression; both scopes are gated."""
-        candidate = sample_evidence()
-        candidate["metrics"]["model_only"]["kappa"] -= 0.4
+        candidate = sample_evidence(
+            pipeline=BASELINE_CONFUSION, model_only=MUCH_WORSE_CONFUSION
+        )
         failures = gold_gate.compare_evidence(approved_baseline(), candidate)
         self.assertTrue(any("model_only" in f for f in failures))
+        self.assertFalse(any("pipeline" in f for f in failures))
 
     def test_incomplete_candidate_run_fails(self):
         candidate = sample_evidence()

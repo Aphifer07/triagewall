@@ -137,6 +137,26 @@ asset inventory appears only as its revision hash and asset count, both of
 which are already non-disclosing. A regression test asserts that alert content
 from the labeled set never appears in an emitted manifest.
 
+## Evidence integrity
+
+Approving a baseline means committing a JSON file by hand, so the gate does
+not trust any field it can derive:
+
+- `behavior_fingerprint.combined` is recomputed from `components`. It cannot
+  be edited to the live digest while stale components sit underneath it.
+- `kappa`, `accuracy`, `true_positive_recall`, `scored`, and the per-class
+  metrics are recomputed from the recorded `confusion` matrix in both scopes.
+  A degraded matrix cannot be shipped under approved scalars.
+- `run.scored` must agree with `metrics.pipeline.scored`.
+
+Any disagreement fails validation rather than being reported as a metric
+regression, because an inconsistent manifest means the numbers cannot be
+trusted at all.
+
+What a human *is* meant to edit: `status`, `thresholds`, and `notes`. Those
+are decisions, not measurements. Everything else should be pasted from
+`evaluate` output unmodified.
+
 ## When the gate fails
 
 **"guarded production inputs changed"** — a change moved the behavior
