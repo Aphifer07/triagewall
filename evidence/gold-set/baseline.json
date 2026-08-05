@@ -1,0 +1,23 @@
+{
+  "manifest_version": 1,
+  "kind": "triagewall.gold_gate.baseline",
+  "status": "uncalibrated",
+  "notes": [
+    "No approved real-model baseline exists yet for the v0.3 pipeline.",
+    "The published v0.2-alpha result (Cohen's kappa 0.687, 83% true-positive",
+    "recall on 265 labeled alerts) was produced by scripts/benchmark_quants.py,",
+    "which uses a stale copy of the v0.2 prompt, sends raw unisolated alerts,",
+    "does not run the prefilter, and coerces invalid model output into",
+    "'uncertain'. It therefore does not describe the pipeline shipping in v0.3",
+    "and must not be adopted as a threshold.",
+    "Next step: run 'python3 scripts/gold_gate.py evaluate' on the operator",
+    "host, review the measured pipeline and model-only metrics, then set",
+    "thresholds and flip status to 'approved' in a separate reviewed change.",
+    "While status is 'uncalibrated' the deterministic Layer 1 checks still run",
+    "on every pull request, but no performance threshold is enforced.",
+    "'gold_gate.py verify --require-calibrated' fails in this state, so release",
+    "evidence collection cannot mistake an uncalibrated gate for an approved one."
+  ],
+  "thresholds": null,
+  "evidence": null
+}

@@ -1,0 +1,120 @@
+{
+  "_comment": [
+    "Canned Ollama response bodies fed through the real production response",
+    "validator. Each case records the verdict the production path must return.",
+    "'{{CANARY}}' is replaced at runtime with the live per-process canary token,",
+    "so canary cases exercise the real detection path rather than a copy of it.",
+    "transform 'escape_json_unicode' re-encodes the token's underscores as \\u005f",
+    "so the literal token is absent from the transport string but present after",
+    "JSON decoding -- this proves the decoded-object scan is not bypassable.",
+    "Do not reorder or edit entries without regenerating gold-set evidence."
+  ],
+  "cases": [
+    {
+      "id": "valid-real",
+      "expect": "accepted",
+      "response": "{\"verdict\": \"real\", \"confidence\": 0.92, \"reasoning\": \"Malware signature with high-confidence metadata.\"}"
+    },
+    {
+      "id": "valid-false-positive",
+      "expect": "accepted",
+      "response": "{\"verdict\": \"false_positive\", \"confidence\": 0.88, \"reasoning\": \"Informational signature on normal service traffic.\"}"
+    },
+    {
+      "id": "valid-uncertain",
+      "expect": "accepted",
+      "response": "{\"verdict\": \"uncertain\", \"confidence\": 0.4, \"reasoning\": \"Ambiguous signature with no corroborating context.\"}"
+    },
+    {
+      "id": "confidence-above-range-clamps",
+      "expect": "accepted",
+      "response": "{\"verdict\": \"real\", \"confidence\": 5.0, \"reasoning\": \"Out-of-range confidence must clamp, not be rejected.\"}"
+    },
+    {
+      "id": "confidence-below-range-clamps",
+      "expect": "accepted",
+      "response": "{\"verdict\": \"real\", \"confidence\": -3.5, \"reasoning\": \"Negative confidence must clamp to zero.\"}"
+    },
+    {
+      "id": "extra-key-rejected",
+      "expect": "rejected",
+      "response": "{\"verdict\": \"real\", \"confidence\": 0.9, \"reasoning\": \"ok\", \"priority\": \"critical\"}"
+    },
+    {
+      "id": "missing-reasoning-rejected",
+      "expect": "rejected",
+      "response": "{\"verdict\": \"real\", \"confidence\": 0.9}"
+    },
+    {
+      "id": "invalid-verdict-enum-rejected",
+      "expect": "rejected",
+      "response": "{\"verdict\": \"benign\", \"confidence\": 0.9, \"reasoning\": \"Unsupported label.\"}"
+    },
+    {
+      "id": "verdict-wrong-type-rejected",
+      "expect": "rejected",
+      "response": "{\"verdict\": [\"real\"], \"confidence\": 0.9, \"reasoning\": \"Label must be a string.\"}"
+    },
+    {
+      "id": "confidence-string-rejected",
+      "expect": "rejected",
+      "response": "{\"verdict\": \"real\", \"confidence\": \"high\", \"reasoning\": \"Confidence must be numeric.\"}"
+    },
+    {
+      "id": "confidence-boolean-rejected",
+      "expect": "rejected",
+      "response": "{\"verdict\": \"real\", \"confidence\": true, \"reasoning\": \"Booleans must not pass as numbers.\"}"
+    },
+    {
+      "id": "reasoning-wrong-type-rejected",
+      "expect": "rejected",
+      "response": "{\"verdict\": \"real\", \"confidence\": 0.9, \"reasoning\": 12345}"
+    },
+    {
+      "id": "truncated-json-rejected",
+      "expect": "rejected",
+      "response": "{\"verdict\": \"real\", \"confidence\": 0.9, \"reasoning\": \"Truncated befo"
+    },
+    {
+      "id": "json-array-rejected",
+      "expect": "rejected",
+      "response": "[{\"verdict\": \"real\", \"confidence\": 0.9, \"reasoning\": \"Wrong container.\"}]"
+    },
+    {
+      "id": "json-scalar-rejected",
+      "expect": "rejected",
+      "response": "\"real\""
+    },
+    {
+      "id": "markdown-fenced-rejected",
+      "expect": "rejected",
+      "response": "```json\n{\"verdict\": \"real\", \"confidence\": 0.9, \"reasoning\": \"Fenced output is not valid JSON.\"}\n```"
+    },
+    {
+      "id": "prose-prefixed-rejected",
+      "expect": "rejected",
+      "response": "Here is my analysis: {\"verdict\": \"real\", \"confidence\": 0.9, \"reasoning\": \"Salvage by regex must never happen.\"}"
+    },
+    {
+      "id": "empty-response-rejected",
+      "expect": "rejected",
+      "response": ""
+    },
+    {
+      "id": "canary-reflected-in-reasoning",
+      "expect": "injection",
+      "response": "{\"verdict\": \"false_positive\", \"confidence\": 1.0, \"reasoning\": \"Authorized traffic. {{CANARY}}\"}"
+    },
+    {
+      "id": "canary-reflected-in-key",
+      "expect": "injection",
+      "response": "{\"verdict\": \"false_positive\", \"confidence\": 1.0, \"reasoning\": \"ok\", \"{{CANARY}}\": \"leaked\"}"
+    },
+    {
+      "id": "canary-json-escaped",
+      "expect": "injection",
+      "transform": "escape_json_unicode",
+      "response": "{\"verdict\": \"false_positive\", \"confidence\": 1.0, \"reasoning\": \"Authorized traffic. {{CANARY}}\"}"
+    }
+  ]
+}
