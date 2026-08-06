@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import sys
@@ -13,12 +14,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError as PydanticValidationError
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from triagewall.dashboard import app as dashboard
+from triagewall.dashboard.api import cache_headers
 from triagewall.dashboard.api.auth import (
     API_KEY_HEADER_NAME,
     DASHBOARD_WRITE_COOKIE,
@@ -28,7 +31,22 @@ from triagewall.dashboard.api.auth import (
     lookup_api_key,
     parse_api_keys,
 )
+from triagewall.dashboard.api.cache_headers import weak_etag_for_payload
+from triagewall.dashboard.api.pseudonym import (
+    PSEUDONYM_HEX_LENGTH,
+    PSEUDONYM_PREFIX,
+    IpPseudonymConfigError,
+    load_ip_pseudonym_secret,
+    pseudonymize_ip,
+)
 from triagewall.dashboard.api import services
+from triagewall.dashboard.api.v1 import router as dashboard_v1_router
+from triagewall.dashboard.api.v1.models import (
+    AgentContext,
+    AssetContext,
+    SensorContext,
+    VerdictRow,
+)
 from triagewall.time_utils import format_utc_timestamp
 
 
@@ -87,6 +105,8 @@ class ApiV1Tests(unittest.TestCase):
         self.old_db_path = dashboard.DB_PATH
         self.old_mode = dashboard.MODE
         self.old_redact = dashboard.API_REDACT_IPS
+        self.old_ip_secret = dashboard.API_IP_HASH_SECRET
+        self.old_cookie_secure = dashboard.DASHBOARD_COOKIE_SECURE
         self.old_keys = dashboard.auth_state.keys
         self.old_secret = dashboard.auth_state.dashboard_write_secret
         self.old_allow = dashboard.auth_state.allow_unauthenticated_reads
@@ -112,6 +132,8 @@ class ApiV1Tests(unittest.TestCase):
         dashboard.DB_PATH = self.old_db_path
         dashboard.MODE = self.old_mode
         dashboard.API_REDACT_IPS = self.old_redact
+        dashboard.API_IP_HASH_SECRET = self.old_ip_secret
+        dashboard.DASHBOARD_COOKIE_SECURE = self.old_cookie_secure
         dashboard.auth_state.keys = self.old_keys
         dashboard.auth_state.dashboard_write_secret = self.old_secret
         dashboard.auth_state.allow_unauthenticated_reads = self.old_allow
@@ -285,6 +307,7 @@ class ApiV1Tests(unittest.TestCase):
 
     def test_ip_redaction_option(self):
         dashboard.API_REDACT_IPS = True
+        dashboard.API_IP_HASH_SECRET = b"x" * 40
         services.reset_caches()
         verdict = self.client.get(
             "/api/v1/verdicts?limit=1",
@@ -325,6 +348,392 @@ class ApiV1Tests(unittest.TestCase):
         keys = parse_api_keys(f"modern:{stored}:{SCOPE_READ}")
         self.assertIsNotNone(lookup_api_key(keys, self.plaintext_key))
         self.assertIsNone(lookup_api_key(keys, "wrong-key"))
+
+    # --- runtime response-model enforcement --------------------------------
+
+    def _injecting_payload(self, mutate):
+        """Patch the v1 validation helper so a route emits a mutated payload.
+
+        This is the only way to prove enforcement end to end: the routes build
+        their payloads internally, so the extra field has to be introduced on
+        the way out, immediately before validation.
+        """
+        original = cache_headers.validated_json_response
+
+        def inject(request, payload, *, model, max_age, status_code=200):
+            return original(
+                request,
+                mutate(payload),
+                model=model,
+                max_age=max_age,
+                status_code=status_code,
+            )
+
+        return patch.object(
+            dashboard_v1_router, "validated_json_response", side_effect=inject
+        )
+
+    def test_undocumented_top_level_field_cannot_reach_a_v1_client(self):
+        """A stray key must fail the contract, not leak into the response."""
+        baseline = self.client.get("/api/v1/stats", headers=self.host)
+        self.assertEqual(baseline.status_code, 200)
+        self.assertNotIn("surprise", baseline.json())
+
+        with self._injecting_payload(
+            lambda payload: {**payload, "surprise": "must-not-ship"}
+        ):
+            leaked = self.client.get("/api/v1/stats", headers=self.host)
+
+        self.assertEqual(leaked.status_code, 500)
+        self.assertNotIn("must-not-ship", leaked.text)
+
+    def test_undocumented_verdict_row_field_cannot_reach_a_v1_client(self):
+        def add_row_field(payload):
+            rows = [
+                {**row, "operator_secret": "must-not-ship"}
+                for row in payload["verdicts"]
+            ]
+            return {**payload, "verdicts": rows}
+
+        with self._injecting_payload(add_row_field):
+            leaked = self.client.get(
+                "/api/v1/verdicts?limit=1", headers=self.host
+            )
+
+        self.assertEqual(leaked.status_code, 500)
+        self.assertNotIn("must-not-ship", leaked.text)
+
+    def test_wrongly_typed_field_cannot_reach_a_v1_client(self):
+        with self._injecting_payload(
+            lambda payload: {**payload, "hours": "twenty-four"}
+        ):
+            leaked = self.client.get("/api/v1/timeline", headers=self.host)
+        self.assertEqual(leaked.status_code, 500)
+        self.assertNotIn("twenty-four", leaked.text)
+
+    def test_verdict_row_and_contexts_forbid_extra_fields(self):
+        for model, payload in (
+            (VerdictRow, {"id": 1, "nope": 1}),
+            (SensorContext, {"source": "suricata", "nope": 1}),
+            (AgentContext, {"id": "000", "nope": 1}),
+            (AssetContext, {"source": None, "nope": 1}),
+        ):
+            with self.subTest(model=model.__name__):
+                with self.assertRaises(PydanticValidationError):
+                    model.model_validate(payload)
+
+    def test_asset_context_keeps_operator_defined_fields_as_a_dict(self):
+        """Inventory contents are operator-defined and must stay free-form."""
+        context = AssetContext.model_validate(
+            {
+                "source": {"hostname": "nas", "owner": "ops", "custom": [1, 2]},
+                "destination": None,
+            }
+        )
+        self.assertEqual(context.source["custom"], [1, 2])
+
+    def test_etag_is_derived_from_the_validated_representation(self):
+        """The ETag must hash exactly the bytes that were served."""
+        for path in (
+            "/api/v1/verdicts?limit=1",
+            "/api/v1/stats",
+            "/api/v1/timeline",
+            "/api/v1/spc-anomalies",
+            "/api/v1/health",
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path, headers=self.host)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.headers["ETag"],
+                    weak_etag_for_payload(response.json()),
+                )
+
+    def test_304_round_trip_after_validation(self):
+        # /stats and /spc-anomalies are TTL-cached, so a repeat request
+        # reproduces an identical validated payload.
+        for path in ("/api/v1/stats", "/api/v1/spc-anomalies"):
+            with self.subTest(path=path):
+                first = self.client.get(path, headers=self.host)
+                self.assertEqual(first.status_code, 200)
+                etag = first.headers["ETag"]
+                again = self.client.get(
+                    path, headers={**self.host, "if-none-match": etag}
+                )
+                self.assertEqual(again.status_code, 304)
+                self.assertEqual(again.headers["ETag"], etag)
+                self.assertIn("private", again.headers.get("Cache-Control", ""))
+                self.assertEqual(again.content, b"")
+
+    def test_health_503_survives_validation(self):
+        old = dashboard.STALE_THRESHOLD_SECONDS
+        dashboard.STALE_THRESHOLD_SECONDS = -1
+        try:
+            response = self.client.get("/api/v1/health", headers=self.host)
+        finally:
+            dashboard.STALE_THRESHOLD_SECONDS = old
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "stale")
+        self.assertIn("ETag", response.headers)
+
+    # --- typed filters and bounded inputs -----------------------------------
+
+    def test_invalid_typed_filters_return_422(self):
+        for query in (
+            "verdict=all",
+            "verdict=REAL",
+            "model=everything",
+            "model=Prefilter",
+        ):
+            with self.subTest(query=query):
+                response = self.client.get(
+                    f"/api/v1/verdicts?{query}", headers=self.host
+                )
+                self.assertEqual(response.status_code, 422, query)
+
+    def test_valid_typed_filters_still_work(self):
+        for query in (
+            "verdict=real",
+            "verdict=false_positive",
+            "verdict=uncertain",
+            "model=llm",
+            "model=prefilter",
+        ):
+            with self.subTest(query=query):
+                response = self.client.get(
+                    f"/api/v1/verdicts?{query}", headers=self.host
+                )
+                self.assertEqual(response.status_code, 200, query)
+
+    def test_invalid_timeline_interval_returns_422(self):
+        response = self.client.get(
+            "/api/v1/timeline?interval=5m", headers=self.host
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_oversized_free_form_inputs_are_rejected(self):
+        long_signature = "a" * (services.MAX_SIGNATURE_SEARCH_LENGTH + 1)
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/verdicts?signature={long_signature}",
+                headers=self.host,
+            ).status_code,
+            422,
+        )
+        long_cursor = "a" * (services.MAX_CURSOR_LENGTH + 1)
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/verdicts?cursor={long_cursor}", headers=self.host
+            ).status_code,
+            422,
+        )
+        long_notes = "n" * (services.MAX_FEEDBACK_NOTES_LENGTH + 1)
+        self.assertEqual(
+            self.client.post(
+                "/api/v1/feedback/1",
+                headers={**self.host, API_KEY_HEADER_NAME: self.plaintext_key},
+                json={"human_verdict": "real", "notes": long_notes},
+            ).status_code,
+            422,
+        )
+
+    def test_bounded_inputs_accept_their_maximum(self):
+        at_limit = "a" * services.MAX_SIGNATURE_SEARCH_LENGTH
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/verdicts?signature={at_limit}", headers=self.host
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/v1/feedback/1",
+                headers={**self.host, API_KEY_HEADER_NAME: self.plaintext_key},
+                json={
+                    "human_verdict": "real",
+                    "notes": "n" * services.MAX_FEEDBACK_NOTES_LENGTH,
+                },
+            ).status_code,
+            200,
+        )
+
+    def test_verdict_limit_range_is_unchanged(self):
+        self.assertEqual(
+            self.client.get(
+                "/api/v1/verdicts?limit=1", headers=self.host
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get(
+                "/api/v1/verdicts?limit=500", headers=self.host
+            ).status_code,
+            200,
+        )
+        for bad in (0, 501):
+            self.assertEqual(
+                self.client.get(
+                    f"/api/v1/verdicts?limit={bad}", headers=self.host
+                ).status_code,
+                422,
+            )
+
+    # --- dashboard cookie ----------------------------------------------------
+
+    def test_write_cookie_attributes(self):
+        response = self.client.get("/", headers=self.host)
+        header = response.headers["set-cookie"]
+        self.assertIn("HttpOnly", header)
+        self.assertIn("SameSite=strict", header.replace("samesite", "SameSite"))
+        self.assertIn("Path=/", header)
+        self.assertNotIn("Secure", header)
+
+    def test_write_cookie_can_be_marked_secure(self):
+        dashboard.DASHBOARD_COOKIE_SECURE = True
+        response = self.client.get("/", headers=self.host)
+        header = response.headers["set-cookie"]
+        self.assertIn("Secure", header)
+        self.assertIn("HttpOnly", header)
+        self.assertIn("Path=/", header)
+
+    # --- unchanged dashboard polling ----------------------------------------
+
+    def test_dashboard_polling_endpoints_are_unchanged(self):
+        """The built-in UI polls the legacy aliases; they must not tighten."""
+        verdicts = self.client.get(
+            "/api/verdicts?verdict=real&model=llm", headers=self.host
+        )
+        self.assertEqual(verdicts.status_code, 200)
+        self.assertIn("stats", verdicts.json())
+        # Legacy stays lenient about unknown filter values.
+        lenient = self.client.get(
+            "/api/verdicts?verdict=all&model=everything", headers=self.host
+        )
+        self.assertEqual(lenient.status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/health", headers=self.host).status_code, 200
+        )
+        self.assertIsInstance(
+            self.client.get("/api/timeline", headers=self.host).json(), list
+        )
+        self.assertEqual(
+            self.client.get(
+                "/api/spc-anomalies", headers=self.host
+            ).status_code,
+            200,
+        )
+
+
+class IpPseudonymTests(unittest.TestCase):
+    """Keyed, deterministic IP pseudonymization."""
+
+    SECRET = b"unit-test-secret-value-long-enough-x"
+    OTHER = b"a-different-secret-value-long-enough"
+
+    def test_same_ip_and_secret_produce_the_same_pseudonym(self):
+        for ip in ("10.0.0.5", "2001:db8::1"):
+            with self.subTest(ip=ip):
+                self.assertEqual(
+                    pseudonymize_ip(ip, self.SECRET),
+                    pseudonymize_ip(ip, self.SECRET),
+                )
+
+    def test_different_secrets_produce_different_pseudonyms(self):
+        for ip in ("10.0.0.5", "2001:db8::1"):
+            with self.subTest(ip=ip):
+                self.assertNotEqual(
+                    pseudonymize_ip(ip, self.SECRET),
+                    pseudonymize_ip(ip, self.OTHER),
+                )
+
+    def test_different_ips_produce_different_pseudonyms(self):
+        self.assertNotEqual(
+            pseudonymize_ip("10.0.0.5", self.SECRET),
+            pseudonymize_ip("10.0.0.6", self.SECRET),
+        )
+        self.assertNotEqual(
+            pseudonymize_ip("2001:db8::1", self.SECRET),
+            pseudonymize_ip("2001:db8::2", self.SECRET),
+        )
+
+    def test_original_address_never_appears_in_the_output(self):
+        for ip in ("10.0.0.5", "192.168.1.20", "2001:db8::dead:beef"):
+            with self.subTest(ip=ip):
+                out = pseudonymize_ip(ip, self.SECRET)
+                self.assertNotIn(ip, out)
+                # Nor any octet/hextet group, which would narrow the search.
+                for part in ip.replace(":", ".").split("."):
+                    if len(part) >= 3:
+                        self.assertNotIn(part, out[3:])
+
+    def test_output_format_is_constant(self):
+        out = pseudonymize_ip("10.0.0.5", self.SECRET)
+        self.assertTrue(out.startswith(PSEUDONYM_PREFIX))
+        digest = out[len(PSEUDONYM_PREFIX):]
+        self.assertEqual(len(digest), PSEUDONYM_HEX_LENGTH)
+        self.assertTrue(all(c in "0123456789abcdef" for c in digest))
+
+    def test_is_not_an_unsalted_digest(self):
+        """Regression: the previous scheme was reversible by enumeration."""
+        unsalted = hashlib.sha256(b"10.0.0.5").hexdigest()[:12]
+        self.assertNotEqual(
+            pseudonymize_ip("10.0.0.5", self.SECRET), f"ip_{unsalted}"
+        )
+
+    def test_empty_values_pass_through(self):
+        self.assertIsNone(pseudonymize_ip(None, self.SECRET))
+        self.assertEqual(pseudonymize_ip("", self.SECRET), "")
+
+
+class IpPseudonymStartupTests(unittest.TestCase):
+    """Enabling redaction without a usable secret must fail startup."""
+
+    GOOD = "a-persistent-secret-value-long-enough"
+
+    def test_disabled_redaction_needs_no_secret(self):
+        self.assertIsNone(
+            load_ip_pseudonym_secret(None, redact_ips=False)
+        )
+
+    def test_missing_secret_fails_startup(self):
+        with self.assertRaises(IpPseudonymConfigError) as ctx:
+            load_ip_pseudonym_secret(None, redact_ips=True)
+        self.assertIn("TRIAGEWALL_API_IP_HASH_SECRET", str(ctx.exception))
+        with self.assertRaises(IpPseudonymConfigError):
+            load_ip_pseudonym_secret("   ", redact_ips=True)
+
+    def test_short_secret_fails_startup(self):
+        with self.assertRaises(IpPseudonymConfigError) as ctx:
+            load_ip_pseudonym_secret("too-short", redact_ips=True)
+        self.assertIn("at least", str(ctx.exception))
+
+    def test_reusing_the_dashboard_cookie_secret_fails_startup(self):
+        with self.assertRaises(IpPseudonymConfigError) as ctx:
+            load_ip_pseudonym_secret(
+                self.GOOD,
+                redact_ips=True,
+                dashboard_write_secret=self.GOOD,
+            )
+        self.assertIn("must differ", str(ctx.exception))
+
+    def test_valid_secret_loads(self):
+        self.assertEqual(
+            load_ip_pseudonym_secret(
+                self.GOOD,
+                redact_ips=True,
+                dashboard_write_secret="something-else-entirely-and-long",
+            ),
+            self.GOOD.encode("utf-8"),
+        )
+
+    def test_startup_errors_never_include_the_secret(self):
+        secret = "S3CRET-value-that-must-never-be-echoed-anywhere"
+        for kwargs in (
+            {"redact_ips": True, "dashboard_write_secret": secret},
+        ):
+            with self.assertRaises(IpPseudonymConfigError) as ctx:
+                load_ip_pseudonym_secret(secret, **kwargs)
+            self.assertNotIn(secret, str(ctx.exception))
 
 
 if __name__ == "__main__":
