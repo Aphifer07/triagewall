@@ -10,6 +10,8 @@ Run:
 
 Stop with Ctrl-C or systemd.
 """
+from __future__ import annotations
+
 import os
 import sys
 import spc
@@ -102,6 +104,11 @@ PROCESSED_LINE = LineResult(processed=True, checkpoint=True)
 CHECKPOINT_LINE = LineResult(processed=False, checkpoint=True)
 RETRY_LINE = LineResult(processed=False, checkpoint=False)
 
+
+class IngestCheckpointError(RuntimeError):
+    """Raised when the durable eve.json checkpoint cannot be advanced safely."""
+
+
 # Graceful shutdown
 _stop = False
 def _handle_signal(signum, frame):
@@ -126,6 +133,80 @@ def load_position():
 def save_position(state):
     POSITION_PATH.parent.mkdir(parents=True, exist_ok=True)
     POSITION_PATH.write_text(json.dumps(state))
+
+
+def _find_path_for_inode(directory: Path, inode: int) -> Path | None:
+    """Return a regular file under directory whose inode matches, if any."""
+    try:
+        candidates = sorted(directory.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            if path.stat().st_ino == inode:
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_readable_eve(state: dict, live_stat: os.stat_result) -> tuple[Path, os.stat_result]:
+    """Choose the file that still owns the durable checkpoint.
+
+    Suricata/logrotate renames ``eve.json`` and creates a new live file. When a
+    checkpoint still points at the previous inode, drain that rotated file
+    before following the live path. If the previous inode is gone and unread
+    bytes remain, fail closed rather than silently skipping alerts.
+    """
+    live_inode = live_stat.st_ino
+    checkpoint_inode = state.get("inode")
+    offset = int(state.get("offset") or 0)
+
+    if checkpoint_inode is None or checkpoint_inode == live_inode:
+        if live_stat.st_size < offset:
+            raise IngestCheckpointError(
+                f"{EVE_PATH} shrank behind the durable checkpoint "
+                f"(size {live_stat.st_size} < offset {offset}); "
+                "refusing to skip unread alerts"
+            )
+        return EVE_PATH, live_stat
+
+    rotated = _find_path_for_inode(EVE_PATH.parent, checkpoint_inode)
+    if rotated is not None:
+        try:
+            if rotated.resolve() != EVE_PATH.resolve():
+                rotated_stat = rotated.stat()
+                if rotated_stat.st_size < offset:
+                    raise IngestCheckpointError(
+                        f"rotated eve.json {rotated} shrank behind the durable "
+                        f"checkpoint (size {rotated_stat.st_size} < offset {offset})"
+                    )
+                log.info(
+                    "eve.json rotated; draining unread records from %s before "
+                    "following the live file",
+                    rotated,
+                )
+                return rotated, rotated_stat
+        except OSError as exc:
+            raise IngestCheckpointError(
+                f"rotated eve.json for inode {checkpoint_inode} is unreadable: {exc}"
+            ) from exc
+
+    if offset > 0:
+        raise IngestCheckpointError(
+            "eve.json inode changed while a durable checkpoint still points at "
+            f"unread bytes in the previous file (inode={checkpoint_inode}, "
+            f"offset={offset}); refusing to skip alerts. Restore the rotated "
+            f"file beside {EVE_PATH} or reset {POSITION_PATH} only after confirming "
+            "the previous file was fully processed."
+        )
+
+    # No unread bytes remain; safe to follow the replacement live file.
+    state["inode"] = live_inode
+    state["offset"] = 0
+    return EVE_PATH, live_stat
 
 
 def _line_is_complete(line):
@@ -369,120 +450,163 @@ def tail_file():
         except FileNotFoundError:
             return None
 
-    while not _stop:
-        try:
-            # Warn if we haven't seen new eve.json lines recently (rate-limited).
-            now = time.time()
-            gap = now - last_line_seen_ts
-            if gap > 300 and (now - last_stall_warning_ts) > 300:
-                mins = gap / 60.0
-                log.warning(
-                    f"Ingestion stalled. No new lines seen in eve.json for {mins:.1f} minutes."
-                )
-                last_stall_warning_ts = now
-
-            disk_stat = eve_disk_stat()
-            if disk_stat is None:
-                log.warning(f"{EVE_PATH} doesn't exist yet, waiting...")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            current_inode = disk_stat.st_ino
-            current_size = disk_stat.st_size
-
-            # Detect truncation (same path inode, but file got smaller than our saved offset)
-            if current_size < state["offset"]:
-                log.info(
-                    f"File shrunk (size {current_size} < offset {state['offset']}), restarting from start"
-                )
-                state["offset"] = 0
-
-            # If we're tracking the wrong inode on disk (rare if position.json is stale), reset.
-            if state["inode"] is not None and state["inode"] != current_inode:
-                log.info("Saved inode doesn't match current eve.json inode; resetting offset")
-                state["offset"] = 0
-
-            state["inode"] = current_inode
-
-            if current_size == state["offset"]:
-                # Nothing new
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            # Read new content using readline() so f.tell() works inside the loop.
-            # Track the inode of the *open file descriptor* via os.fstat() so we can detect rotation
-            # even when the path is recreated with a new inode while we're still reading the old file.
-            f = open(EVE_PATH, "r")
+    try:
+        while not _stop:
             try:
-                open_inode = os.fstat(f.fileno()).st_ino
-                f.seek(state["offset"])
-                new_lines = 0
-                processed = 0
-                while not _stop:
-                    line = f.readline()
-                    if not line:
-                        # EOF: decide whether we're waiting for more bytes, or the file rotated.
-                        disk = eve_disk_stat()
-                        if disk is None:
-                            # Race during rotation/rename; wait briefly and retry.
-                            time.sleep(POLL_INTERVAL)
-                            continue
+                # Warn if we haven't seen new eve.json lines recently (rate-limited).
+                now = time.time()
+                gap = now - last_line_seen_ts
+                if gap > 300 and (now - last_stall_warning_ts) > 300:
+                    mins = gap / 60.0
+                    log.warning(
+                        f"Ingestion stalled. No new lines seen in eve.json for {mins:.1f} minutes."
+                    )
+                    last_stall_warning_ts = now
 
-                        if disk.st_ino != open_inode:
-                            log.info(
-                                "Detected eve.json rotation (inode changed); reopening new file from start"
-                            )
-                            state["offset"] = 0
-                            state["inode"] = disk.st_ino
-                            save_position(state)
+                disk_stat = eve_disk_stat()
+                if disk_stat is None:
+                    log.warning(f"{EVE_PATH} doesn't exist yet, waiting...")
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
-                            f.close()
-                            f = open(EVE_PATH, "r")
-                            open_inode = os.fstat(f.fileno()).st_ino
-                            f.seek(0)
-                            continue
+                read_path, read_stat = _resolve_readable_eve(state, disk_stat)
+                current_inode = read_stat.st_ino
+                current_size = read_stat.st_size
 
-                        # Same inode, waiting for more data.
-                        break
-
-                    if not _line_is_complete_or_wait(line):
-                        # An append-in-place writer may expose a partial JSON
-                        # record at EOF. Leave the checkpoint unchanged so the
-                        # completed record is reread on the next poll.
-                        break
-
-                    last_line_seen_ts = time.time()
-                    result = process_line(conn, line)
-                    if not result.checkpoint:
-                        # Retryable processing failures must block later records
-                        # from moving the durable checkpoint past this alert.
+                # Finished draining a rotated file; follow the live replacement.
+                if read_path != EVE_PATH and current_size == state["offset"]:
+                    live = eve_disk_stat()
+                    if live is None:
                         time.sleep(POLL_INTERVAL)
-                        break
-
-                    new_lines += 1
-                    if result:
-                        processed += 1
-
-                    state["offset"] = f.tell()
-                    state["inode"] = open_inode
+                        continue
+                    log.info(
+                        "Finished draining rotated eve.json; following live file %s",
+                        EVE_PATH,
+                    )
+                    state["offset"] = 0
+                    state["inode"] = live.st_ino
+                    state["size"] = live.st_size
                     save_position(state)
-            finally:
+                    continue
+
+                if current_size == state["offset"]:
+                    # Nothing new
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                # Read new content using readline() so f.tell() works inside the loop.
+                # Track the inode of the *open file descriptor* via os.fstat() so we can
+                # detect rotation even when the path is recreated with a new inode while
+                # we're still reading the old file.
+                f = open(read_path, "r")
                 try:
-                    f.close()
-                except Exception:
-                    pass
+                    open_inode = os.fstat(f.fileno()).st_ino
+                    # Stat/open race: the path we chose may have been replaced before open.
+                    if open_inode != current_inode:
+                        log.info(
+                            "eve.json inode changed between stat and open; retrying without "
+                            "advancing the durable checkpoint"
+                        )
+                        continue
+                    f.seek(state["offset"])
+                    if f.tell() != state["offset"]:
+                        raise IngestCheckpointError(
+                            f"failed to seek {read_path} to durable offset {state['offset']}"
+                        )
+                    new_lines = 0
+                    processed = 0
+                    while not _stop:
+                        line = f.readline()
+                        if not line:
+                            # EOF: decide whether we're waiting for more bytes, or the file rotated.
+                            if read_path != EVE_PATH:
+                                # Rotated files are immutable after rename; EOF means drain complete.
+                                live = eve_disk_stat()
+                                if live is None:
+                                    time.sleep(POLL_INTERVAL)
+                                    continue
+                                log.info(
+                                    "Finished draining rotated eve.json; following live file %s",
+                                    EVE_PATH,
+                                )
+                                state["offset"] = 0
+                                state["inode"] = live.st_ino
+                                state["size"] = live.st_size
+                                save_position(state)
+                                break
 
-            if new_lines:
-                log.info(
-                    f"Read {new_lines} new lines, triaged {processed} alerts (offset now {state['offset']})"
-                )
+                            disk = eve_disk_stat()
+                            if disk is None:
+                                # Race during rotation/rename; wait briefly and retry.
+                                time.sleep(POLL_INTERVAL)
+                                continue
 
-        except Exception as e:
-            log.error(f"Loop error: {type(e).__name__}: {e}")
-            time.sleep(POLL_INTERVAL)
+                            if disk.st_ino != open_inode:
+                                log.info(
+                                    "Detected eve.json rotation (inode changed); "
+                                    "reopening new file from start"
+                                )
+                                state["offset"] = 0
+                                state["inode"] = disk.st_ino
+                                state["size"] = disk.st_size
+                                save_position(state)
 
-    conn.close()
-    log.info("Ingest daemon stopped cleanly")
+                                f.close()
+                                f = open(EVE_PATH, "r")
+                                open_inode = os.fstat(f.fileno()).st_ino
+                                if open_inode != disk.st_ino:
+                                    log.info(
+                                        "Live eve.json changed again while reopening; retrying"
+                                    )
+                                    break
+                                f.seek(0)
+                                continue
+
+                            # Same inode, waiting for more data.
+                            break
+
+                        if not _line_is_complete_or_wait(line):
+                            # An append-in-place writer may expose a partial JSON
+                            # record at EOF. Leave the checkpoint unchanged so the
+                            # completed record is reread on the next poll.
+                            break
+
+                        last_line_seen_ts = time.time()
+                        result = process_line(conn, line)
+                        if not result.checkpoint:
+                            # Retryable processing failures must block later records
+                            # from moving the durable checkpoint past this alert.
+                            time.sleep(POLL_INTERVAL)
+                            break
+
+                        new_lines += 1
+                        if result:
+                            processed += 1
+
+                        state["offset"] = f.tell()
+                        state["inode"] = open_inode
+                        state["size"] = current_size
+                        save_position(state)
+                finally:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+
+                if new_lines:
+                    log.info(
+                        f"Read {new_lines} new lines, triaged {processed} alerts "
+                        f"(offset now {state['offset']})"
+                    )
+
+            except IngestCheckpointError:
+                raise
+            except Exception as e:
+                log.error(f"Loop error: {type(e).__name__}: {e}")
+                time.sleep(POLL_INTERVAL)
+    finally:
+        conn.close()
+        log.info("Ingest daemon stopped cleanly")
 
 
 def main() -> int:
@@ -492,7 +616,7 @@ def main() -> int:
             demo_loop()
         else:
             tail_file()
-    except (OSError, RuntimeError, sqlite3.Error) as exc:
+    except (OSError, RuntimeError, sqlite3.Error, IngestCheckpointError) as exc:
         log.critical("Suricata ingest startup failed: %s", exc)
         return 1
     return 0

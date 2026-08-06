@@ -291,6 +291,118 @@ class IngestCheckpointTests(unittest.TestCase):
             self.assertEqual(calls, [first, first])
             self.assertEqual(saved["offset"], expected_offset)
 
+    def test_tail_loop_drains_rotated_file_before_following_live_eve(self):
+        """Unread alerts in a renamed eve.json must not be skipped after restart."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            rotated_path = temp_path / "eve.json.1"
+            db_path = temp_path / "triage.db"
+            position_path = temp_path / "position.json"
+            first = json.dumps({
+                "event_type": "alert",
+                "timestamp": "2026-08-06T00:00:00+00:00",
+                "alert": {"signature_id": 11, "signature": "already-read"},
+            }) + "\n"
+            unread = json.dumps({
+                "event_type": "alert",
+                "timestamp": "2026-08-06T00:00:01+00:00",
+                "alert": {"signature_id": 12, "signature": "unread-before-rotation"},
+            }) + "\n"
+            live = json.dumps({
+                "event_type": "alert",
+                "timestamp": "2026-08-06T00:00:02+00:00",
+                "alert": {"signature_id": 13, "signature": "after-rotation"},
+            }) + "\n"
+            eve_path.write_text(first + unread)
+            old_inode = eve_path.stat().st_ino
+            with eve_path.open("r") as handle:
+                handle.readline()
+                offset = handle.tell()
+            position_path.write_text(
+                json.dumps({"offset": offset, "inode": old_inode, "size": 0})
+            )
+            eve_path.rename(rotated_path)
+            eve_path.write_text(live)
+            migrations.ensure_db_initialized(db_path)
+
+            calls = []
+            verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
+
+            def capture(event, asset_context=None):
+                calls.append(event["alert"]["signature_id"])
+                if len(calls) >= 2:
+                    ingest._stop = True
+                return verdict
+
+            ingest._stop = False
+            try:
+                with patch.object(ingest, "EVE_PATH", eve_path), patch.object(
+                    ingest, "DB_PATH", db_path
+                ), patch.object(ingest, "POSITION_PATH", position_path), patch.object(
+                    ingest, "call_ollama", side_effect=capture
+                ), patch.object(ingest.time, "sleep", return_value=None):
+                    ingest.tail_file()
+            finally:
+                ingest._stop = False
+
+            self.assertEqual(calls, [12, 13])
+            saved = json.loads(position_path.read_text())
+            self.assertEqual(saved["inode"], eve_path.stat().st_ino)
+            self.assertEqual(saved["offset"], eve_path.stat().st_size)
+
+    def test_missing_rotated_file_with_unread_offset_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            db_path = temp_path / "triage.db"
+            position_path = temp_path / "position.json"
+            eve_path.write_text("{}\n")
+            position_path.write_text(
+                json.dumps({"offset": 50, "inode": 99999999, "size": 100})
+            )
+            migrations.ensure_db_initialized(db_path)
+
+            ingest._stop = False
+            try:
+                with patch.object(ingest, "EVE_PATH", eve_path), patch.object(
+                    ingest, "DB_PATH", db_path
+                ), patch.object(ingest, "POSITION_PATH", position_path):
+                    with self.assertRaises(ingest.IngestCheckpointError) as ctx:
+                        ingest.tail_file()
+            finally:
+                ingest._stop = False
+
+            self.assertIn("refusing to skip alerts", str(ctx.exception))
+
+    def test_truncated_eve_behind_checkpoint_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            db_path = temp_path / "triage.db"
+            position_path = temp_path / "position.json"
+            eve_path.write_text("{}\n")
+            position_path.write_text(
+                json.dumps({
+                    "offset": 500,
+                    "inode": eve_path.stat().st_ino,
+                    "size": 500,
+                })
+            )
+            migrations.ensure_db_initialized(db_path)
+
+            ingest._stop = False
+            try:
+                with patch.object(ingest, "EVE_PATH", eve_path), patch.object(
+                    ingest, "DB_PATH", db_path
+                ), patch.object(ingest, "POSITION_PATH", position_path):
+                    with self.assertRaises(ingest.IngestCheckpointError) as ctx:
+                        ingest.tail_file()
+            finally:
+                ingest._stop = False
+
+            self.assertIn("shrank behind the durable checkpoint", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
