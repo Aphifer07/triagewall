@@ -9,9 +9,31 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+
+
+# `time.tzset()` is POSIX-only, so the integration tests that mutate the real
+# process timezone are guarded. Linux CI runs them; other platforms still get
+# the pure conversion coverage below, which needs no tzset.
+REQUIRES_TZSET = unittest.skipUnless(
+    hasattr(time, "tzset"), "requires POSIX time.tzset()"
+)
+
+try:
+    from zoneinfo import ZoneInfo
+
+    ZoneInfo("America/New_York")
+    HAVE_TZDB = True
+except Exception:  # pragma: no cover - depends on the platform tz database
+    HAVE_TZDB = False
+
+# Windows ships no tz database; `tzdata` supplies one and is pinned in
+# tests/requirements-ci.txt so these run everywhere.
+REQUIRES_TZDB = unittest.skipUnless(
+    HAVE_TZDB, "requires an IANA tz database (install tzdata)"
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -436,6 +458,7 @@ class WazuhCheckpointTests(unittest.TestCase):
 
         self.addCleanup(restore)
 
+    @REQUIRES_TZSET
     def test_local_evening_does_not_prematurely_require_archive(self):
         """UTC day can advance while Wazuh's local day (and archive) has not.
 
@@ -472,6 +495,7 @@ class WazuhCheckpointTests(unittest.TestCase):
         self.assertEqual(state["date"], "2026-08-05")
         self.assertEqual(state["offset"], len(line))
 
+    @REQUIRES_TZSET
     def test_local_midnight_rotation_drains_archive_before_new_inode(self):
         """Local midnight can rotate while the UTC mtime date is still yesterday.
 
@@ -511,6 +535,120 @@ class WazuhCheckpointTests(unittest.TestCase):
         self.assertEqual(state["date"], "2026-08-06")
         self.assertEqual(state["offset"], len(second))
         self.assertEqual(state["inode"], self.alerts_path.stat().st_ino)
+
+
+class WazuhArchiveDayTests(unittest.TestCase):
+    """The archive-day conversion itself, on every platform.
+
+    Wazuh names ``ossec-alerts-DD`` by the manager's *local* calendar day, so
+    the conversion must follow the configured timezone rather than UTC. These
+    exercise ``archive_day()`` directly with an explicit timezone, which needs
+    no ``time.tzset()``; the tzset integration tests above prove the production
+    call path picks up the real process timezone.
+    """
+
+    @staticmethod
+    def _epoch(year, month, day, hour, minute=0):
+        return datetime(
+            year, month, day, hour, minute, tzinfo=timezone.utc
+        ).timestamp()
+
+    def test_default_utc_deployment(self):
+        # 2026-08-06 00:30 UTC is already 2026-08-06 in a UTC deployment.
+        self.assertEqual(
+            wazuh_ingest.archive_day(
+                self._epoch(2026, 8, 6, 0, 30), timezone.utc
+            ),
+            date(2026, 8, 6),
+        )
+        self.assertEqual(
+            wazuh_ingest.archive_day(
+                self._epoch(2026, 8, 5, 23, 59), timezone.utc
+            ),
+            date(2026, 8, 5),
+        )
+
+    def test_utc_negative_offset_lags_the_utc_day(self):
+        """UTC advances first; the local Wazuh day is still yesterday."""
+        eastern = timezone(timedelta(hours=-4))  # America/New_York in August
+        self.assertEqual(
+            wazuh_ingest.archive_day(self._epoch(2026, 8, 6, 0, 30), eastern),
+            date(2026, 8, 5),
+        )
+        # ...and it does roll over once local midnight passes.
+        self.assertEqual(
+            wazuh_ingest.archive_day(self._epoch(2026, 8, 6, 4, 30), eastern),
+            date(2026, 8, 6),
+        )
+
+    def test_utc_positive_offset_leads_the_utc_day(self):
+        """Local midnight arrives before UTC midnight."""
+        berlin = timezone(timedelta(hours=2))  # Europe/Berlin in August (CEST)
+        self.assertEqual(
+            wazuh_ingest.archive_day(self._epoch(2026, 8, 5, 22, 0), berlin),
+            date(2026, 8, 6),
+        )
+        self.assertEqual(
+            wazuh_ingest.archive_day(self._epoch(2026, 8, 5, 21, 59), berlin),
+            date(2026, 8, 5),
+        )
+
+    @REQUIRES_TZDB
+    def test_named_zones_match_their_fixed_offset_equivalents(self):
+        self.assertEqual(
+            wazuh_ingest.archive_day(
+                self._epoch(2026, 8, 6, 0, 30), ZoneInfo("America/New_York")
+            ),
+            date(2026, 8, 5),
+        )
+        self.assertEqual(
+            wazuh_ingest.archive_day(
+                self._epoch(2026, 8, 5, 22, 0), ZoneInfo("Europe/Berlin")
+            ),
+            date(2026, 8, 6),
+        )
+
+    @REQUIRES_TZDB
+    def test_daylight_saving_shifts_the_day_boundary(self):
+        """The same clock offset is not constant across a DST transition."""
+        eastern = ZoneInfo("America/New_York")
+        # Standard time (UTC-5): 2026-01-06 04:30 UTC is 2026-01-05 23:30 local.
+        self.assertEqual(
+            wazuh_ingest.archive_day(self._epoch(2026, 1, 6, 4, 30), eastern),
+            date(2026, 1, 5),
+        )
+        # Daylight time (UTC-4): the same UTC clock time is already local Aug 6.
+        self.assertEqual(
+            wazuh_ingest.archive_day(self._epoch(2026, 8, 6, 4, 30), eastern),
+            date(2026, 8, 6),
+        )
+        # Southern-hemisphere DST runs the other way.
+        sydney = ZoneInfo("Australia/Sydney")
+        self.assertEqual(
+            wazuh_ingest.archive_day(self._epoch(2026, 1, 5, 13, 30), sydney),
+            date(2026, 1, 6),
+        )
+        self.assertEqual(
+            wazuh_ingest.archive_day(self._epoch(2026, 7, 5, 13, 30), sydney),
+            date(2026, 7, 5),
+        )
+
+    def test_production_path_uses_the_process_timezone(self):
+        """`_current_log_date` must not pin itself to UTC."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "alerts.json"
+            path.write_bytes(b"{}\n")
+            stamp = self._epoch(2026, 8, 6, 0, 30)
+            os.utime(path, (stamp, stamp))
+            self.assertEqual(
+                wazuh_ingest._current_log_date(path),
+                wazuh_ingest.archive_day(stamp),
+            )
+            # And the local answer is the one that can differ from UTC.
+            self.assertEqual(
+                wazuh_ingest.archive_day(stamp),
+                datetime.fromtimestamp(stamp).date(),
+            )
 
 
 if __name__ == "__main__":

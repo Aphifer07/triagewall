@@ -42,10 +42,34 @@ WAZUH_POLL_INTERVAL=10
 TZ=UTC
 ```
 
-Set `TZ` on the Triagewall wazuh-ingest service to the same timezone the
-Wazuh manager uses for daily `ossec-alerts-DD` rotation. Archive day
-boundaries follow that local calendar; a mismatched `TZ` can stop ingest
-fail-closed at rotation.
+### Timezone must match the Wazuh manager
+
+Wazuh names its daily archives `ossec-alerts-DD` using the **manager's local
+calendar day**, so Triagewall derives the archive day from the process-local
+timezone rather than UTC. `TZ` on the `wazuh-ingest` service must therefore be
+set to the same timezone the Wazuh manager runs in. Both default to `UTC`,
+which is correct only if the manager is also on UTC.
+
+A mismatch is not cosmetic. It shifts Triagewall's day boundary away from the
+one Wazuh rotates on, and at rotation that produces one of two failures:
+
+- **Triagewall's day advances first.** It looks for an archive the manager has
+  not written yet, finds it missing, and stops fail-closed rather than skipping
+  a gap in alerts.
+- **Triagewall's day advances last.** It reaches the new `alerts.json` inode
+  without having drained the previous day's archive, and again stops
+  fail-closed rather than losing the undrained records.
+
+Either way ingest halts and needs an operator, so verify `TZ` before enabling
+the profile. Confirm the manager's zone with:
+
+```bash
+docker exec <wazuh-manager-container> date +%Z%z
+```
+
+and set the matching IANA name (for example `TZ=America/New_York`) in `.env`.
+Changing the host's clock or the manager's timezone later requires the same
+change here.
 
 `WAZUH_SOURCE_ID` must be a stable 1-64 character identifier using letters,
 digits, dots, underscores, or hyphens. Changing it while an existing checkpoint

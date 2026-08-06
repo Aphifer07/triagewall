@@ -14,7 +14,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, tzinfo
 from pathlib import Path
 
 from database import connect_database
@@ -199,6 +199,17 @@ def _last_complete_offset(path: Path) -> int:
     return 0
 
 
+def archive_day(modified_epoch: float, tz: tzinfo | None = None) -> date:
+    """Convert a POSIX mtime to the Wazuh archive calendar day.
+
+    ``tz=None`` means the process-local timezone, which is what production
+    uses. It is a parameter only so the conversion itself can be exercised
+    against an explicit ``zoneinfo.ZoneInfo`` on platforms that have no
+    ``time.tzset()``.
+    """
+    return datetime.fromtimestamp(modified_epoch, tz).date()
+
+
 def _current_log_date(path: Path) -> date:
     """Return the Wazuh archive day for ``path``.
 
@@ -209,7 +220,7 @@ def _current_log_date(path: Path) -> date:
     local rotation and either fails closed on inode change or looks for an
     archive that does not exist yet.
     """
-    return datetime.fromtimestamp(path.stat().st_mtime).date()
+    return archive_day(path.stat().st_mtime)
 
 
 def initialize_position() -> dict:
