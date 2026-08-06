@@ -281,6 +281,7 @@ class PersistenceAndApiTests(unittest.TestCase):
         dashboard.MODE = "local"
         dashboard._stats_cache.update(data=None, ts=0.0)
         self.client = TestClient(dashboard.app)
+        self.client.get("/", headers={"host": "localhost"})
 
     def tearDown(self):
         self.conn.close()

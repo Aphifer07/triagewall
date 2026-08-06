@@ -1,0 +1,146 @@
+"""Deprecated unversioned /api/* aliases for the existing dashboard."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+from fastapi import APIRouter, Depends, Query, Request
+
+from triagewall.dashboard.api.auth import AuthContext, AuthState
+from triagewall.dashboard.api.cache_headers import cached_json_response
+from triagewall.dashboard.api import services
+from triagewall.dashboard.api.v1.models import (
+    FeedbackRequest,
+    FeedbackResponse,
+    LegacyHealthResponse,
+    LegacyVerdictsResponse,
+    SpcAnomaliesResponse,
+    StatsModel,
+    TimelineBucket,
+)
+
+
+def create_legacy_router(
+    *,
+    auth: AuthState,
+    db_factory: Callable,
+    get_mode: Callable[[], str],
+    get_db_path: Callable,
+    get_stale_threshold: Callable[[], int],
+    row_to_dict: Callable,
+    mask_ip_fn: Callable,
+    redact_ips: Callable[[], bool],
+) -> APIRouter:
+    """Thin deprecated aliases preserving dashboard response shapes."""
+    router = APIRouter(tags=["legacy"], deprecated=True)
+    require_read = auth.require_read
+    require_write = auth.require_feedback_write
+
+    @router.get(
+        "/api/health",
+        response_model=LegacyHealthResponse,
+        deprecated=True,
+        responses={503: {"model": LegacyHealthResponse}},
+    )
+    def health(request: Request):
+        payload, status_code = services.compute_health(
+            db_factory,
+            get_db_path(),
+            stale_threshold_seconds=get_stale_threshold(),
+            include_storage=True,
+        )
+        return cached_json_response(
+            request,
+            payload,
+            max_age=5,
+            status_code=status_code,
+        )
+
+    @router.get(
+        "/api/verdicts",
+        response_model=LegacyVerdictsResponse,
+        deprecated=True,
+    )
+    def list_verdicts(
+        request: Request,
+        verdict: str | None = None,
+        signature: str | None = None,
+        model: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+        _auth: AuthContext = Depends(require_read),
+    ):
+        with db_factory(readonly=True) as conn:
+            rows, _next = services.fetch_verdicts(
+                conn,
+                verdict=verdict,
+                signature=signature,
+                model=model,
+                limit=limit,
+                cursor=None,
+            )
+        stats_dict, _generated = services.get_cached_stats(db_factory)
+        payload = {
+            "mode": get_mode(),
+            "stats": StatsModel.model_validate(stats_dict).model_dump(),
+            "verdicts": [row_to_dict(r) for r in rows],
+        }
+        return cached_json_response(request, payload, max_age=5)
+
+    @router.post(
+        "/api/feedback/{event_id}",
+        response_model=FeedbackResponse,
+        deprecated=True,
+    )
+    def feedback(
+        event_id: int,
+        body: FeedbackRequest,
+        _auth: AuthContext = Depends(require_write),
+    ):
+        return services.submit_feedback(
+            db_factory,
+            mode=get_mode(),
+            event_id=event_id,
+            human_verdict=body.human_verdict,
+            notes=body.notes,
+        )
+
+    @router.get("/api/timeline", deprecated=True)
+    def timeline(
+        request: Request,
+        _auth: AuthContext = Depends(require_read),
+    ):
+        buckets, _generated = services.get_timeline(
+            db_factory,
+            hours=24,
+            interval="1h",
+        )
+        # Legacy clients expect a bare array.
+        return cached_json_response(
+            request,
+            [TimelineBucket.model_validate(b).model_dump() for b in buckets],
+            max_age=int(services.TIMELINE_TTL),
+        )
+
+    @router.get(
+        "/api/spc-anomalies",
+        response_model=SpcAnomaliesResponse,
+        deprecated=True,
+    )
+    def spc_anomalies(
+        request: Request,
+        _auth: AuthContext = Depends(require_read),
+    ):
+        payload, generated_at = services.get_spc_anomalies(
+            db_factory,
+            mode=get_mode(),
+            mask_ip_fn=mask_ip_fn,
+            redact_ips=redact_ips(),
+        )
+        body = {"generated_at": generated_at, **payload}
+        return cached_json_response(
+            request,
+            body,
+            max_age=int(services.SPC_TTL),
+        )
+
+    return router

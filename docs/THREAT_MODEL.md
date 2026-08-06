@@ -59,9 +59,10 @@ The important boundaries are:
 4. **Writers to SQLite.** Verdict, asset snapshots, and source provenance are
    committed together. Retryable model or persistence failures do not advance
    the relevant checkpoint.
-5. **Dashboard to operator.** The dashboard validates configured Host values,
-   but it has no user authentication by default and is intended for a trusted
-   private network.
+5. **Dashboard to operator.** The dashboard validates configured Host values
+   and is intended for a trusted private network. The JSON API may require
+   API keys (and always requires a credential for writes); the HTML UI uses a
+   same-origin write cookie rather than multi-user login.
 
 ## Attacker model
 
@@ -163,9 +164,14 @@ prompt projection remains hardening work.
 localhost, a tunnel, a private segmented network, or an authenticated proxy
 when the network between Core and Ollama is not fully trusted.
 
-**The dashboard is unauthenticated.** Host validation is not user
+**The dashboard UI is not multi-user SSO.** Host validation is not user
 authentication. Do not port-forward the dashboard; use a VPN or authenticated
-reverse proxy for remote access.
+reverse proxy for remote access. The JSON API supports optional API-key auth
+(`X-API-Key`, hashed keys, scopes `read` / `feedback:write`) and a same-origin
+HttpOnly write cookie for the built-in UI. Writes always require a credential.
+Unauthenticated reads remain available only when
+`TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true` (default). See
+[docs/api.md](api.md).
 
 **Retention remains an operator-controlled maintenance action.** The bounded,
 backup-first host runner restores monitoring between short deletion pauses and
