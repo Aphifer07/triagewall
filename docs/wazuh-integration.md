@@ -39,7 +39,13 @@ WAZUH_MIN_LEVEL=8
 WAZUH_START_MODE=end
 WAZUH_POSITION_PATH=/var/lib/triagewall/wazuh-position.json
 WAZUH_POLL_INTERVAL=10
+TZ=UTC
 ```
+
+Set `TZ` on the Triagewall wazuh-ingest service to the same timezone the
+Wazuh manager uses for daily `ossec-alerts-DD` rotation. Archive day
+boundaries follow that local calendar; a mismatched `TZ` can stop ingest
+fail-closed at rotation.
 
 `WAZUH_SOURCE_ID` must be a stable 1-64 character identifier using letters,
 digits, dots, underscores, or hyphens. Changing it while an existing checkpoint

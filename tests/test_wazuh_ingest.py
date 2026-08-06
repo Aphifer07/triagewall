@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -419,6 +420,97 @@ class WazuhCheckpointTests(unittest.TestCase):
         self.assertIn("oversized_record", failure[1])
         self.assertIn("sha256:", failure[2])
         self.assertEqual(state["offset"], self.alerts_path.stat().st_size)
+
+    def _with_timezone(self, tz_name: str):
+        """Temporarily apply ``tz_name`` for local-date archive boundaries."""
+        previous = os.environ.get("TZ")
+        os.environ["TZ"] = tz_name
+        time.tzset()
+
+        def restore():
+            if previous is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous
+            time.tzset()
+
+        self.addCleanup(restore)
+
+    def test_local_evening_does_not_prematurely_require_archive(self):
+        """UTC day can advance while Wazuh's local day (and archive) has not.
+
+        Example: America/New_York at 20:30 on Aug 5 is already Aug 6 00:30 UTC.
+        Using the UTC mtime date would demand Aug 5's archive before rotation.
+        """
+        self._with_timezone("America/New_York")
+        line = encoded(sample_alert("1.1", level=3))
+        self.alerts_path.write_bytes(line)
+        # 2026-08-06 00:30 UTC == 2026-08-05 20:30 America/New_York
+        ts = datetime(2026, 8, 6, 0, 30, tzinfo=timezone.utc).timestamp()
+        os.utime(self.alerts_path, (ts, ts))
+        self.assertEqual(
+            wazuh_ingest._current_log_date(self.alerts_path).isoformat(),
+            "2026-08-05",
+        )
+        state = wazuh_ingest._position_document(
+            datetime(2026, 8, 5).date(),
+            0,
+            self.alerts_path.stat().st_ino,
+            self.alerts_path.stat().st_size,
+        )
+        seen = []
+
+        def record(_conn, raw):
+            seen.append(json.loads(raw)["id"])
+            return CHECKPOINT_LINE
+
+        with patch.object(wazuh_ingest, "process_wazuh_record", record):
+            result = wazuh_ingest.process_available(self.conn, state)
+
+        self.assertEqual(seen, ["1.1"])
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(state["date"], "2026-08-05")
+        self.assertEqual(state["offset"], len(line))
+
+    def test_local_midnight_rotation_drains_archive_before_new_inode(self):
+        """Local midnight can rotate while the UTC mtime date is still yesterday.
+
+        Example: Europe/Berlin midnight Aug 6 is still Aug 5 22:00 UTC. A UTC
+        day check would see no date advance, hit the new inode, and fail closed
+        without draining ``ossec-alerts-05``.
+        """
+        self._with_timezone("Europe/Berlin")
+        first = encoded(sample_alert("1.1", level=3))
+        second = encoded(sample_alert("1.2", level=3))
+        archive_dir = self.root / "2026" / "Aug"
+        archive_dir.mkdir(parents=True)
+        archive = archive_dir / "ossec-alerts-05.json"
+        archive.write_bytes(first)
+        self.alerts_path.write_bytes(second)
+        # 2026-08-05 22:00 UTC == 2026-08-06 00:00 Europe/Berlin (CEST)
+        ts = datetime(2026, 8, 5, 22, 0, tzinfo=timezone.utc).timestamp()
+        os.utime(self.alerts_path, (ts, ts))
+        self.assertEqual(
+            wazuh_ingest._current_log_date(self.alerts_path).isoformat(),
+            "2026-08-06",
+        )
+        state = wazuh_ingest._position_document(
+            datetime(2026, 8, 5).date(), 0, 999999, 0
+        )
+        seen = []
+
+        def record(_conn, raw):
+            seen.append(json.loads(raw)["id"])
+            return CHECKPOINT_LINE
+
+        with patch.object(wazuh_ingest, "process_wazuh_record", record):
+            result = wazuh_ingest.process_available(self.conn, state)
+
+        self.assertEqual(seen, ["1.1", "1.2"])
+        self.assertEqual(result.scanned, 2)
+        self.assertEqual(state["date"], "2026-08-06")
+        self.assertEqual(state["offset"], len(second))
+        self.assertEqual(state["inode"], self.alerts_path.stat().st_ino)
 
 
 if __name__ == "__main__":
