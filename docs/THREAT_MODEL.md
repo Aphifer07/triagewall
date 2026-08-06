@@ -130,6 +130,40 @@ responses fail closed.
 - New Wazuh identities are deduplicated by source type, source instance, and
   source event ID. Instance-less identities use a separate unique constraint.
 
+#### Suricata `eve.json` rotation
+
+The Suricata checkpoint names a specific inode and byte offset. It is never
+abandoned merely because the live `eve.json` path now resolves to a different
+inode.
+
+- When the checkpointed inode is not the live inode, the rotated archive that
+  still owns that inode is drained first. Only affirmative evidence of a
+  complete drain — reopening that exact inode and observing a stable EOF —
+  allows the checkpoint to move on.
+- If the checkpointed inode is no longer present beside `eve.json`, ingest
+  fails closed and exits non-zero. A saved offset of `0` is *not* treated as
+  proof that the archive was read; it just as plausibly means the whole file
+  was still unread.
+- A renamed log is not assumed to be immutable. `logrotate` can move the path
+  while Suricata still holds the old descriptor and appends more records
+  through it, so EOF is confirmed across consecutive observations separated by
+  a bounded settle interval. Late appends are drained before the checkpoint
+  moves. The wait is bounded and yields to graceful shutdown.
+- Rotated-archive discovery is bounded: a single non-recursive scan of the
+  `eve.json` directory, restricted to regular files whose names begin with the
+  live file's name, rejecting symlinks, directories, devices, sockets and
+  FIFOs, and capped at a fixed number of directory entries.
+- Rotation ordering follows the documented schemes — `logrotate` numbering
+  (a higher index is older) and Suricata's dated archives — so a second
+  rotation that happens while ingest is still catching up drains the displaced
+  file before the new live file.
+- A file that shrank behind the saved offset, and an inode that changes between
+  `stat()` and `open()`, both leave the checkpoint untouched.
+- Known limitation: if the rotation chain position cannot be re-established
+  after a drain (for example, the archive was compressed and unlinked and no
+  recorded successor remains), ingest fails closed and asks an operator to
+  resolve the chain rather than guessing which archive comes next.
+
 ### Operator-facing output
 
 - Dashboard values are HTML-escaped.

@@ -13,8 +13,10 @@ Stop with Ctrl-C or systemd.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import spc
+import stat
 import time
 import json
 import sqlite3
@@ -81,6 +83,25 @@ DB_PATH = Path(
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))  # seconds
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
+# --- Rotation handling ---
+# Rotated eve.json archives are written beside the live file, inside the single
+# directory the deployment mounts as HOST_EVE_DIR. Discovery stays deliberately
+# bounded: one directory, never recursive, never through a symlink, regular
+# files only, and a hard cap on how many entries we are willing to examine.
+MAX_ROTATION_SCAN_ENTRIES = 512
+COMPRESSED_ROTATION_SUFFIXES = (".gz", ".bz2", ".xz", ".zst")
+_NUMBERED_ROTATION_RE = re.compile(r"^\.(\d+)$")
+
+# A renamed eve.json is NOT immutable. logrotate (and Suricata's own rotation)
+# can move the path while the writer still holds the old descriptor open and
+# appends more records through it. Treating the first EOF as "fully drained"
+# silently loses those records, so an inode is only abandoned after consecutive
+# unchanged EOF observations spaced by a bounded settle interval.
+EOF_STABLE_OBSERVATIONS = max(
+    2, int(os.environ.get("EVE_EOF_STABLE_OBSERVATIONS", "2"))
+)
+EOF_SETTLE_INTERVAL = float(os.environ.get("EVE_EOF_SETTLE_SECONDS", "1.0"))
+
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -135,78 +156,226 @@ def save_position(state):
     POSITION_PATH.write_text(json.dumps(state))
 
 
-def _find_path_for_inode(directory: Path, inode: int) -> Path | None:
-    """Return a regular file under directory whose inode matches, if any."""
+def _rotation_sort_key(name: str, live_name: str):
+    """Order eve.json siblings oldest-first using documented rotation schemes.
+
+    logrotate numbers archives so that a *higher* index is older
+    (``eve.json.2`` predates ``eve.json.1``). Suricata's own dated archives
+    (``eve.json-20260806``) sort oldest-first lexicographically. The live file
+    is always the newest member of the chain.
+    """
+    if name == live_name:
+        return (2, 0, "")
+    suffix = name[len(live_name):]
+    for compressed in COMPRESSED_ROTATION_SUFFIXES:
+        if suffix.endswith(compressed):
+            suffix = suffix[: -len(compressed)]
+            break
+    numbered = _NUMBERED_ROTATION_RE.match(suffix)
+    if numbered:
+        return (0, -int(numbered.group(1)), "")
+    return (1, 0, suffix)
+
+
+def _scan_eve_chain(live_path: Path) -> list[tuple[str, Path, os.stat_result]]:
+    """Return the bounded, oldest-first rotation chain beside ``live_path``.
+
+    Only plausible rotated siblings are considered: entries in the eve.json
+    directory whose name starts with the live file's name. Symlinks,
+    directories, devices, sockets and FIFOs are rejected outright, the scan
+    never recurses, and it stops after ``MAX_ROTATION_SCAN_ENTRIES`` entries.
+    """
+    directory = live_path.parent
+    prefix = live_path.name
+    chain: list[tuple[str, Path, os.stat_result]] = []
+    examined = 0
     try:
-        candidates = sorted(directory.iterdir(), key=lambda path: path.name)
-    except OSError:
-        return None
-    for path in candidates:
-        try:
-            if path.is_symlink() or not path.is_file():
-                continue
-            if path.stat().st_ino == inode:
-                return path
-        except OSError:
-            continue
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                examined += 1
+                if examined > MAX_ROTATION_SCAN_ENTRIES:
+                    log.warning(
+                        "Stopped scanning %s for rotated eve.json archives after "
+                        "%d entries; rotation recovery may be incomplete",
+                        directory,
+                        MAX_ROTATION_SCAN_ENTRIES,
+                    )
+                    break
+                if not entry.name.startswith(prefix):
+                    continue
+                try:
+                    if entry.is_symlink():
+                        # Never follow a symlink out of the eve.json directory.
+                        continue
+                    # DirEntry.stat(follow_symlinks=False) reports st_ino == 0 on
+                    # Windows, so stat the (already proven non-symlink) path.
+                    entry_stat = os.stat(entry.path)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(entry_stat.st_mode):
+                    continue
+                chain.append((entry.name, Path(entry.path), entry_stat))
+    except OSError as exc:
+        log.warning(
+            "Could not scan %s for rotated eve.json archives: %s", directory, exc
+        )
+        return []
+    chain.sort(key=lambda item: _rotation_sort_key(item[0], prefix))
+    return chain
+
+
+def _chain_index_of_inode(
+    chain: list[tuple[str, Path, os.stat_result]], inode: int
+) -> int | None:
+    for index, (_name, _path, entry_stat) in enumerate(chain):
+        if entry_stat.st_ino == inode:
+            return index
     return None
 
 
-def _resolve_readable_eve(state: dict, live_stat: os.stat_result) -> tuple[Path, os.stat_result]:
+def _successor_in_chain(
+    live_path: Path, inode: int
+) -> tuple[Path, os.stat_result] | None:
+    """Return the archive that directly follows ``inode`` in the rotation chain."""
+    chain = _scan_eve_chain(live_path)
+    index = _chain_index_of_inode(chain, inode)
+    if index is None or index + 1 >= len(chain):
+        return None
+    _name, path, entry_stat = chain[index + 1]
+    return path, entry_stat
+
+
+@dataclass(frozen=True)
+class EveSource:
+    """The file that currently owns the durable checkpoint."""
+
+    path: Path
+    stat: os.stat_result
+    # True when this is a rotated archive rather than the live eve.json.
+    draining: bool
+    # Chain successor recorded *before* draining, so the chain position survives
+    # logrotate compressing (and unlinking) this archive while we read it.
+    successor_hint: tuple[Path, int] | None
+
+
+def _resolve_checkpoint_source(
+    state: dict, live_stat: os.stat_result
+) -> EveSource | None:
     """Choose the file that still owns the durable checkpoint.
 
-    Suricata/logrotate renames ``eve.json`` and creates a new live file. When a
-    checkpoint still points at the previous inode, drain that rotated file
-    before following the live path. If the previous inode is gone and unread
-    bytes remain, fail closed rather than silently skipping alerts.
+    Suricata/logrotate renames ``eve.json`` and creates a new live file. While
+    a checkpoint still points at the previous inode, that archive must be
+    drained before the live path is followed. Returns ``None`` when the
+    filesystem is mid-rename and the caller should simply re-resolve.
     """
     live_inode = live_stat.st_ino
     checkpoint_inode = state.get("inode")
     offset = int(state.get("offset") or 0)
 
-    if checkpoint_inode is None or checkpoint_inode == live_inode:
+    if checkpoint_inode is None:
+        # First run: adopt the live file and read it from the saved offset.
         if live_stat.st_size < offset:
-            raise IngestCheckpointError(
-                f"{EVE_PATH} shrank behind the durable checkpoint "
-                f"(size {live_stat.st_size} < offset {offset}); "
-                "refusing to skip unread alerts"
-            )
-        return EVE_PATH, live_stat
+            raise IngestCheckpointError(_shrank_message(EVE_PATH, live_stat, offset))
+        return EveSource(EVE_PATH, live_stat, draining=False, successor_hint=None)
 
-    rotated = _find_path_for_inode(EVE_PATH.parent, checkpoint_inode)
-    if rotated is not None:
-        try:
-            if rotated.resolve() != EVE_PATH.resolve():
-                rotated_stat = rotated.stat()
-                if rotated_stat.st_size < offset:
-                    raise IngestCheckpointError(
-                        f"rotated eve.json {rotated} shrank behind the durable "
-                        f"checkpoint (size {rotated_stat.st_size} < offset {offset})"
-                    )
-                log.info(
-                    "eve.json rotated; draining unread records from %s before "
-                    "following the live file",
-                    rotated,
-                )
-                return rotated, rotated_stat
-        except OSError as exc:
-            raise IngestCheckpointError(
-                f"rotated eve.json for inode {checkpoint_inode} is unreadable: {exc}"
-            ) from exc
+    if checkpoint_inode == live_inode:
+        if live_stat.st_size < offset:
+            raise IngestCheckpointError(_shrank_message(EVE_PATH, live_stat, offset))
+        return EveSource(EVE_PATH, live_stat, draining=False, successor_hint=None)
 
-    if offset > 0:
+    chain = _scan_eve_chain(EVE_PATH)
+    index = _chain_index_of_inode(chain, checkpoint_inode)
+    if index is None:
+        # The checkpointed inode is gone. A zero offset is NOT evidence that the
+        # archive was drained -- it just as plausibly means the whole file was
+        # still unread -- so fail closed either way.
+        raise IngestCheckpointError(_missing_inode_message(checkpoint_inode, offset))
+
+    name, rotated_path, rotated_stat = chain[index]
+    if name == EVE_PATH.name:
+        # The live path was replaced between the stat above and this scan.
+        return None
+
+    if rotated_stat.st_size < offset:
         raise IngestCheckpointError(
-            "eve.json inode changed while a durable checkpoint still points at "
-            f"unread bytes in the previous file (inode={checkpoint_inode}, "
-            f"offset={offset}); refusing to skip alerts. Restore the rotated "
-            f"file beside {EVE_PATH} or reset {POSITION_PATH} only after confirming "
-            "the previous file was fully processed."
+            _shrank_message(rotated_path, rotated_stat, offset)
         )
 
-    # No unread bytes remain; safe to follow the replacement live file.
-    state["inode"] = live_inode
-    state["offset"] = 0
-    return EVE_PATH, live_stat
+    successor_hint = None
+    if index + 1 < len(chain):
+        _next_name, next_path, next_stat = chain[index + 1]
+        successor_hint = (next_path, next_stat.st_ino)
+
+    log.info(
+        "eve.json rotated; draining unread records from %s (inode %s, offset %s) "
+        "before following the live file",
+        rotated_path,
+        checkpoint_inode,
+        offset,
+    )
+    return EveSource(
+        rotated_path, rotated_stat, draining=True, successor_hint=successor_hint
+    )
+
+
+def _shrank_message(path: Path, path_stat: os.stat_result, offset: int) -> str:
+    return (
+        f"{path} shrank behind the durable checkpoint "
+        f"(size {path_stat.st_size} < offset {offset}); refusing to skip unread "
+        "alerts. Recovery: restore the file that produced this checkpoint, or "
+        "have an operator record the resulting alert gap before the checkpoint "
+        "is changed."
+    )
+
+
+def _missing_inode_message(inode: int, offset: int) -> str:
+    return (
+        f"the eve.json checkpoint points at inode {inode} (offset {offset}) but no "
+        f"regular file with that inode remains in {EVE_PATH.parent}. Triagewall "
+        "has no evidence that the previous file was fully drained -- an offset of "
+        "0 can equally mean the entire archive was still unread -- so it will not "
+        "skip ahead to the current eve.json. Recovery: restore the rotated archive "
+        f"for inode {inode} into {EVE_PATH.parent} (for example from the logrotate "
+        "archive or a backup) and restart ingest, which resumes at offset "
+        f"{offset}. If that log is genuinely unrecoverable, an operator must "
+        "decide and record the resulting alert gap before replacing "
+        f"{POSITION_PATH}."
+    )
+
+
+def _await_stable_eof(handle) -> bool:
+    """Return True once this descriptor has held EOF across bounded rechecks.
+
+    A renamed eve.json is not immutable: logrotate can move the path while
+    Suricata still holds the old descriptor and appends more records through it.
+    Treating the first EOF as "drained" loses those records, so require
+    consecutive unchanged observations, spaced by a bounded settle interval,
+    before any caller is allowed to leave this inode. Returns False when more
+    bytes appeared (keep draining) or when shutdown was requested.
+    """
+    position = handle.tell()
+    observations = 0
+    while observations < EOF_STABLE_OBSERVATIONS:
+        try:
+            size = os.fstat(handle.fileno()).st_size
+        except OSError as exc:
+            log.warning("Could not re-stat the open eve.json descriptor: %s", exc)
+            # Back off so a persistently failing descriptor cannot spin the
+            # caller's EOF retry loop.
+            time.sleep(EOF_SETTLE_INTERVAL)
+            return False
+        if size > position:
+            # A late append landed after we first saw EOF.
+            return False
+        observations += 1
+        if observations >= EOF_STABLE_OBSERVATIONS:
+            break
+        time.sleep(EOF_SETTLE_INTERVAL)
+        if _stop:
+            # Graceful shutdown: leave the checkpoint on this inode so the next
+            # start resumes the drain instead of skipping ahead.
+            return False
+    return True
 
 
 def _line_is_complete(line):
@@ -469,27 +638,20 @@ def tail_file():
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                read_path, read_stat = _resolve_readable_eve(state, disk_stat)
-                current_inode = read_stat.st_ino
-                current_size = read_stat.st_size
-
-                # Finished draining a rotated file; follow the live replacement.
-                if read_path != EVE_PATH and current_size == state["offset"]:
-                    live = eve_disk_stat()
-                    if live is None:
-                        time.sleep(POLL_INTERVAL)
-                        continue
-                    log.info(
-                        "Finished draining rotated eve.json; following live file %s",
-                        EVE_PATH,
-                    )
-                    state["offset"] = 0
-                    state["inode"] = live.st_ino
-                    state["size"] = live.st_size
-                    save_position(state)
+                source = _resolve_checkpoint_source(state, disk_stat)
+                if source is None:
+                    # Mid-rename race; re-resolve without touching the checkpoint.
+                    time.sleep(POLL_INTERVAL)
                     continue
 
-                if current_size == state["offset"]:
+                read_path = source.path
+                current_inode = source.stat.st_ino
+                current_size = source.stat.st_size
+
+                # A rotated archive must be reopened and confirmed at a stable EOF
+                # before its checkpoint may move, so the idle shortcut below only
+                # applies while we are following the live file.
+                if not source.draining and current_size == state["offset"]:
                     # Nothing new
                     time.sleep(POLL_INTERVAL)
                     continue
@@ -504,9 +666,14 @@ def tail_file():
                     # Stat/open race: the path we chose may have been replaced before open.
                     if open_inode != current_inode:
                         log.info(
-                            "eve.json inode changed between stat and open; retrying without "
-                            "advancing the durable checkpoint"
+                            "%s changed identity between stat and open (expected inode "
+                            "%s, opened %s); retrying without advancing the durable "
+                            "checkpoint",
+                            read_path,
+                            current_inode,
+                            open_inode,
                         )
+                        time.sleep(POLL_INTERVAL)
                         continue
                     f.seek(state["offset"])
                     if f.tell() != state["offset"]:
@@ -518,51 +685,66 @@ def tail_file():
                     while not _stop:
                         line = f.readline()
                         if not line:
-                            # EOF: decide whether we're waiting for more bytes, or the file rotated.
-                            if read_path != EVE_PATH:
-                                # Rotated files are immutable after rename; EOF means drain complete.
-                                live = eve_disk_stat()
-                                if live is None:
-                                    time.sleep(POLL_INTERVAL)
-                                    continue
-                                log.info(
-                                    "Finished draining rotated eve.json; following live file %s",
-                                    EVE_PATH,
-                                )
-                                state["offset"] = 0
-                                state["inode"] = live.st_ino
-                                state["size"] = live.st_size
-                                save_position(state)
+                            # EOF. Never abandon this descriptor on a single
+                            # observation: a renamed eve.json can still receive
+                            # appends from the writer holding the old descriptor.
+                            if not _await_stable_eof(f):
+                                if _stop:
+                                    break
+                                # Late append: keep draining this inode.
+                                continue
+
+                            live = eve_disk_stat()
+                            if live is None:
+                                # Mid-rename: the live path is momentarily absent.
+                                time.sleep(POLL_INTERVAL)
                                 break
 
-                            disk = eve_disk_stat()
-                            if disk is None:
-                                # Race during rotation/rename; wait briefly and retry.
-                                time.sleep(POLL_INTERVAL)
-                                continue
+                            if not source.draining and live.st_ino == open_inode:
+                                # Still the live file; just waiting for more data.
+                                break
 
-                            if disk.st_ino != open_inode:
-                                log.info(
-                                    "Detected eve.json rotation (inode changed); "
-                                    "reopening new file from start"
+                            # This descriptor held a stable EOF, so every complete
+                            # record on this inode is durably processed or
+                            # quarantined. Only now may the checkpoint leave it.
+                            successor = _successor_in_chain(EVE_PATH, open_inode)
+                            if successor is None and source.successor_hint is not None:
+                                # logrotate may have compressed (and unlinked) the
+                                # archive we just drained. Fall back to the chain
+                                # position recorded before the drain started.
+                                hint_path, hint_inode = source.successor_hint
+                                try:
+                                    hint_stat = os.stat(hint_path)
+                                except OSError:
+                                    hint_stat = None
+                                if hint_stat is not None and hint_stat.st_ino == hint_inode:
+                                    successor = (hint_path, hint_stat)
+                            if successor is None:
+                                raise IngestCheckpointError(
+                                    f"drained eve.json inode {open_inode} but its "
+                                    f"position in the rotation chain under "
+                                    f"{EVE_PATH.parent} can no longer be determined, "
+                                    "so the next archive to read is unknown. "
+                                    "Triagewall will not guess and risk skipping "
+                                    "alerts. Recovery: stop the rotation tooling, "
+                                    "confirm which archive follows inode "
+                                    f"{open_inode}, and have an operator set "
+                                    f"{POSITION_PATH} to that file's inode with "
+                                    "offset 0."
                                 )
-                                state["offset"] = 0
-                                state["inode"] = disk.st_ino
-                                state["size"] = disk.st_size
-                                save_position(state)
-
-                                f.close()
-                                f = open(EVE_PATH, "r")
-                                open_inode = os.fstat(f.fileno()).st_ino
-                                if open_inode != disk.st_ino:
-                                    log.info(
-                                        "Live eve.json changed again while reopening; retrying"
-                                    )
-                                    break
-                                f.seek(0)
-                                continue
-
-                            # Same inode, waiting for more data.
+                            next_path, next_stat = successor
+                            log.info(
+                                "Drained eve.json inode %s (%s); following %s "
+                                "(inode %s) from offset 0",
+                                open_inode,
+                                read_path,
+                                next_path,
+                                next_stat.st_ino,
+                            )
+                            state["offset"] = 0
+                            state["inode"] = next_stat.st_ino
+                            state["size"] = next_stat.st_size
+                            save_position(state)
                             break
 
                         if not _line_is_complete_or_wait(line):
@@ -616,7 +798,11 @@ def main() -> int:
             demo_loop()
         else:
             tail_file()
-    except (OSError, RuntimeError, sqlite3.Error, IngestCheckpointError) as exc:
+    except IngestCheckpointError as exc:
+        # Fail closed: the daemon exits non-zero rather than skipping alerts.
+        log.critical("Suricata ingest stopped to avoid skipping alerts: %s", exc)
+        return 1
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
         log.critical("Suricata ingest startup failed: %s", exc)
         return 1
     return 0
