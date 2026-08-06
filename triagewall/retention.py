@@ -112,6 +112,10 @@ class RetentionDeadlineExceeded(RuntimeError):
     """Raised when pre-prune work consumes the bounded maintenance window."""
 
 
+class RetentionCleanupError(RuntimeError):
+    """Raised when authorization cleanup leaves the connection unusable."""
+
+
 def _remaining_busy_timeout_ms(
     deadline: float | None,
     clock: Callable[[], float],
@@ -154,11 +158,84 @@ def _restore_sqlite_busy_timeout(
         conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
 
 
-def _retention_predicate(include_reviewed: bool) -> str:
-    predicate = "processed_at IS NOT NULL AND processed_at < ?"
+def _retention_predicate(include_reviewed: bool, alias: str = "") -> str:
+    """The eligibility predicate shared by planning, pruning and authorization.
+
+    ``alias`` qualifies each column so the identical predicate can be reused in
+    a joined statement without drifting from what pruning actually deletes.
+    """
+    prefix = f"{alias}." if alias else ""
+    predicate = (
+        f"{prefix}processed_at IS NOT NULL AND {prefix}processed_at < ?"
+    )
     if not include_reviewed:
-        predicate += " AND human_verdict IS NULL"
+        predicate += f" AND {prefix}human_verdict IS NULL"
     return predicate
+
+
+# Columns that carry analyst feedback. Comparing them directly against the
+# verified backup is what authorizes an --include-reviewed prune; `reviewed_at`
+# alone is only a proxy and misses SQL/admin edits that leave it NULL or stale.
+FEEDBACK_COLUMNS = ("human_verdict", "human_notes", "agreed", "reviewed_at")
+
+
+def _backup_feedback_authorization_sql() -> str:
+    """Build the statement that proves the backup holds the latest feedback.
+
+    The live side stays bounded by the verified backup sequence, the retention
+    cutoff and the same reviewed-row predicate pruning uses. The backup side is
+    a correlated primary-key lookup on ``triage_events.id`` -- never a scan of
+    the whole backup feedback table per eligible live row.
+
+    SQLite's ``IS`` is null-safe equality (equivalent to the newer
+    ``IS NOT DISTINCT FROM``), so a NULL on one side and a value on the other
+    correctly counts as a difference.
+    """
+    comparisons = "\n                              ".join(
+        f"AND bak.{column} IS live.{column}" for column in FEEDBACK_COLUMNS
+    )
+    return f"""SELECT 1
+                        FROM main.triage_events AS live
+                        WHERE live.id <= ?
+                          AND {_retention_predicate(True, alias="live")}
+                          AND live.human_verdict IS NOT NULL
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM verified_backup.triage_events AS bak
+                            WHERE bak.id = live.id
+                              {comparisons}
+                          )
+                        LIMIT 1"""
+
+
+def _readonly_backup_uri(backup: Path) -> str:
+    """A SQLite URI that attaches the verified backup read-only.
+
+    ``Path.as_uri()`` produces an absolute, percent-encoded URI on both POSIX
+    and Windows, which a hand-built ``file:{path}`` string does not.
+    """
+    return f"{backup.resolve().as_uri()}?mode=ro"
+
+
+def _detach_verified_backup(conn: sqlite3.Connection) -> None:
+    """Detach the comparison backup without masking an in-flight failure."""
+    in_flight = sys.exc_info()[1]
+    try:
+        conn.execute("DETACH DATABASE verified_backup")
+    except sqlite3.Error as exc:
+        if in_flight is not None:
+            # A deadline interrupt (or any earlier error) is the useful
+            # diagnosis; never replace it with a cleanup error.
+            print(
+                f"warning: could not detach the verified backup during "
+                f"cleanup: {exc}",
+                file=sys.stderr,
+            )
+            return
+        raise RetentionCleanupError(
+            "could not detach the verified backup after authorization; the "
+            "source connection may still have it attached"
+        ) from exc
 
 
 def build_retention_plan(
@@ -1518,6 +1595,7 @@ def validate_backup_manifest(
             lambda: 1 if clock() >= deadline else 0,
             1_000,
         )
+    progress_handler_cleared = False
     try:
         # This safety check is about rows inserted after the backup. Without
         # NOT INDEXED, SQLite can choose idx_triage_processed and scan the
@@ -1539,37 +1617,27 @@ def validate_backup_manifest(
             # backup re-hash, so writers stay stopped only briefly.
             source_conn.execute(
                 "ATTACH DATABASE ? AS verified_backup",
-                (f"file:{backup.resolve()}?mode=ro",),
+                (_readonly_backup_uri(backup),),
             )
             try:
-                post_backup_feedback = source_conn.execute(
-                    f"""SELECT 1
-                        FROM main.triage_events AS live
-                        WHERE live.id <= ?
-                          AND live.processed_at IS NOT NULL
-                          AND live.processed_at < ?
-                          AND live.human_verdict IS NOT NULL
-                          AND NOT EXISTS (
-                            SELECT 1
-                            FROM verified_backup.triage_events AS bak
-                            WHERE bak.id = live.id
-                              AND bak.human_verdict
-                                  IS NOT DISTINCT FROM live.human_verdict
-                              AND bak.human_notes
-                                  IS NOT DISTINCT FROM live.human_notes
-                              AND bak.agreed
-                                  IS NOT DISTINCT FROM live.agreed
-                              AND bak.reviewed_at
-                                  IS NOT DISTINCT FROM live.reviewed_at
-                          )
-                        LIMIT 1""",
-                    (
-                        backup_sequence,
-                        canonical_cutoff,
-                    ),
-                ).fetchone()
+                cursor = source_conn.execute(
+                    _backup_feedback_authorization_sql(),
+                    (backup_sequence, canonical_cutoff),
+                )
+                try:
+                    post_backup_feedback = cursor.fetchone()
+                finally:
+                    # Finalize the statement; SQLite refuses to DETACH a
+                    # database that still has an active read on it.
+                    cursor.close()
             finally:
-                source_conn.execute("DETACH DATABASE verified_backup")
+                # Clear the progress handler *before* any cleanup statement.
+                # Otherwise an expired deadline interrupts DETACH as well and
+                # the cleanup error masks the deadline error being unwound.
+                if deadline is not None:
+                    source_conn.set_progress_handler(None, 0)
+                    progress_handler_cleared = True
+                _detach_verified_backup(source_conn)
     except sqlite3.OperationalError as exc:
         if deadline is not None and clock() >= deadline:
             raise RetentionDeadlineExceeded(
@@ -1577,8 +1645,10 @@ def validate_backup_manifest(
             ) from exc
         raise
     finally:
-        if deadline is not None:
+        if deadline is not None and not progress_handler_cleared:
             source_conn.set_progress_handler(None, 0)
+        # Always restore the caller's lock-wait policy, even if cleanup above
+        # failed, so the source connection is left usable.
         _restore_sqlite_busy_timeout(
             source_conn,
             previous_busy_timeout_ms,
