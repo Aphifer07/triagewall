@@ -631,6 +631,114 @@ class RetentionTests(unittest.TestCase):
                 include_reviewed=True,
             )
 
+    def test_manifest_rejects_post_backup_feedback_with_null_reviewed_at(self):
+        """NULL reviewed_at must not bypass include-reviewed authorization."""
+        event_id = self.insert_event(age_days=60, signature_id=333)
+        backup_path = Path(self.temp_dir.name) / "null-reviewed.db"
+        manifest_path = Path(self.temp_dir.name) / "null-reviewed.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        self.conn.execute(
+            """UPDATE triage_events
+               SET human_verdict = 'false_positive',
+                   human_notes = 'sql review without reviewed_at',
+                   agreed = 1,
+                   reviewed_at = NULL
+               WHERE id = ?""",
+            (event_id,),
+        )
+        self.conn.commit()
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+
+        validate_backup_manifest(
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+            cutoff=cutoff,
+        )
+        with self.assertRaisesRegex(ValueError, "latest feedback"):
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+                cutoff=cutoff,
+                include_reviewed=True,
+            )
+
+    def test_manifest_allows_pre_backup_feedback_with_null_reviewed_at(self):
+        """Unchanged pre-backup feedback is authorized even without reviewed_at."""
+        self.insert_event(
+            age_days=60,
+            signature_id=334,
+            human_verdict="real",
+        )
+        backup_path = Path(self.temp_dir.name) / "pre-backup-feedback.db"
+        manifest_path = Path(self.temp_dir.name) / (
+            "pre-backup-feedback.manifest.json"
+        )
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        validate_backup_manifest(
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+            cutoff=cutoff,
+            include_reviewed=True,
+        )
+
+    def test_manifest_rejects_feedback_mutation_with_stale_reviewed_at(self):
+        """Mutating feedback while leaving an old reviewed_at must fail closed."""
+        event_id = self.insert_event(age_days=60, signature_id=335)
+        old_reviewed_at = format_utc_timestamp(
+            self.now - timedelta(days=40)
+        )
+        self.conn.execute(
+            """UPDATE triage_events
+               SET human_verdict = 'real', human_notes = 'original',
+                   agreed = 0, reviewed_at = ?
+               WHERE id = ?""",
+            (old_reviewed_at, event_id),
+        )
+        self.conn.commit()
+        backup_path = Path(self.temp_dir.name) / "stale-reviewed.db"
+        manifest_path = Path(self.temp_dir.name) / "stale-reviewed.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        self.conn.execute(
+            """UPDATE triage_events
+               SET human_verdict = 'false_positive',
+                   human_notes = 'changed without bumping reviewed_at',
+                   agreed = 1
+               WHERE id = ?""",
+            (event_id,),
+        )
+        self.conn.commit()
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        with self.assertRaisesRegex(ValueError, "latest feedback"):
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+                cutoff=cutoff,
+                include_reviewed=True,
+            )
+
     def test_verify_rejects_backup_provenance_from_another_database(self):
         other_path = Path(self.temp_dir.name) / "other.db"
         other_conn = connect_database(other_path)

@@ -1531,20 +1531,45 @@ def validate_backup_manifest(
         ).fetchone()
         post_backup_feedback = None
         if include_reviewed:
-            post_backup_feedback = source_conn.execute(
-                f"""SELECT 1
-                    FROM triage_events
-                    WHERE id <= ? AND {predicate}
-                      AND human_verdict IS NOT NULL
-                      AND reviewed_at IS NOT NULL
-                      AND reviewed_at >= ?
-                    LIMIT 1""",
-                (
-                    backup_sequence,
-                    canonical_cutoff,
-                    format_utc_timestamp(created_at),
-                ),
-            ).fetchone()
+            # Compare live feedback to the verified backup. A reviewed_at
+            # timestamp proxy misses SQL/admin updates that leave
+            # reviewed_at NULL (or older than backup creation), which would
+            # otherwise let --include-reviewed delete feedback the backup
+            # does not contain. ATTACH is a targeted lookup, not a full
+            # backup re-hash, so writers stay stopped only briefly.
+            source_conn.execute(
+                "ATTACH DATABASE ? AS verified_backup",
+                (f"file:{backup.resolve()}?mode=ro",),
+            )
+            try:
+                post_backup_feedback = source_conn.execute(
+                    f"""SELECT 1
+                        FROM main.triage_events AS live
+                        WHERE live.id <= ?
+                          AND live.processed_at IS NOT NULL
+                          AND live.processed_at < ?
+                          AND live.human_verdict IS NOT NULL
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM verified_backup.triage_events AS bak
+                            WHERE bak.id = live.id
+                              AND bak.human_verdict
+                                  IS NOT DISTINCT FROM live.human_verdict
+                              AND bak.human_notes
+                                  IS NOT DISTINCT FROM live.human_notes
+                              AND bak.agreed
+                                  IS NOT DISTINCT FROM live.agreed
+                              AND bak.reviewed_at
+                                  IS NOT DISTINCT FROM live.reviewed_at
+                          )
+                        LIMIT 1""",
+                    (
+                        backup_sequence,
+                        canonical_cutoff,
+                    ),
+                ).fetchone()
+            finally:
+                source_conn.execute("DETACH DATABASE verified_backup")
     except sqlite3.OperationalError as exc:
         if deadline is not None and clock() >= deadline:
             raise RetentionDeadlineExceeded(
