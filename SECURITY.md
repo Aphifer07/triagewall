@@ -25,7 +25,8 @@ During pre-release (current), only the latest commit on `main` is supported. Onc
 In scope:
 - Bugs in Triagewall's ingestion, triage, or dashboard code
 - Vulnerabilities in the prefilter logic
-- Authentication or authorization issues (when added in v0.1+)
+- Authentication or authorization issues in the HTTP API (API keys, scopes,
+  dashboard write cookie) and related configuration
 - Data leakage or information exposure
 
 Out of scope (please report to the upstream project):
