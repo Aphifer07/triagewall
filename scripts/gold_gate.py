@@ -888,6 +888,40 @@ def load_labeled_rows(db_path, limit=None) -> list[dict]:
     return rows
 
 
+# Bumped whenever the dataset-revision construction changes, so a revision
+# computed under an older scheme can never be mistaken for a current one.
+DATASET_REVISION_SCHEME = "gold-set-dataset-revision-v2"
+
+
+def dataset_revision(rows) -> str:
+    """Bind the dataset revision to the labeled alert *content*.
+
+    Row identity, human label and source type do not change when an alert is
+    edited in place, so a silently mutated gold set could keep reusing approved
+    evidence: the gate would compare new behaviour against a baseline measured
+    on different alerts and call it unchanged. Each row therefore also
+    contributes a digest of its canonicalized alert.
+
+    Canonical JSON sorts keys recursively, so the revision is stable across
+    irrelevant JSON key ordering while still moving for any content change.
+
+    Only the aggregate is ever emitted. Per-row digests stay local: publishing
+    them would let anyone holding a candidate alert confirm whether that exact
+    alert -- and therefore the host, address or signature in it -- is part of
+    the labeled set.
+    """
+    contributions = [
+        [
+            row["id"],
+            row["human_verdict"],
+            row["source_type"],
+            digest(row["alert"]),
+        ]
+        for row in rows
+    ]
+    return digest([DATASET_REVISION_SCHEME, contributions])
+
+
 def evaluate(db_path, *, limit=None, commit="unknown") -> dict:
     """
     Run the labeled set through the real production classification path.
@@ -967,9 +1001,7 @@ def evaluate(db_path, *, limit=None, commit="unknown") -> dict:
             "count": triage.ASSET_INVENTORY.count,
         },
         "dataset": {
-            "revision": digest(
-                [[row["id"], row["human_verdict"], row["source_type"]] for row in rows]
-            ),
+            "revision": dataset_revision(rows),
             "total": len(rows),
             "class_counts": class_counts,
             "source_counts": source_counts,

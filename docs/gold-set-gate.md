@@ -25,6 +25,15 @@ They are not a valid baseline for v0.3 and are not used as one.
 GitHub CI also has no GPU and no Ollama, so a real-model run cannot be a
 required check. That constraint is what the two-layer split exists to handle.
 
+## This gate is not an adversarial probe suite
+
+The gold-set gate is a **deterministic behaviour and performance gate** over a
+human-labeled set. It is not a Garak implementation and does not claim Garak
+coverage. The full-pipeline Garak injection gate remains an open roadmap item
+and is tracked separately; keeping the two apart matters because a deterministic
+regression gate and an adversarial probe suite fail for different reasons and
+need different review.
+
 ## The behavior fingerprint
 
 Layer 1 hashes what the model can actually see, not the bytes of the files
@@ -129,6 +138,43 @@ Ground truth stays human-labeled. The model does not label its own test set.
 Each run reports Wazuh label counts so a genuine multi-source gold set can be
 built once those labels exist.
 
+## What the dataset revision protects
+
+`dataset.revision` answers one question: *is this evidence still describing the
+same evaluation?* Comparison refuses to run when a candidate's revision differs
+from the approved baseline's, because metrics measured on a different set of
+alerts are not comparable.
+
+For that to mean anything, the revision has to move whenever the evaluation
+changes. It is a digest over, for every labeled row in `id` order:
+
+- the row identity,
+- the human label,
+- the source type, and
+- **a digest of the canonicalized alert content**.
+
+The last item matters. Identity, label and source type all stay the same when
+an alert is edited in place — a corrected address, a re-encoded field, a
+tampered signature — so a revision built from those alone would let a silently
+mutated gold set keep reusing approved evidence. The gate would then compare
+new behaviour against a baseline measured on different alerts and report no
+change.
+
+So the revision changes when any of these change:
+
+| Change | Revision moves |
+| --- | --- |
+| Alert content (including nested fields) | yes |
+| Row identity | yes |
+| Human label | yes |
+| Source type | yes |
+| The selected evaluation population (rows added, removed, or limited) | yes |
+| JSON key ordering within an alert | **no** — canonical JSON sorts keys recursively |
+
+It does **not** protect against a reviewer approving a bad label, and it is not
+an integrity check on the database itself. It only guarantees that a change to
+what is being measured is visible as a change in the evidence.
+
 ## What the evidence contains
 
 Evidence carries metrics, counts, and hashes. It does not carry raw alerts,
@@ -136,6 +182,13 @@ model reasoning, addresses, hostnames, agent names, or inventory contents. The
 asset inventory appears only as its revision hash and asset count, both of
 which are already non-disclosing. A regression test asserts that alert content
 from the labeled set never appears in an emitted manifest.
+
+Only the **final aggregate** `dataset.revision` is committed. The per-row alert
+digests that feed it are computed locally and discarded. Publishing them would
+create an avoidable correlation risk: anyone holding a candidate alert could
+hash it and confirm whether that exact alert — and therefore the host, address
+or signature inside it — is part of the labeled set. A regression test asserts
+no per-row digest appears in an emitted manifest.
 
 ## Evidence integrity
 
