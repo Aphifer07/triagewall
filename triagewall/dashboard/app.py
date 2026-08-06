@@ -302,8 +302,7 @@ def custom_openapi():
         "in": "header",
         "name": API_KEY_HEADER_NAME,
         "description": (
-            "PBKDF2-hashed keys configured via TRIAGEWALL_API_KEYS "
-            "(legacy SHA-256 hex still accepted). "
+            "PBKDF2-hashed keys configured via TRIAGEWALL_API_KEYS. "
             "Scopes: read, feedback:write. Unversioned /api/* aliases are "
             "deprecated and scheduled for removal on 2026-12-31."
         ),

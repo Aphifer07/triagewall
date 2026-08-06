@@ -101,20 +101,12 @@ def _parse_pbkdf2_hash(value: str) -> tuple[int, bytes, str] | None:
     return iterations, salt, digest_hex.lower()
 
 
-def _is_legacy_sha256_hex(value: str) -> bool:
-    return len(value) == 64 and all(
-        c in "0123456789abcdef" for c in value.lower()
-    )
-
-
 def _validate_key_hash(name: str, key_hash: str) -> str:
     if _parse_pbkdf2_hash(key_hash) is not None:
         return key_hash
-    if _is_legacy_sha256_hex(key_hash):
-        return key_hash.lower()
     raise RuntimeError(
         f"TRIAGEWALL_API_KEYS hash for {name!r} must be "
-        "pbkdf2_sha256$iterations$salt_hex$digest_hex or legacy 64-char hex"
+        f"{_PBKDF2_PREFIX}iterations$salt_hex$digest_hex"
     )
 
 
@@ -202,10 +194,12 @@ def lookup_api_key(
     for record in keys:
         parsed = _parse_pbkdf2_hash(record.key_hash)
         if parsed is None:
-            # Backward compatibility for legacy single-pass sha256hex records.
-            digest = hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
-            if hmac.compare_digest(record.key_hash, digest):
-                return record
+            logger.warning(
+                "Skipping API key record %r with unsupported hash format; "
+                "re-hash with PBKDF2 and prefix %r.",
+                record.name,
+                _PBKDF2_PREFIX,
+            )
             continue
         iterations, salt, expected_digest_hex = parsed
         digest = _hash_plaintext_key(

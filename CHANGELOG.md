@@ -11,9 +11,9 @@ All notable changes to Triagewall are documented in this file.
   (`hours`, `interval`), dedicated `/api/v1/stats`, liveness-only
   `/api/v1/health`, and Prometheus `/metrics` (stdlib text format).
 - API-key authentication (`X-API-Key`) with PBKDF2-HMAC-SHA256 hashed key
-  storage (legacy SHA-256 hex still accepted) and scopes `read` /
-  `feedback:write`. Writes always require a credential. Optional
-  `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS` (default `true`) for read BC.
+  storage and scopes `read` / `feedback:write`. Writes always require a
+  credential. Optional `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS`
+  (default `true`) for read BC.
 - Same-origin HttpOnly dashboard write cookie so the built-in UI can POST
   feedback without JavaScript changes.
 - `TRIAGEWALL_API_REDACT_IPS` to hash IPs for non-local consumers (default
@@ -37,9 +37,8 @@ All notable changes to Triagewall are documented in this file.
 2. Prefer `/api/v1/verdicts` with `cursor` / `limit` for listing.
 3. Configure `TRIAGEWALL_API_KEYS` with PBKDF2 digests from
    `triagewall.dashboard.api.auth.hash_api_key` before exposing the API beyond
-   a trusted host. Legacy SHA-256 hex entries still verify. Set
-   `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=false` when keys are required
-   for reads.
+   a trusted host. Set `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=false` when
+   keys are required for reads.
 4. Set a stable `TRIAGEWALL_DASHBOARD_WRITE_SECRET` in production so dashboard
    write cookies survive process restarts.
 5. Clients using `real_` should switch to `real` before 2026-12-31.

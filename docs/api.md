@@ -14,8 +14,7 @@ scheduled for removal on **2026-12-31**. Prefer `/api/v1/*` and the field
 |---------|-----------|
 | Header | `X-API-Key: <plaintext>` |
 | Storage | Keys are configured as **PBKDF2-HMAC-SHA256** digests only
-  (`TRIAGEWALL_API_KEYS`). Plaintext keys are never stored or logged. Legacy
-  single-pass SHA-256 hex digests are still accepted for one transition. |
+  (`TRIAGEWALL_API_KEYS`). Plaintext keys are never stored or logged. |
 | Scopes | `read`, `feedback:write` |
 | Reads | Allowed without a key when `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true` (**default**). Set to `false` to require a key with `read` (or `feedback:write`) for read endpoints and `/metrics`. |
 | Writes | **Always** require a credential: an API key with `feedback:write`, or the same-origin dashboard write cookie. |
@@ -34,9 +33,6 @@ TRIAGEWALL_API_KEYS=kiosk:pbkdf2_sha256$210000$<salt>$<digest>:read,operator:pbk
 TRIAGEWALL_DASHBOARD_WRITE_SECRET=<long-random-string>
 TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true
 ```
-
-Legacy `name:<64-char-sha256-hex>:scopes` entries still verify, but new keys
-should use the `pbkdf2_sha256$…` form.
 ## IP exposure
 
 Responses may include internal `src_ip` / `dest_ip` values and SPC `ip`

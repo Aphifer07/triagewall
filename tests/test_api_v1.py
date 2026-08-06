@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import sqlite3
 import sys
@@ -31,10 +30,6 @@ from triagewall.dashboard.api.auth import (
 )
 from triagewall.dashboard.api import services
 from triagewall.time_utils import format_utc_timestamp
-
-
-def _sha256_hex(plaintext: str) -> str:
-    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
 
 
 class ApiV1Tests(unittest.TestCase):
@@ -321,15 +316,8 @@ class ApiV1Tests(unittest.TestCase):
             parse_api_keys("bad")
         with self.assertRaises(RuntimeError):
             parse_api_keys("name:nothex:read")
-
-    def test_legacy_sha256_api_key_still_accepted(self):
-        keys = parse_api_keys(
-            f"legacy:{_sha256_hex(self.plaintext_key)}:{SCOPE_READ}"
-        )
-        matched = lookup_api_key(keys, self.plaintext_key)
-        self.assertIsNotNone(matched)
-        self.assertEqual(matched.name, "legacy")
-        self.assertIsNone(lookup_api_key(keys, "wrong-key"))
+        with self.assertRaises(RuntimeError):
+            parse_api_keys(f"legacy:{'a' * 64}:{SCOPE_READ}")
 
     def test_pbkdf2_api_key_round_trip(self):
         stored = hash_api_key(self.plaintext_key, iterations=1000)
