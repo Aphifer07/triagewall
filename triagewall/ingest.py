@@ -102,6 +102,14 @@ PROCESSED_LINE = LineResult(processed=True, checkpoint=True)
 CHECKPOINT_LINE = LineResult(processed=False, checkpoint=True)
 RETRY_LINE = LineResult(processed=False, checkpoint=False)
 
+# Common Suricata/logrotate numbered backups kept beside the live eve.json path.
+ROTATED_EVE_SUFFIXES = tuple(f".{n}" for n in range(1, 6))
+
+
+class EveRotationError(RuntimeError):
+    """Raised when a checkpointed eve.json inode cannot be drained after rotation."""
+
+
 # Graceful shutdown
 _stop = False
 def _handle_signal(signum, frame):
@@ -126,6 +134,20 @@ def load_position():
 def save_position(state):
     POSITION_PATH.parent.mkdir(parents=True, exist_ok=True)
     POSITION_PATH.write_text(json.dumps(state))
+
+
+def find_eve_path_for_inode(inode: int, primary: Path) -> Path | None:
+    """Locate the live or rotated eve.json path that still owns ``inode``."""
+    candidates = [primary]
+    for suffix in ROTATED_EVE_SUFFIXES:
+        candidates.append(Path(str(primary) + suffix))
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and candidate.stat().st_ino == inode:
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _line_is_complete(line):
@@ -389,30 +411,68 @@ def tail_file():
 
             current_inode = disk_stat.st_ino
             current_size = disk_stat.st_size
+            read_path = EVE_PATH
 
-            # Detect truncation (same path inode, but file got smaller than our saved offset)
-            if current_size < state["offset"]:
-                log.info(
-                    f"File shrunk (size {current_size} < offset {state['offset']}), restarting from start"
-                )
-                state["offset"] = 0
-
-            # If we're tracking the wrong inode on disk (rare if position.json is stale), reset.
+            # Rotation often happens between polls. Never reset the checkpoint to
+            # the new inode until the prior inode has been drained; otherwise
+            # unread alerts in eve.json.1 (etc.) are permanently skipped.
             if state["inode"] is not None and state["inode"] != current_inode:
-                log.info("Saved inode doesn't match current eve.json inode; resetting offset")
-                state["offset"] = 0
+                rotated = find_eve_path_for_inode(state["inode"], EVE_PATH)
+                if rotated is None:
+                    raise EveRotationError(
+                        f"eve.json inode {state['inode']} rotated away before "
+                        f"offset {state['offset']} was drained"
+                    )
+                try:
+                    rotated_stat = rotated.stat()
+                except FileNotFoundError as exc:
+                    raise EveRotationError(
+                        f"eve.json inode {state['inode']} rotated away before "
+                        f"offset {state['offset']} was drained"
+                    ) from exc
+                if rotated_stat.st_size < state["offset"]:
+                    raise EveRotationError(
+                        f"rotated eve.json shrunk behind checkpoint offset "
+                        f"{state['offset']}"
+                    )
+                if rotated_stat.st_size == state["offset"]:
+                    log.info(
+                        "Prior eve.json inode fully drained; switching to current file"
+                    )
+                    state["offset"] = 0
+                    state["inode"] = current_inode
+                    save_position(state)
+                else:
+                    log.info(
+                        "Detected eve.json rotation; draining prior inode from %s "
+                        "at offset %s",
+                        rotated,
+                        state["offset"],
+                    )
+                    read_path = rotated
 
-            state["inode"] = current_inode
+            if read_path == EVE_PATH:
+                # Detect truncation (same path inode, but file got smaller than
+                # our saved offset).
+                if current_size < state["offset"]:
+                    log.info(
+                        f"File shrunk (size {current_size} < offset {state['offset']}), "
+                        "restarting from start"
+                    )
+                    state["offset"] = 0
 
-            if current_size == state["offset"]:
-                # Nothing new
-                time.sleep(POLL_INTERVAL)
-                continue
+                state["inode"] = current_inode
+
+                if current_size == state["offset"]:
+                    # Nothing new
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
             # Read new content using readline() so f.tell() works inside the loop.
-            # Track the inode of the *open file descriptor* via os.fstat() so we can detect rotation
-            # even when the path is recreated with a new inode while we're still reading the old file.
-            f = open(EVE_PATH, "r")
+            # Track the inode of the *open file descriptor* via os.fstat() so we
+            # can detect rotation even when the path is recreated with a new
+            # inode while we're still reading the old file.
+            f = open(read_path, "r")
             try:
                 open_inode = os.fstat(f.fileno()).st_ino
                 f.seek(state["offset"])
@@ -421,7 +481,15 @@ def tail_file():
                 while not _stop:
                     line = f.readline()
                     if not line:
-                        # EOF: decide whether we're waiting for more bytes, or the file rotated.
+                        # More bytes may have landed on this FD after an earlier
+                        # EOF, especially around rename races. Drain them before
+                        # considering the path's current inode.
+                        open_stat = os.fstat(f.fileno())
+                        if open_stat.st_size > f.tell():
+                            continue
+
+                        # EOF: decide whether we're waiting for more bytes, or
+                        # the live path rotated to a new inode.
                         disk = eve_disk_stat()
                         if disk is None:
                             # Race during rotation/rename; wait briefly and retry.
@@ -430,7 +498,8 @@ def tail_file():
 
                         if disk.st_ino != open_inode:
                             log.info(
-                                "Detected eve.json rotation (inode changed); reopening new file from start"
+                                "Detected eve.json rotation (inode changed); "
+                                "reopening new file from start"
                             )
                             state["offset"] = 0
                             state["inode"] = disk.st_ino
@@ -474,9 +543,12 @@ def tail_file():
 
             if new_lines:
                 log.info(
-                    f"Read {new_lines} new lines, triaged {processed} alerts (offset now {state['offset']})"
+                    f"Read {new_lines} new lines, triaged {processed} alerts "
+                    f"(offset now {state['offset']})"
                 )
 
+        except EveRotationError:
+            raise
         except Exception as e:
             log.error(f"Loop error: {type(e).__name__}: {e}")
             time.sleep(POLL_INTERVAL)
@@ -492,8 +564,8 @@ def main() -> int:
             demo_loop()
         else:
             tail_file()
-    except (OSError, RuntimeError, sqlite3.Error) as exc:
-        log.critical("Suricata ingest startup failed: %s", exc)
+    except (OSError, RuntimeError, sqlite3.Error, EveRotationError) as exc:
+        log.critical("Suricata ingest failed: %s", exc)
         return 1
     return 0
 

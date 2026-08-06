@@ -291,6 +291,124 @@ class IngestCheckpointTests(unittest.TestCase):
             self.assertEqual(calls, [first, first])
             self.assertEqual(saved["offset"], expected_offset)
 
+    def test_find_eve_path_for_inode_locates_numbered_rotation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            eve_path = Path(temp_dir) / "eve.json"
+            rotated = Path(str(eve_path) + ".1")
+            eve_path.write_text("live\n")
+            rotated.write_text("rotated\n")
+            self.assertEqual(
+                ingest.find_eve_path_for_inode(rotated.stat().st_ino, eve_path),
+                rotated,
+            )
+            self.assertIsNone(
+                ingest.find_eve_path_for_inode(9_999_999_999, eve_path)
+            )
+
+    def test_tail_loop_drains_rotated_eve_before_reading_new_inode(self):
+        class SuccessResult:
+            processed = True
+            checkpoint = True
+
+            def __bool__(self):
+                return self.processed
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            db_path = temp_path / "triage.db"
+            position_path = temp_path / "position.json"
+            first = (
+                '{"event_type":"alert","timestamp":"2026-08-06T00:00:00Z",'
+                '"flow_id":1,"alert":{"signature_id":1,"signature":"kept"}}\n'
+            )
+            lost_without_fix = (
+                '{"event_type":"alert","timestamp":"2026-08-06T00:00:01Z",'
+                '"flow_id":2,"alert":{"signature_id":2,"signature":"rotated"}}\n'
+            )
+            after_rotation = (
+                '{"event_type":"alert","timestamp":"2026-08-06T00:00:02Z",'
+                '"flow_id":3,"alert":{"signature_id":3,"signature":"new"}}\n'
+            )
+            eve_path.write_text(first)
+            old_inode = eve_path.stat().st_ino
+            position_path.write_text(
+                json.dumps(
+                    {
+                        "offset": len(first),
+                        "inode": old_inode,
+                        "size": len(first),
+                    }
+                )
+            )
+            eve_path.write_text(first + lost_without_fix)
+            rotated = Path(str(eve_path) + ".1")
+            eve_path.rename(rotated)
+            eve_path.write_text(after_rotation)
+            migrations.ensure_db_initialized(db_path)
+
+            calls = []
+
+            def process_and_stop_after_both(conn, line):
+                calls.append(json.loads(line)["alert"]["signature_id"])
+                if len(calls) >= 2:
+                    ingest._stop = True
+                return SuccessResult()
+
+            ingest._stop = False
+            try:
+                with patch.object(ingest, "EVE_PATH", eve_path), patch.object(
+                    ingest, "DB_PATH", db_path
+                ), patch.object(ingest, "POSITION_PATH", position_path), patch.object(
+                    ingest, "process_line", side_effect=process_and_stop_after_both
+                ), patch.object(ingest.time, "sleep"):
+                    ingest.tail_file()
+            finally:
+                ingest._stop = False
+
+            self.assertEqual(calls, [2, 3])
+            saved = json.loads(position_path.read_text())
+            self.assertEqual(saved["inode"], eve_path.stat().st_ino)
+            self.assertEqual(saved["offset"], eve_path.stat().st_size)
+
+    def test_tail_loop_fails_closed_when_rotated_inode_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            db_path = temp_path / "triage.db"
+            position_path = temp_path / "position.json"
+            eve_path.write_text('{"event_type":"flow"}\n')
+            position_path.write_text(
+                json.dumps(
+                    {
+                        "offset": 12,
+                        "inode": 1_234_567_890,
+                        "size": 12,
+                    }
+                )
+            )
+            migrations.ensure_db_initialized(db_path)
+
+            ingest._stop = False
+            try:
+                with patch.object(ingest, "EVE_PATH", eve_path), patch.object(
+                    ingest, "DB_PATH", db_path
+                ), patch.object(ingest, "POSITION_PATH", position_path), patch.object(
+                    ingest, "process_line"
+                ) as process_line, patch.object(ingest.time, "sleep"):
+                    with self.assertRaisesRegex(
+                        ingest.EveRotationError,
+                        "rotated away before offset 12 was drained",
+                    ):
+                        ingest.tail_file()
+            finally:
+                ingest._stop = False
+
+            process_line.assert_not_called()
+            saved = json.loads(position_path.read_text())
+            self.assertEqual(saved["inode"], 1_234_567_890)
+            self.assertEqual(saved["offset"], 12)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
