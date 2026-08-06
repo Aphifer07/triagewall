@@ -8,28 +8,34 @@ MODE=demo   → IPs masked, feedback disabled, read-only
 Run:
     uvicorn triagewall.dashboard.app:app --host 0.0.0.0 --port 8084
 """
-import os
-import json
+from __future__ import annotations
+
 import ipaddress
+import json
+import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from datetime import timedelta
 from urllib.parse import urlsplit
-from fastapi import FastAPI, HTTPException, Body, Query, Request
+
+from fastapi import FastAPI, Request
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from triagewall.dashboard.stats import get_dashboard_stats
+
+from triagewall.dashboard.api.auth import (
+    API_KEY_HEADER_NAME,
+    DASHBOARD_WRITE_COOKIE,
+    AuthState,
+    issue_dashboard_write_cookie,
+)
+from triagewall.dashboard.api.legacy import create_legacy_router
+from triagewall.dashboard.api import services
+from triagewall.dashboard.api.v1.router import create_metrics_handler, create_v1_router
 from triagewall.database import connect_database
 from triagewall.environment import parse_boolean
 from triagewall.migrations import verify_db_initialized
-from triagewall.storage import get_storage_metrics
-from triagewall.time_utils import (
-    format_utc_timestamp,
-    parse_utc_timestamp,
-    utc_now,
-    utc_now_iso,
-)
+from triagewall.time_utils import format_utc_timestamp
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -90,6 +96,18 @@ TRUSTED_HOSTS = {
     for host in os.environ.get("TRUSTED_HOSTS", "localhost").split(",")
     if host.strip()
 }
+API_REDACT_IPS = parse_boolean(
+    os.environ.get("TRIAGEWALL_API_REDACT_IPS", "false"),
+    "TRIAGEWALL_API_REDACT_IPS",
+)
+
+auth_state = AuthState()
+
+# Back-compat aliases for existing tests that reset module-level caches.
+_stats_cache = services._stats_cache
+_timeline_cache = services._timeline_cache
+_spc_cache = services._spc_cache
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -98,9 +116,8 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Triage Dashboard", lifespan=lifespan)
+app = FastAPI(title="Triage Dashboard", version="1.0.0", lifespan=lifespan)
 
-# --- Helpers -----------------------------------------------------------------
 
 def _host_is_allowed(host_header):
     """Allow localhost, IP literals, and explicitly configured DNS names."""
@@ -212,7 +229,6 @@ def row_to_dict(row):
     if MODE == "demo":
         d["src_ip"] = mask_ip(d.get("src_ip"))
         d["dest_ip"] = mask_ip(d.get("dest_ip"))
-        # Demo responses contain no stored alert/model/analyst free text.
         d["raw_alert"] = None
         d["reasoning"] = None
         d["human_notes"] = None
@@ -223,283 +239,93 @@ def row_to_dict(row):
             "event_id": None,
             "agent": None,
         }
+    elif API_REDACT_IPS:
+        d["src_ip"] = services.hash_ip(d.get("src_ip"))
+        d["dest_ip"] = services.hash_ip(d.get("dest_ip"))
     return d
 
 
-# --- API endpoints -----------------------------------------------------------
+def _get_mode() -> str:
+    return MODE
 
-@app.get("/api/verdicts")
-def list_verdicts(
-    verdict: str = None,
-    signature: str = None,
-    model: str = None,
-    limit: int = Query(default=100, ge=1, le=500),
-):
-    """Return a paginated list of verdicts plus summary stats."""
-    where, params = [], []
-    if verdict in ("real", "false_positive", "uncertain"):
-        where.append("events.verdict = ?")
-        params.append(verdict)
-    if signature:
-        where.append("events.signature LIKE ?")
-        params.append(f"%{signature}%")
-    if model == "llm":
-        where.append("events.model_used != 'prefilter'")
-    elif model == "prefilter":
-        where.append("events.model_used = 'prefilter'")
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    # Use a read-only connection for the high-frequency polling endpoint to reduce
-    # lock contention with the ingest daemon.
-    with db(readonly=True) as conn:
-        rows = conn.execute(
-            f"""SELECT events.id, events.timestamp, events.src_ip, events.src_port,
-                       events.dest_ip, events.dest_port, events.proto,
-                       events.signature_id, events.signature, events.category,
-                       events.severity, events.verdict, events.confidence,
-                       events.reasoning, events.model_used, events.processed_at,
-                       events.human_verdict, events.human_notes, events.agreed,
-                       events.reviewed_at,
-                       src_snapshot.asset_json AS src_asset_json,
-                       dest_snapshot.asset_json AS dest_asset_json,
-                       sensor.source_type AS sensor_source,
-                       sensor.source_instance AS sensor_instance,
-                       sensor.source_event_id AS sensor_event_id,
-                       sensor.agent_id AS sensor_agent_id,
-                       sensor.agent_name AS sensor_agent_name
-                FROM triage_events AS events
-                LEFT JOIN asset_snapshots AS src_snapshot
-                  ON src_snapshot.id = events.src_asset_snapshot_id
-                LEFT JOIN asset_snapshots AS dest_snapshot
-                  ON dest_snapshot.id = events.dest_asset_snapshot_id
-                LEFT JOIN sensor_event_context AS sensor
-                  ON sensor.triage_event_id = events.id
-                {where_sql}
-                ORDER BY events.processed_at DESC NULLS LAST, events.id DESC
-                LIMIT ?""",
-            params + [limit],
-        ).fetchall()
+def _get_db_path():
+    return DB_PATH
 
-    # Cache the bounded 24-hour aggregate so concurrent dashboard polls share
-    # one result. The query itself remains safe after cache expiry because it
-    # uses idx_triage_processed to seek to the cutoff.
-    _now = _time.time()
-    if (
-        _stats_cache["data"] is not None
-        and (_now - _stats_cache["ts"]) < _STATS_TTL
-    ):
-        stats_dict = _stats_cache["data"]
-    else:
-        with db(readonly=True) as conn:
-            stats_dict = get_dashboard_stats(conn)
 
-        _stats_cache["data"] = stats_dict
-        _stats_cache["ts"] = _now
+def _get_stale_threshold() -> int:
+    return STALE_THRESHOLD_SECONDS
 
-    return {
-        "mode": MODE,
-        "stats": stats_dict,
-        "verdicts": [row_to_dict(r) for r in rows],
+
+def _redact_ips() -> bool:
+    return API_REDACT_IPS
+
+
+_router_kwargs = dict(
+    auth=auth_state,
+    db_factory=db,
+    get_mode=_get_mode,
+    get_db_path=_get_db_path,
+    get_stale_threshold=_get_stale_threshold,
+    row_to_dict=row_to_dict,
+    mask_ip_fn=mask_ip,
+    redact_ips=_redact_ips,
+)
+
+app.include_router(create_v1_router(**_router_kwargs))
+app.include_router(create_legacy_router(**_router_kwargs))
+app.add_api_route(
+    "/metrics",
+    create_metrics_handler(
+        auth=auth_state,
+        db_factory=db,
+        get_db_path=_get_db_path,
+        get_stale_threshold=_get_stale_threshold,
+    ),
+    methods=["GET"],
+    tags=["ops"],
+)
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+    )
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})[
+        "ApiKeyAuth"
+    ] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": API_KEY_HEADER_NAME,
+        "description": (
+            "SHA-256 hashed keys configured via TRIAGEWALL_API_KEYS. "
+            "Scopes: read, feedback:write. Unversioned /api/* aliases are "
+            "deprecated and scheduled for removal on 2026-12-31."
+        ),
     }
+    app.openapi_schema = schema
+    return app.openapi_schema
 
 
-@app.post("/api/feedback/{event_id}")
-def submit_feedback(event_id: int, payload: dict = Body(...)):
-    """Record human feedback on a verdict. Disabled in demo mode."""
-    if MODE == "demo":
-        raise HTTPException(403, "Feedback disabled in demo mode")
+app.openapi = custom_openapi
 
-    human_verdict = payload.get("human_verdict")
-    notes = payload.get("notes", "")
-    if human_verdict not in ("real", "false_positive", "uncertain"):
-        raise HTTPException(400, "human_verdict must be real | false_positive | uncertain")
-
-    with db() as conn:
-        row = conn.execute(
-            "SELECT verdict FROM triage_events WHERE id = ?", (event_id,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "event not found")
-        agreed = 1 if row["verdict"] == human_verdict else 0
-        conn.execute(
-            """UPDATE triage_events
-               SET human_verdict = ?, human_notes = ?, agreed = ?, reviewed_at = ?
-               WHERE id = ?""",
-            (human_verdict, notes, agreed, utc_now_iso(), event_id),
-        )
-        conn.commit()
-    return {"ok": True, "agreed": bool(agreed)}
-
-
-@app.get("/api/health")
-def health():
-    last_processed_at = None
-    storage = None
-    with db(readonly=True) as conn:
-        try:
-            row = conn.execute(
-                "SELECT MAX(processed_at) AS last_processed_at FROM triage_events"
-            ).fetchone()
-            if row:
-                last_processed_at = row["last_processed_at"]
-            storage = get_storage_metrics(conn, DB_PATH)
-        except sqlite3.OperationalError:
-            # If schema/table doesn't exist yet, treat as stale.
-            last_processed_at = None
-
-    now = utc_now()
-    age_seconds = 10**9
-    if last_processed_at:
-        try:
-            dt = parse_utc_timestamp(str(last_processed_at))
-            age_seconds = int((now - dt).total_seconds())
-        except Exception:
-            age_seconds = 10**9
-
-    payload = {
-        "last_alert_age_seconds": max(0, age_seconds),
-        "storage": storage,
-    }
-    if age_seconds > STALE_THRESHOLD_SECONDS:
-        payload["status"] = "stale"
-        return JSONResponse(payload, status_code=503)
-    payload["status"] = "ok"
-    return payload
-
-
-
-# --- lightweight TTL cache for expensive polling endpoints ---------------
-import time as _time
-_timeline_cache = {"data": None, "ts": 0.0}
-_TIMELINE_TTL = 60.0  # seconds; hourly buckets don't change faster than this
-_spc_cache = {"data": None, "ts": 0.0}
-_SPC_TTL = 30.0  # seconds; anomalies arrive ~1-2/day, no need to re-query often
-_stats_cache = {"data": None, "ts": 0.0}
-_STATS_TTL = 30.0  # seconds; share one bounded aggregate across concurrent polls
-
-@app.get("/api/timeline")
-def timeline():
-    """
-    Return hourly buckets for the last 24 hours. Cached for _TIMELINE_TTL
-    seconds so concurrent polls from multiple clients share one query result
-    instead of each re-aggregating against the live (write-busy) DB.
-    """
-    now = _time.time()
-    if _timeline_cache["data"] is not None and (now - _timeline_cache["ts"]) < _TIMELINE_TTL:
-        return _timeline_cache["data"]
-    # Bucket by processed_at so the timeline matches when Triagewall classified
-    # alerts (consistent with the hero stat), not when Suricata first detected them.
-    cutoff = format_utc_timestamp(utc_now() - timedelta(hours=24))
-    with db(readonly=True) as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                strftime('%Y-%m-%dT%H:00:00.000000Z', processed_at) AS hour_bucket,
-                COUNT(*) AS total_alerts,
-                COALESCE(SUM(model_used = 'prefilter'), 0) AS prefiltered_count,
-                COALESCE(SUM(verdict = 'real'), 0) AS real_count
-            FROM triage_events
-            WHERE processed_at >= ?
-            GROUP BY hour_bucket
-            ORDER BY hour_bucket ASC
-            """,
-            (cutoff,),
-        ).fetchall()
-
-    out = []
-    for r in rows:
-        total = int(r["total_alerts"] or 0)
-        pre = int(r["prefiltered_count"] or 0)
-        real = int(r["real_count"] or 0)
-        pct = (pre / total * 100.0) if total else 0.0
-        hour = r["hour_bucket"] or ""
-        out.append(
-            {
-                "timestamp": hour,
-                "total_alerts": total,
-                "prefiltered_count": pre,
-                "prefilter_percentage": pct,
-                "real_count": real,
-            }
-        )
-    _timeline_cache["data"] = out
-    _timeline_cache["ts"] = now
-    return out
-
-
-@app.get("/api/spc-anomalies")
-def spc_anomalies():
-    """
-    Recent SPC behavioral-baselining anomalies — an INDEPENDENT detection signal.
-
-    These are surfaced regardless of any LLM verdict: an SPC anomaly means a host
-    deviated from its own behavioral baseline (a rate spike, or a never-before-seen
-    signature), which prompt injection cannot fake by rewriting alert text. The
-    panel is intentionally not joined to or filtered by the verdict list, so a
-    high-confidence LLM "false positive" can never suppress a behavioral anomaly.
-
-    Cached briefly since anomalies arrive on the order of 1-2 per day.
-    """
-    now = _time.time()
-    if _spc_cache["data"] is not None and (now - _spc_cache["ts"]) < _SPC_TTL:
-        return _spc_cache["data"]
-
-    out = {"anomalies": [], "available": True}
-    with db(readonly=True) as conn:
-        # The spc_anomalies table only exists once the SPC engine has run. Guard
-        # so the dashboard degrades gracefully on installs without SPC.
-        exists = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='spc_anomalies'"
-        ).fetchone()
-        if not exists:
-            out["available"] = False
-            _spc_cache["data"] = out
-            _spc_cache["ts"] = now
-            return out
-
-        rows = conn.execute(
-            """
-            SELECT detected_at, feature, ip, signature_id, z, note
-            FROM spc_anomalies
-            ORDER BY id DESC
-            LIMIT 50
-            """
-        ).fetchall()
-
-        # Also surface a count for the last 24h, so the panel can show recency.
-        cutoff = format_utc_timestamp(utc_now() - timedelta(hours=24))
-        last24 = conn.execute(
-            "SELECT COUNT(*) FROM spc_anomalies "
-            "WHERE detected_at >= ?",
-            (cutoff,),
-        ).fetchone()[0]
-
-    for r in rows:
-        try:
-            ts = format_utc_timestamp(r["detected_at"])
-        except (TypeError, ValueError):
-            ts = None
-        out["anomalies"].append({
-            "detected_at": ts,
-            "feature": r["feature"],
-            "ip": mask_ip(r["ip"]),
-            "signature_id": r["signature_id"],
-            "z": r["z"],
-            "note": None if MODE == "demo" else r["note"],
-        })
-    out["count_24h"] = int(last24 or 0)
-
-    _spc_cache["data"] = out
-    _spc_cache["ts"] = now
-    return out
-
-
-# --- Static files ------------------------------------------------------------
 
 @app.get("/")
 @app.head("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    response = FileResponse(STATIC_DIR / "index.html")
+    response.set_cookie(
+        key=DASHBOARD_WRITE_COOKIE,
+        value=issue_dashboard_write_cookie(auth_state.dashboard_write_secret),
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return response
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

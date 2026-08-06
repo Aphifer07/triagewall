@@ -259,6 +259,8 @@ class DashboardBoundaryTests(unittest.TestCase):
         dashboard._spc_cache.update(data=None, ts=0.0)
         dashboard._timeline_cache.update(data=None, ts=0.0)
         self.client = TestClient(dashboard.app)
+        # Establish the same-origin dashboard write cookie used by /api/feedback.
+        self.client.get("/", headers={"host": "localhost"})
 
     def tearDown(self):
         dashboard.DB_PATH = self.old_db_path

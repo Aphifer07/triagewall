@@ -103,6 +103,7 @@ class DashboardStatsTests(unittest.TestCase):
             stats,
             {
                 "total": 4,
+                "real": 1,
                 "real_": 1,
                 "fp": 1,
                 "unc": 1,

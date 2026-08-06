@@ -46,9 +46,12 @@ def get_dashboard_stats(conn: sqlite3.Connection) -> dict[str, int]:
     ).fetchone()
     lifetime = conn.execute(LIFETIME_TOTAL_SQL).fetchone()
 
+    real_count = int(window["window_real"] or 0)
     return {
         "total": int(lifetime["lifetime_total"] or 0),
-        "real_": int(window["window_real"] or 0),
+        "real": real_count,
+        # Deprecated alias retained through 2026-12-31; prefer ``real``.
+        "real_": real_count,
         "fp": int(window["window_fp"] or 0),
         "unc": int(window["window_uncertain"] or 0),
         "reviewed": int(window["window_reviewed"] or 0),
