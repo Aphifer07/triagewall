@@ -21,6 +21,9 @@ DASHBOARD_WRITE_COOKIE = "tw_dash_write"
 SCOPE_READ = "read"
 SCOPE_FEEDBACK_WRITE = "feedback:write"
 _VALID_SCOPES = frozenset({SCOPE_READ, SCOPE_FEEDBACK_WRITE})
+_PBKDF2_PREFIX = "pbkdf2_sha256$"
+_DEFAULT_PBKDF2_ITERATIONS = 210_000
+_SALT_BYTES = 16
 
 api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
 
@@ -30,7 +33,7 @@ class ApiKeyRecord:
     """One configured API key (hash only; plaintext never stored)."""
 
     name: str
-    key_hash_hex: str
+    key_hash: str
     scopes: frozenset[str]
 
 
@@ -43,12 +46,80 @@ class AuthContext:
     via: str  # "api_key" | "dashboard_cookie" | "anonymous"
 
 
-def _hash_plaintext_key(plaintext: str) -> str:
-    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+def _hash_plaintext_key(
+    plaintext: str,
+    *,
+    salt: bytes,
+    iterations: int = _DEFAULT_PBKDF2_ITERATIONS,
+) -> str:
+    """Derive a PBKDF2-HMAC-SHA256 digest hex for an API key."""
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        plaintext.encode("utf-8"),
+        salt,
+        iterations,
+    ).hex()
+
+
+def hash_api_key(
+    plaintext: str,
+    *,
+    iterations: int = _DEFAULT_PBKDF2_ITERATIONS,
+    salt: bytes | None = None,
+) -> str:
+    """Return a storable ``pbkdf2_sha256$…`` digest for ``TRIAGEWALL_API_KEYS``."""
+    if iterations <= 0:
+        raise ValueError("iterations must be positive")
+    salt_bytes = salt if salt is not None else secrets.token_bytes(_SALT_BYTES)
+    digest = _hash_plaintext_key(
+        plaintext,
+        salt=salt_bytes,
+        iterations=iterations,
+    )
+    return (
+        f"{_PBKDF2_PREFIX}{iterations}${salt_bytes.hex()}${digest}"
+    )
+
+
+def _parse_pbkdf2_hash(value: str) -> tuple[int, bytes, str] | None:
+    """Parse ``pbkdf2_sha256$<iterations>$<salt_hex>$<digest_hex>``."""
+    if not value.startswith(_PBKDF2_PREFIX):
+        return None
+    parts = value.split("$")
+    if len(parts) != 4:
+        return None
+    _, iterations_raw, salt_hex, digest_hex = parts
+    try:
+        iterations = int(iterations_raw)
+        salt = bytes.fromhex(salt_hex)
+    except ValueError:
+        return None
+    if iterations <= 0 or not salt or not digest_hex:
+        return None
+    if any(c not in "0123456789abcdef" for c in digest_hex.lower()):
+        return None
+    return iterations, salt, digest_hex.lower()
+
+
+def _is_legacy_sha256_hex(value: str) -> bool:
+    return len(value) == 64 and all(
+        c in "0123456789abcdef" for c in value.lower()
+    )
+
+
+def _validate_key_hash(name: str, key_hash: str) -> str:
+    if _parse_pbkdf2_hash(key_hash) is not None:
+        return key_hash
+    if _is_legacy_sha256_hex(key_hash):
+        return key_hash.lower()
+    raise RuntimeError(
+        f"TRIAGEWALL_API_KEYS hash for {name!r} must be "
+        "pbkdf2_sha256$iterations$salt_hex$digest_hex or legacy 64-char hex"
+    )
 
 
 def parse_api_keys(raw: str | None) -> tuple[ApiKeyRecord, ...]:
-    """Parse ``name:sha256hex:scope|scope`` entries from env."""
+    """Parse ``name:key_hash:scope|scope`` entries from env."""
     if not raw or not raw.strip():
         return ()
     records: list[ApiKeyRecord] = []
@@ -59,19 +130,14 @@ def parse_api_keys(raw: str | None) -> tuple[ApiKeyRecord, ...]:
         pieces = entry.split(":", 2)
         if len(pieces) != 3:
             raise RuntimeError(
-                "TRIAGEWALL_API_KEYS entries must be name:sha256hex:scopes"
+                "TRIAGEWALL_API_KEYS entries must be name:key_hash:scopes"
             )
-        name, key_hash_hex, scopes_raw = (p.strip() for p in pieces)
-        if not name or not key_hash_hex:
+        name, key_hash, scopes_raw = (p.strip() for p in pieces)
+        if not name or not key_hash:
             raise RuntimeError(
                 "TRIAGEWALL_API_KEYS entries require a non-empty name and hash"
             )
-        if len(key_hash_hex) != 64 or any(
-            c not in "0123456789abcdef" for c in key_hash_hex.lower()
-        ):
-            raise RuntimeError(
-                f"TRIAGEWALL_API_KEYS hash for {name!r} must be 64 lowercase hex"
-            )
+        key_hash = _validate_key_hash(name, key_hash)
         scopes = frozenset(
             s.strip() for s in scopes_raw.replace(",", "|").split("|") if s.strip()
         )
@@ -83,7 +149,7 @@ def parse_api_keys(raw: str | None) -> tuple[ApiKeyRecord, ...]:
         records.append(
             ApiKeyRecord(
                 name=name,
-                key_hash_hex=key_hash_hex.lower(),
+                key_hash=key_hash,
                 scopes=scopes,
             )
         )
@@ -133,9 +199,21 @@ def lookup_api_key(
 ) -> ApiKeyRecord | None:
     if not plaintext:
         return None
-    digest = _hash_plaintext_key(plaintext)
     for record in keys:
-        if hmac.compare_digest(record.key_hash_hex, digest):
+        parsed = _parse_pbkdf2_hash(record.key_hash)
+        if parsed is None:
+            # Backward compatibility for legacy single-pass sha256hex records.
+            digest = hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+            if hmac.compare_digest(record.key_hash, digest):
+                return record
+            continue
+        iterations, salt, expected_digest_hex = parsed
+        digest = _hash_plaintext_key(
+            plaintext,
+            salt=salt,
+            iterations=iterations,
+        )
+        if hmac.compare_digest(expected_digest_hex, digest):
             return record
     return None
 

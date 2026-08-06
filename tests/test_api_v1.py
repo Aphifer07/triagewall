@@ -25,6 +25,8 @@ from triagewall.dashboard.api.auth import (
     DASHBOARD_WRITE_COOKIE,
     SCOPE_FEEDBACK_WRITE,
     SCOPE_READ,
+    hash_api_key,
+    lookup_api_key,
     parse_api_keys,
 )
 from triagewall.dashboard.api import services
@@ -103,9 +105,9 @@ class ApiV1Tests(unittest.TestCase):
         self.read_only_key = "read-only-key"
         dashboard.auth_state.keys = parse_api_keys(
             "operator:"
-            f"{_sha256_hex(self.plaintext_key)}:"
+            f"{hash_api_key(self.plaintext_key, iterations=1000)}:"
             f"{SCOPE_READ}|{SCOPE_FEEDBACK_WRITE},"
-            f"reader:{_sha256_hex(self.read_only_key)}:{SCOPE_READ}"
+            f"reader:{hash_api_key(self.read_only_key, iterations=1000)}:{SCOPE_READ}"
         )
         services.reset_caches()
         self.client = TestClient(dashboard.app)
@@ -319,6 +321,22 @@ class ApiV1Tests(unittest.TestCase):
             parse_api_keys("bad")
         with self.assertRaises(RuntimeError):
             parse_api_keys("name:nothex:read")
+
+    def test_legacy_sha256_api_key_still_accepted(self):
+        keys = parse_api_keys(
+            f"legacy:{_sha256_hex(self.plaintext_key)}:{SCOPE_READ}"
+        )
+        matched = lookup_api_key(keys, self.plaintext_key)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched.name, "legacy")
+        self.assertIsNone(lookup_api_key(keys, "wrong-key"))
+
+    def test_pbkdf2_api_key_round_trip(self):
+        stored = hash_api_key(self.plaintext_key, iterations=1000)
+        self.assertTrue(stored.startswith("pbkdf2_sha256$"))
+        keys = parse_api_keys(f"modern:{stored}:{SCOPE_READ}")
+        self.assertIsNotNone(lookup_api_key(keys, self.plaintext_key))
+        self.assertIsNone(lookup_api_key(keys, "wrong-key"))
 
 
 if __name__ == "__main__":

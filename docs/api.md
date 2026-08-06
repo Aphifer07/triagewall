@@ -13,7 +13,9 @@ scheduled for removal on **2026-12-31**. Prefer `/api/v1/*` and the field
 | Concern | Mechanism |
 |---------|-----------|
 | Header | `X-API-Key: <plaintext>` |
-| Storage | Keys are configured as **SHA-256 hex digests** only (`TRIAGEWALL_API_KEYS`). Plaintext keys are never stored or logged. |
+| Storage | Keys are configured as **PBKDF2-HMAC-SHA256** digests only
+  (`TRIAGEWALL_API_KEYS`). Plaintext keys are never stored or logged. Legacy
+  single-pass SHA-256 hex digests are still accepted for one transition. |
 | Scopes | `read`, `feedback:write` |
 | Reads | Allowed without a key when `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true` (**default**). Set to `false` to require a key with `read` (or `feedback:write`) for read endpoints and `/metrics`. |
 | Writes | **Always** require a credential: an API key with `feedback:write`, or the same-origin dashboard write cookie. |
@@ -23,16 +25,18 @@ scheduled for removal on **2026-12-31**. Prefer `/api/v1/*` and the field
 ### Configuring a key
 
 ```bash
-# Generate a plaintext key, store it in a secret manager, configure only the hash:
-python -c "import hashlib,secrets; k=secrets.token_urlsafe(32); print(k); print(hashlib.sha256(k.encode()).hexdigest())"
+# Generate a plaintext key and a PBKDF2 digest (store only the digest in env):
+python -c "from triagewall.dashboard.api.auth import hash_api_key; import secrets; k=secrets.token_urlsafe(32); print(k); print(hash_api_key(k))"
 ```
 
 ```env
-TRIAGEWALL_API_KEYS=kiosk:<sha256hex>:read,operator:<sha256hex>:read|feedback:write
+TRIAGEWALL_API_KEYS=kiosk:pbkdf2_sha256$210000$<salt>$<digest>:read,operator:pbkdf2_sha256$210000$<salt>$<digest>:read|feedback:write
 TRIAGEWALL_DASHBOARD_WRITE_SECRET=<long-random-string>
 TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true
 ```
 
+Legacy `name:<64-char-sha256-hex>:scopes` entries still verify, but new keys
+should use the `pbkdf2_sha256$…` form.
 ## IP exposure
 
 Responses may include internal `src_ip` / `dest_ip` values and SPC `ip`
