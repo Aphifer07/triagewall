@@ -88,7 +88,17 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 # directory the deployment mounts as HOST_EVE_DIR. Discovery stays deliberately
 # bounded: one directory, never recursive, never through a symlink, regular
 # files only, and a hard cap on how many entries we are willing to examine.
+#
+# The two caps are separate on purpose. HOST_EVE_DIR is usually the whole
+# Suricata log directory, so unrelated files (fast.log, stats.log, other
+# daemons' logs) must not consume the archive budget -- counting them was what
+# let a truncated scan hide an intermediate archive and skip its alerts. Only
+# eve.json* siblings count against MAX_ROTATION_SCAN_ENTRIES; the much larger
+# MAX_ROTATION_DIR_ENTRIES bounds a pathological directory. Exceeding either is
+# a hard failure, never a partial chain: an incomplete chain cannot be told
+# apart from a complete one by its callers.
 MAX_ROTATION_SCAN_ENTRIES = 512
+MAX_ROTATION_DIR_ENTRIES = 100_000
 COMPRESSED_ROTATION_SUFFIXES = (".gz", ".bz2", ".xz", ".zst")
 _NUMBERED_ROTATION_RE = re.compile(r"^\.(\d+)$")
 
@@ -248,32 +258,80 @@ def _rotation_sort_key(name: str, live_name: str):
     return (1, 0, suffix)
 
 
+def _is_compressed_archive(name: str) -> bool:
+    """Whether ``name`` is a compressed rotation archive.
+
+    Compressed archives stay in the chain: they are evidence that a rotation
+    happened and they hold their slot in the ordering. They are simply not
+    readable as JSON-Lines, so they may never become a read source or a
+    persisted checkpoint.
+    """
+    return name.endswith(COMPRESSED_ROTATION_SUFFIXES)
+
+
+def _compressed_archive_message(path: Path, inode: int) -> str:
+    return (
+        f"the next unread eve.json archive is {path} (inode {inode}), which is "
+        "compressed. Triagewall reads eve.json as plain JSON-Lines and will "
+        "not decompress it, and it will not skip it either: the alerts inside "
+        "have not been triaged. The checkpoint has been left on the file "
+        "before it. Recovery: decompress the archive in place beside "
+        f"{EVE_PATH} (for example `gunzip {path}`), or restore an "
+        "uncompressed copy under the same name, then restart ingest. If that "
+        "archive is genuinely unrecoverable, an operator must decide and "
+        f"record the resulting alert gap before editing {POSITION_PATH}."
+    )
+
+
 def _scan_eve_chain(live_path: Path) -> list[tuple[str, Path, os.stat_result]]:
     """Return the bounded, oldest-first rotation chain beside ``live_path``.
 
     Only plausible rotated siblings are considered: entries in the eve.json
     directory whose name starts with the live file's name. Symlinks,
-    directories, devices, sockets and FIFOs are rejected outright, the scan
-    never recurses, and it stops after ``MAX_ROTATION_SCAN_ENTRIES`` entries.
+    directories, devices, sockets and FIFOs are rejected outright, and the scan
+    never recurses.
+
+    The chain this returns is always complete. Callers use it to decide which
+    archive comes next, and a partial chain is indistinguishable from a
+    complete one: if an intermediate archive is missing from it, successor
+    selection happily skips to the live file and that archive's alerts are
+    never triaged. So an incomplete scan raises ``IngestCheckpointError``
+    instead of returning what it managed to see.
     """
     directory = live_path.parent
     prefix = live_path.name
     chain: list[tuple[str, Path, os.stat_result]] = []
     examined = 0
+    matched = 0
     try:
         with os.scandir(directory) as entries:
             for entry in entries:
                 examined += 1
-                if examined > MAX_ROTATION_SCAN_ENTRIES:
-                    log.warning(
-                        "Stopped scanning %s for rotated eve.json archives after "
-                        "%d entries; rotation recovery may be incomplete",
-                        directory,
-                        MAX_ROTATION_SCAN_ENTRIES,
+                if examined > MAX_ROTATION_DIR_ENTRIES:
+                    raise IngestCheckpointError(
+                        f"{directory} holds more than "
+                        f"{MAX_ROTATION_DIR_ENTRIES} entries, so Triagewall "
+                        "cannot enumerate the eve.json rotation chain without "
+                        "an unbounded scan. It will not advance the checkpoint "
+                        "on a chain it could not fully see. Recovery: mount a "
+                        "directory that contains only the Suricata logs as "
+                        "HOST_EVE_DIR, or reduce the number of files in it."
                     )
-                    break
                 if not entry.name.startswith(prefix):
+                    # Unrelated logs in HOST_EVE_DIR must not consume the
+                    # archive budget; only the directory-wide cap bounds them.
                     continue
+                matched += 1
+                if matched > MAX_ROTATION_SCAN_ENTRIES:
+                    raise IngestCheckpointError(
+                        f"more than {MAX_ROTATION_SCAN_ENTRIES} files in "
+                        f"{directory} look like rotated eve.json archives, so "
+                        "the rotation chain cannot be enumerated within its "
+                        "safety bound. Triagewall will not guess which archive "
+                        "follows the checkpoint and risk skipping alerts. "
+                        "Recovery: archive or remove the drained rotations, "
+                        "leaving only the ones ingest has not read yet."
+                    )
                 try:
                     if entry.is_symlink():
                         # Never follow a symlink out of the eve.json directory.
@@ -287,10 +345,16 @@ def _scan_eve_chain(live_path: Path) -> list[tuple[str, Path, os.stat_result]]:
                     continue
                 chain.append((entry.name, Path(entry.path), entry_stat))
     except OSError as exc:
-        log.warning(
-            "Could not scan %s for rotated eve.json archives: %s", directory, exc
-        )
-        return []
+        # An unreadable log directory is not evidence that no archive is
+        # pending. Returning an empty chain here would let a caller conclude
+        # the checkpointed inode is gone, or that the live file is the next
+        # thing to read.
+        raise IngestCheckpointError(
+            f"could not scan {directory} for rotated eve.json archives: {exc}. "
+            "Triagewall cannot confirm which archive follows the checkpoint, "
+            "so it will not advance it. Recovery: restore read access to the "
+            "directory and restart ingest."
+        ) from exc
     chain.sort(key=lambda item: _rotation_sort_key(item[0], prefix))
     return chain
 
@@ -366,6 +430,14 @@ def _resolve_checkpoint_source(
     if name == EVE_PATH.name:
         # The live path was replaced between the stat above and this scan.
         return None
+
+    if _is_compressed_archive(name):
+        # The checkpoint names an archive that has since been compressed in
+        # place (same inode, new name). It cannot be read as JSON-Lines and
+        # its unread records must not be skipped.
+        raise IngestCheckpointError(
+            _compressed_archive_message(rotated_path, checkpoint_inode)
+        )
 
     if rotated_stat.st_size < offset:
         raise IngestCheckpointError(
@@ -804,6 +876,20 @@ def tail_file():
                                     "offset 0."
                                 )
                             next_path, next_stat = successor
+                            if _is_compressed_archive(next_path.name):
+                                # Fail closed *before* save_position(). Parking
+                                # the durable checkpoint on a compressed inode
+                                # would make every later poll open gzip bytes
+                                # as UTF-8 text, and the resulting
+                                # UnicodeDecodeError is not a checkpoint error,
+                                # so the generic retry path would spin forever
+                                # with the checkpoint already moved -- and a
+                                # restart would reproduce it.
+                                raise IngestCheckpointError(
+                                    _compressed_archive_message(
+                                        next_path, next_stat.st_ino
+                                    )
+                                )
                             log.info(
                                 "Drained eve.json inode %s (%s); following %s "
                                 "(inode %s) from offset 0",
