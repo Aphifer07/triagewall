@@ -1,23 +1,167 @@
 {
   "manifest_version": 1,
   "kind": "triagewall.gold_gate.baseline",
-  "status": "uncalibrated",
+  "status": "approved",
   "notes": [
-    "No approved real-model baseline exists yet for the v0.3 pipeline.",
-    "The published v0.2-alpha result (Cohen's kappa 0.687, 83% true-positive",
-    "recall on 265 labeled alerts) was produced by scripts/benchmark_quants.py,",
-    "which uses a stale copy of the v0.2 prompt, sends raw unisolated alerts,",
-    "does not run the prefilter, and coerces invalid model output into",
-    "'uncertain'. It therefore does not describe the pipeline shipping in v0.3",
-    "and must not be adopted as a threshold.",
-    "Next step: run 'python3 scripts/gold_gate.py evaluate' on the operator",
-    "host, review the measured pipeline and model-only metrics, then set",
-    "thresholds and flip status to 'approved' in a separate reviewed change.",
-    "While status is 'uncalibrated' the deterministic Layer 1 checks still run",
-    "on every pull request, but no performance threshold is enforced.",
-    "'gold_gate.py verify --require-calibrated' fails in this state, so release",
-    "evidence collection cannot mistake an uncalibrated gate for an approved one."
+    "Approved v0.3 calibration evidence from omv1 for commit 89e24fb048517bafda6cce8c362b88773fc22842.",
+    "The run completed 266/266 rows with zero invalid output, transport errors, or unexpected errors.",
+    "The set is imbalanced: 259 false positives, six real alerts, and one uncertain alert.",
+    "All labeled rows are Suricata; Wazuh has structural coverage but no performance claim.",
+    "A 0.05 true-positive recall tolerance is stricter than the 1/6 step size, so any newly missed real alert blocks.",
+    "Dataset revision and class counts must match; changes require explicit reapproval."
   ],
-  "thresholds": null,
-  "evidence": null
+  "thresholds": {
+    "max_kappa_decrease": 0.05,
+    "max_true_positive_recall_decrease": 0.05,
+    "max_invalid_output": 0,
+    "require_complete_run": true,
+    "require_matching_class_counts": true
+  },
+  "evidence": {
+    "asset_inventory": {
+      "count": 2,
+      "revision": "sha256:3dd464829377322b7cbf70346bf403287c293f43075a7a9c5916ba1be01680c0"
+    },
+    "behavior_fingerprint": {
+      "combined": "sha256:5275d437763f4326669d2f34ef6e67688d5f1c8497b9e0544263b933080deda2",
+      "components": {
+        "model_identity": "sha256:c5155122c41f56ec8a0728e799d8a63dd4f45fb267aefd03df258adbd934b35c",
+        "prefilter_behavior": "sha256:e9bf77ab79eb53b2f9b5737b7f6fe7118d16fc1ad232c07e7d1412cb67e824a2",
+        "prefilter_policy": "sha256:19fcd5b41bc96c1e1e1a885abc2f07fc86a756576fd15aca885de4cc7f759e4d",
+        "response_contract": "sha256:8eba8fbc23f4672facac689d10299d32363cd4dc24066a1608cd1bdafd8ba603",
+        "suricata_request_surface": "sha256:b6f18d47a06f9848d93eb23d60bb6b64543ea279b2b058ae7ac3ff1e6a81ffe5",
+        "wazuh_request_surface": "sha256:eb507c26186ca5c7f28254dc6fdaaa6344753874c516484c1727117fa08c8a6b"
+      },
+      "coverage": {
+        "response_contract_cases": 21,
+        "suricata_fixtures": 6,
+        "suricata_model_requests": 5,
+        "suricata_prefiltered": 1,
+        "wazuh_fixtures": 4,
+        "wazuh_max_projection_bytes": 2121
+      }
+    },
+    "commit": "89e24fb048517bafda6cce8c362b88773fc22842",
+    "dataset": {
+      "class_counts": {
+        "false_positive": 259,
+        "real": 6,
+        "uncertain": 1
+      },
+      "revision": "sha256:231cf5541337c4d522e6d935b9afca7093e1f430243e1a9fbb23612cfdd3ff42",
+      "source_counts": {
+        "suricata": 266
+      },
+      "total": 266
+    },
+    "generated_at": "2026-08-08T15:00:28.322426Z",
+    "kind": "triagewall.gold_gate.evidence",
+    "manifest_version": 1,
+    "metrics": {
+      "model_only": {
+        "accuracy": 0.9848484848484849,
+        "classes": {
+          "false_positive": {
+            "f1": 0.9914529914529915,
+            "fn": 1,
+            "fp": 0,
+            "precision": 1.0,
+            "recall": 0.9830508474576272,
+            "support": 59,
+            "tp": 58
+          },
+          "real": {
+            "f1": 1.0,
+            "fn": 0,
+            "fp": 0,
+            "precision": 1.0,
+            "recall": 1.0,
+            "support": 6,
+            "tp": 6
+          },
+          "uncertain": {
+            "f1": 0.6666666666666666,
+            "fn": 0,
+            "fp": 1,
+            "precision": 0.5,
+            "recall": 1.0,
+            "support": 1,
+            "tp": 1
+          }
+        },
+        "confusion": {
+          "false_positive": {
+            "false_positive": 58,
+            "uncertain": 1
+          },
+          "real": {
+            "real": 6
+          },
+          "uncertain": {
+            "uncertain": 1
+          }
+        },
+        "kappa": 0.9263392857142858,
+        "scored": 66,
+        "true_positive_recall": 1.0
+      },
+      "pipeline": {
+        "accuracy": 0.9962406015037594,
+        "classes": {
+          "false_positive": {
+            "f1": 0.9980657640232108,
+            "fn": 1,
+            "fp": 0,
+            "precision": 1.0,
+            "recall": 0.9961389961389961,
+            "support": 259,
+            "tp": 258
+          },
+          "real": {
+            "f1": 1.0,
+            "fn": 0,
+            "fp": 0,
+            "precision": 1.0,
+            "recall": 1.0,
+            "support": 6,
+            "tp": 6
+          },
+          "uncertain": {
+            "f1": 0.6666666666666666,
+            "fn": 0,
+            "fp": 1,
+            "precision": 0.5,
+            "recall": 1.0,
+            "support": 1,
+            "tp": 1
+          }
+        },
+        "confusion": {
+          "false_positive": {
+            "false_positive": 258,
+            "uncertain": 1
+          },
+          "real": {
+            "real": 6
+          },
+          "uncertain": {
+            "uncertain": 1
+          }
+        },
+        "kappa": 0.9317248459958927,
+        "scored": 266,
+        "true_positive_recall": 1.0
+      }
+    },
+    "run": {
+      "completed": true,
+      "errors": {
+        "transport": 0,
+        "unexpected": 0
+      },
+      "invalid_output": 0,
+      "prefilter_resolved": 200,
+      "scored": 266
+    }
+  }
 }
