@@ -691,6 +691,22 @@ class CompareTests(unittest.TestCase):
         failures = gold_gate.compare_evidence(approved_baseline(), candidate)
         self.assertTrue(any("dataset revision differs" in f for f in failures))
 
+    def test_dataset_revision_mismatch_fails_even_when_class_counts_are_optional(self):
+        """Revision identity must not be gated on require_matching_class_counts.
+
+        That flag only relaxes the class-count equality check. Nesting the
+        revision comparison under it lets a candidate measured on a different
+        labeled set reuse approved thresholds whenever an operator disables
+        class-count matching.
+        """
+        candidate = sample_evidence()
+        candidate["dataset"]["revision"] = "sha256:" + "9" * 64
+        failures = gold_gate.compare_evidence(
+            approved_baseline(require_matching_class_counts=False),
+            candidate,
+        )
+        self.assertTrue(any("dataset revision differs" in f for f in failures))
+
     def test_uncalibrated_baseline_cannot_be_compared_against(self):
         failures = gold_gate.compare_evidence(
             gold_gate.load_baseline(), sample_evidence()

@@ -794,16 +794,19 @@ def compare_evidence(baseline: dict, candidate: dict) -> list[str]:
             f"candidate produced {invalid} invalid model outputs, "
             f"limit is {thresholds['max_invalid_output']}"
         )
+    # Dataset revision is an identity check, not a class-count policy. It must
+    # always run: otherwise require_matching_class_counts=false would let a
+    # candidate measured on a different labeled set reuse approved thresholds.
+    if candidate["dataset"]["revision"] != approved["dataset"]["revision"]:
+        failures.append(
+            "candidate dataset revision differs from the approved set; "
+            "re-approve the evaluation set before comparing"
+        )
     if thresholds["require_matching_class_counts"]:
         if candidate["dataset"]["class_counts"] != approved["dataset"]["class_counts"]:
             failures.append(
                 "candidate dataset class counts differ from the approved set; "
                 "metrics are not comparable"
-            )
-        if candidate["dataset"]["revision"] != approved["dataset"]["revision"]:
-            failures.append(
-                "candidate dataset revision differs from the approved set; "
-                "re-approve the evaluation set before comparing"
             )
 
     for scope in ("pipeline", "model_only"):
