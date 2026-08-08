@@ -14,7 +14,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, tzinfo
 from pathlib import Path
 
 from database import connect_database
@@ -199,9 +199,28 @@ def _last_complete_offset(path: Path) -> int:
     return 0
 
 
+def archive_day(modified_epoch: float, tz: tzinfo | None = None) -> date:
+    """Convert a POSIX mtime to the Wazuh archive calendar day.
+
+    ``tz=None`` means the process-local timezone, which is what production
+    uses. It is a parameter only so the conversion itself can be exercised
+    against an explicit ``zoneinfo.ZoneInfo`` on platforms that have no
+    ``time.tzset()``.
+    """
+    return datetime.fromtimestamp(modified_epoch, tz).date()
+
+
 def _current_log_date(path: Path) -> date:
-    modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-    return modified.date()
+    """Return the Wazuh archive day for ``path``.
+
+    Wazuh rotates and names ``ossec-alerts-DD`` archives by the manager's
+    local calendar day. Derive the day from mtime in the process local
+    timezone (Compose ``TZ``) so Triagewall's day boundary matches Wazuh when
+    both containers share the same ``TZ``. Using UTC here desynchronizes from
+    local rotation and either fails closed on inode change or looks for an
+    archive that does not exist yet.
+    """
+    return archive_day(path.stat().st_mtime)
 
 
 def initialize_position() -> dict:
