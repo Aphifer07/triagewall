@@ -736,5 +736,121 @@ class IpPseudonymStartupTests(unittest.TestCase):
             self.assertNotIn(secret, str(ctx.exception))
 
 
+class IpPseudonymNonAsciiSecretTests(unittest.TestCase):
+    """Non-ASCII secrets must not crash the reuse check.
+
+    ``hmac.compare_digest`` raises ``TypeError`` when either ``str`` operand
+    contains a non-ASCII character. Comparing the configured secrets as
+    ``str`` therefore aborted startup with an uncaught ``TypeError`` for any
+    deployment using a non-ASCII passphrase, even though the secrets were
+    valid, long enough and distinct. The dashboard cookie HMAC already
+    accepted such secrets, so enabling the documented redaction hardening
+    could take the API down.
+    """
+
+    # Both are >= MIN_SECRET_LENGTH characters and contain non-ASCII.
+    SPANISH = "Contraseña-de-producción-muy-larga-para-2026"
+    RUSSIAN = "Пароль-очень-длинный-секрет-для-теста-2026"
+    ASCII = "a-persistent-secret-value-long-enough"
+
+    def test_non_ascii_dashboard_secret_does_not_break_startup(self):
+        """The reported trigger: valid ASCII IP secret, non-ASCII cookie secret."""
+        self.assertEqual(
+            load_ip_pseudonym_secret(
+                self.ASCII,
+                redact_ips=True,
+                dashboard_write_secret=self.SPANISH,
+            ),
+            self.ASCII.encode("utf-8"),
+        )
+
+    def test_non_ascii_ip_secret_does_not_break_startup(self):
+        self.assertEqual(
+            load_ip_pseudonym_secret(
+                self.SPANISH,
+                redact_ips=True,
+                dashboard_write_secret=self.ASCII,
+            ),
+            self.SPANISH.encode("utf-8"),
+        )
+
+    def test_two_different_non_ascii_secrets_are_accepted(self):
+        self.assertEqual(
+            load_ip_pseudonym_secret(
+                self.SPANISH,
+                redact_ips=True,
+                dashboard_write_secret=self.RUSSIAN,
+            ),
+            self.SPANISH.encode("utf-8"),
+        )
+
+    def test_identical_non_ascii_secrets_are_detected_as_reuse(self):
+        """Must be IpPseudonymConfigError, never TypeError."""
+        for secret in (self.SPANISH, self.RUSSIAN):
+            with self.subTest(secret=secret[:8]):
+                with self.assertRaises(IpPseudonymConfigError) as ctx:
+                    load_ip_pseudonym_secret(
+                        secret,
+                        redact_ips=True,
+                        dashboard_write_secret=secret,
+                    )
+                self.assertIn("must differ", str(ctx.exception))
+
+    def test_reuse_is_detected_across_surrounding_whitespace(self):
+        with self.assertRaises(IpPseudonymConfigError):
+            load_ip_pseudonym_secret(
+                f"  {self.SPANISH}  ",
+                redact_ips=True,
+                dashboard_write_secret=f"\t{self.SPANISH}\n",
+            )
+
+    def test_whitespace_only_dashboard_secret_is_treated_as_unset(self):
+        self.assertEqual(
+            load_ip_pseudonym_secret(
+                self.SPANISH,
+                redact_ips=True,
+                dashboard_write_secret="   ",
+            ),
+            self.SPANISH.encode("utf-8"),
+        )
+
+    def test_non_ascii_reuse_errors_never_include_either_secret(self):
+        with self.assertRaises(IpPseudonymConfigError) as ctx:
+            load_ip_pseudonym_secret(
+                self.SPANISH,
+                redact_ips=True,
+                dashboard_write_secret=self.SPANISH,
+            )
+        message = str(ctx.exception)
+        self.assertNotIn(self.SPANISH, message)
+        self.assertNotIn(self.RUSSIAN, message)
+
+    def test_ascii_reuse_behaviour_is_unchanged(self):
+        with self.assertRaises(IpPseudonymConfigError) as ctx:
+            load_ip_pseudonym_secret(
+                self.ASCII,
+                redact_ips=True,
+                dashboard_write_secret=self.ASCII,
+            )
+        self.assertIn("must differ", str(ctx.exception))
+
+    def test_pseudonym_output_is_unchanged_by_the_encoding_fix(self):
+        """The comparison changed; the derived pseudonym must not have."""
+        loaded = load_ip_pseudonym_secret(
+            self.ASCII,
+            redact_ips=True,
+            dashboard_write_secret=self.SPANISH,
+        )
+        self.assertEqual(
+            pseudonymize_ip("10.0.0.5", loaded),
+            pseudonymize_ip("10.0.0.5", self.ASCII.encode("utf-8")),
+        )
+        # Pinned so a future change to the derivation is visible here.
+        self.assertEqual(
+            pseudonymize_ip("10.0.0.5", loaded),
+            "ip_0a020c4e94126b6a199a290d2bd675f6",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -87,9 +87,15 @@ def load_ip_pseudonym_secret(
             "characters; a short secret can be recovered by brute force just "
             "as easily as the addresses it is meant to protect."
         )
-    if (
-        dashboard_write_secret
-        and hmac.compare_digest(secret, dashboard_write_secret.strip())
+    # Compare as UTF-8 bytes, not as ``str``. ``hmac.compare_digest`` only
+    # accepts ASCII-only strings and raises ``TypeError`` otherwise, so a
+    # non-ASCII passphrase in either secret would abort startup with an
+    # uncaught TypeError instead of loading (or failing cleanly). The dashboard
+    # cookie HMAC already encodes the same secret this way.
+    other = (dashboard_write_secret or "").strip()
+    if other and hmac.compare_digest(
+        secret.encode("utf-8"),
+        other.encode("utf-8"),
     ):
         raise IpPseudonymConfigError(
             f"{ENV_IP_HASH_SECRET} must differ from "
