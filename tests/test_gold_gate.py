@@ -616,6 +616,41 @@ class VerifyTests(unittest.TestCase):
         baseline = approved_baseline(evidence)
         self.assertEqual(gold_gate.verify_baseline(baseline, self.fingerprint), [])
 
+    def test_calibrated_release_verification_checks_asset_inventory(self):
+        evidence = sample_evidence()
+        evidence["behavior_fingerprint"] = self.fingerprint
+        baseline = approved_baseline(evidence)
+
+        self.assertEqual(
+            gold_gate.verify_baseline(
+                baseline,
+                self.fingerprint,
+                require_calibrated=True,
+                asset_inventory=copy.deepcopy(evidence["asset_inventory"]),
+            ),
+            [],
+        )
+
+        changed_inventory = copy.deepcopy(evidence["asset_inventory"])
+        changed_inventory["revision"] = "sha256:" + "9" * 64
+        failures = gold_gate.verify_baseline(
+            baseline,
+            self.fingerprint,
+            require_calibrated=True,
+            asset_inventory=changed_inventory,
+        )
+        self.assertTrue(any("asset inventory changed" in f for f in failures))
+
+    def test_calibrated_release_verification_requires_live_inventory(self):
+        evidence = sample_evidence()
+        evidence["behavior_fingerprint"] = self.fingerprint
+        failures = gold_gate.verify_baseline(
+            approved_baseline(evidence),
+            self.fingerprint,
+            require_calibrated=True,
+        )
+        self.assertTrue(any("asset inventory was not supplied" in f for f in failures))
+
     def test_stale_evidence_is_rejected_and_names_the_changed_component(self):
         """
         Evidence recorded before a model change: internally consistent, so it
@@ -700,6 +735,12 @@ class CompareTests(unittest.TestCase):
         candidate["dataset"]["revision"] = "sha256:" + "9" * 64
         failures = gold_gate.compare_evidence(approved_baseline(), candidate)
         self.assertTrue(any("dataset revision differs" in f for f in failures))
+
+    def test_asset_inventory_mismatch_fails(self):
+        candidate = sample_evidence()
+        candidate["asset_inventory"]["revision"] = "sha256:" + "9" * 64
+        failures = gold_gate.compare_evidence(approved_baseline(), candidate)
+        self.assertTrue(any("asset inventory differs" in f for f in failures))
 
     def test_dataset_revision_mismatch_fails_even_when_class_counts_are_optional(self):
         """Revision identity must not be gated on require_matching_class_counts.

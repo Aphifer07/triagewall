@@ -733,7 +733,11 @@ def load_baseline(path: Path = BASELINE_PATH) -> dict:
 
 
 def verify_baseline(
-    baseline: dict, fingerprint: dict, *, require_calibrated: bool = False
+    baseline: dict,
+    fingerprint: dict,
+    *,
+    require_calibrated: bool = False,
+    asset_inventory: dict | None = None,
 ) -> list[str]:
     """
     Return a list of failures. An empty list means the gate passes.
@@ -767,6 +771,23 @@ def verify_baseline(
             f"missing: {missing or 'none'}). Re-run the operator evaluation "
             "and record fresh evidence."
         )
+    if require_calibrated:
+        recorded_inventory = baseline["evidence"]["asset_inventory"]
+        if asset_inventory is None:
+            failures.append(
+                "current asset inventory was not supplied for calibrated "
+                "verification; release evidence cannot be declared current"
+            )
+        elif asset_inventory != recorded_inventory:
+            failures.append(
+                "asset inventory changed since the approved gold-set evidence "
+                "was recorded "
+                f"(revision {recorded_inventory['revision']} -> "
+                f"{asset_inventory.get('revision', 'missing')}, count "
+                f"{recorded_inventory['count']} -> "
+                f"{asset_inventory.get('count', 'missing')}). Re-run the "
+                "operator evaluation and record fresh evidence."
+            )
     if not baseline["evidence"]["run"]["completed"]:
         failures.append("approved gold-set evidence records an incomplete run")
     return failures
@@ -793,6 +814,11 @@ def compare_evidence(baseline: dict, candidate: dict) -> list[str]:
         failures.append(
             f"candidate produced {invalid} invalid model outputs, "
             f"limit is {thresholds['max_invalid_output']}"
+        )
+    if candidate["asset_inventory"] != approved["asset_inventory"]:
+        failures.append(
+            "candidate asset inventory differs from the approved calibration; "
+            "re-approve after inventory changes before comparing metrics"
         )
     # Dataset revision is an identity check, not a class-count policy. It must
     # always run: otherwise require_matching_class_counts=false would let a
@@ -1079,9 +1105,17 @@ def main(argv=None) -> int:
 
         if args.command == "verify":
             baseline = load_baseline(Path(args.baseline))
-            fingerprint = compute_behavior_fingerprint()
+            triage = import_triage()
+            fingerprint = compute_behavior_fingerprint(triage)
+            asset_inventory = {
+                "revision": triage.ASSET_INVENTORY.revision,
+                "count": triage.ASSET_INVENTORY.count,
+            }
             failures = verify_baseline(
-                baseline, fingerprint, require_calibrated=args.require_calibrated
+                baseline,
+                fingerprint,
+                require_calibrated=args.require_calibrated,
+                asset_inventory=asset_inventory,
             )
             if failures:
                 return _print_failures(failures)
