@@ -1,4 +1,16 @@
-"""API-key and dashboard write-cookie authentication."""
+"""API-key authorization and the same-origin dashboard write cookie.
+
+Two different mechanisms live here and they are not equivalent:
+
+* **API keys** identify a caller. Each configured key has a name and scopes,
+  and a request presenting one is attributable to that key.
+* **The dashboard write cookie** does not identify anyone. It is same-origin
+  CSRF resistance for the trusted built-in UI: it proves a write came from a
+  page Triagewall itself served, not that a particular user is signed in. Any
+  browser that can load the dashboard receives one. It is not a login, not a
+  session, and not a substitute for network controls -- remote access still
+  requires a VPN or an authenticated reverse proxy.
+"""
 
 from __future__ import annotations
 
@@ -39,7 +51,12 @@ class ApiKeyRecord:
 
 @dataclass(frozen=True)
 class AuthContext:
-    """Resolved caller identity for a request."""
+    """Resolved authorization for a request.
+
+    ``principal`` names an *identity* only when ``via == "api_key"``. For
+    ``dashboard_cookie`` it is the constant ``"dashboard"``: the cookie proves
+    same-origin provenance, not who is operating the browser.
+    """
 
     principal: str
     scopes: frozenset[str]
@@ -153,7 +170,12 @@ def load_auth_settings_from_env() -> tuple[
     str,
     bool,
 ]:
-    """Load API keys, dashboard write secret, and unauthenticated-reads flag."""
+    """Load API keys, dashboard write-cookie secret, and the read flag.
+
+    An unset write-cookie secret falls back to a per-process value: the UI keeps
+    working, but every restart invalidates open tabs' cookies. Set
+    ``TRIAGEWALL_DASHBOARD_WRITE_SECRET`` in production.
+    """
     keys = parse_api_keys(os.environ.get("TRIAGEWALL_API_KEYS"))
     secret = os.environ.get("TRIAGEWALL_DASHBOARD_WRITE_SECRET", "").strip()
     if not secret:
@@ -169,7 +191,11 @@ def load_auth_settings_from_env() -> tuple[
 
 
 def issue_dashboard_write_cookie(secret: str) -> str:
-    """Return an HMAC cookie value granting feedback:write for the local UI."""
+    """Return the same-origin write cookie value for the built-in UI.
+
+    This grants ``feedback:write`` to a page Triagewall served itself. It
+    authenticates the *origin*, not a user.
+    """
     digest = hmac.new(
         secret.encode("utf-8"),
         b"dashboard-write-v1",

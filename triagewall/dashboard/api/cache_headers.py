@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+import logging
+from typing import Any, TypeVar
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ValidationError
+
+logger = logging.getLogger(__name__)
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 def weak_etag_for_payload(payload: Any) -> str:
@@ -17,15 +23,14 @@ def weak_etag_for_payload(payload: Any) -> str:
     return f'W/"{digest}"'
 
 
-def cached_json_response(
+def _conditional_response(
     request: Request,
-    payload: Any,
+    body: Any,
     *,
     max_age: int,
-    status_code: int = 200,
+    status_code: int,
 ) -> Response:
-    """Return JSON with Cache-Control and honor If-None-Match."""
-    etag = weak_etag_for_payload(payload)
+    etag = weak_etag_for_payload(body)
     if_none_match = request.headers.get("if-none-match")
     headers = {
         "Cache-Control": f"private, max-age={max_age}",
@@ -35,4 +40,67 @@ def cached_json_response(
         part.strip() for part in if_none_match.split(",")
     }:
         return Response(status_code=304, headers=headers)
-    return JSONResponse(payload, status_code=status_code, headers=headers)
+    return JSONResponse(body, status_code=status_code, headers=headers)
+
+
+def cached_json_response(
+    request: Request,
+    payload: Any,
+    *,
+    max_age: int,
+    status_code: int = 200,
+) -> Response:
+    """Return JSON with Cache-Control and honor If-None-Match.
+
+    Prefer :func:`validated_json_response` for the versioned contract. This
+    unvalidated form remains for the deprecated unversioned aliases, whose
+    shapes are frozen and must not change before removal.
+    """
+    return _conditional_response(
+        request,
+        payload,
+        max_age=max_age,
+        status_code=status_code,
+    )
+
+
+def validated_json_response(
+    request: Request,
+    payload: Any,
+    *,
+    model: type[ModelT],
+    max_age: int,
+    status_code: int = 200,
+) -> Response:
+    """Serve ``payload`` only after it satisfies its declared response model.
+
+    Routes that return an explicit ``Response`` bypass FastAPI's own
+    ``response_model`` serialization and validation, so the declared model
+    documents a contract nothing enforces. This validates first, serializes the
+    validated model with JSON-compatible output, and derives the ETag from that
+    representation -- so the cache key and the bytes on the wire always agree,
+    and an undocumented field or wrong type cannot reach a v1 client.
+
+    Conditional (304) handling, cache headers and non-200 status codes are all
+    preserved.
+    """
+    try:
+        validated = model.model_validate(payload)
+    except ValidationError as exc:
+        # Fail closed: never emit a response that violates the published
+        # contract. The error count is safe to log; field values are not.
+        logger.error(
+            "API response failed %s validation with %d error(s)",
+            model.__name__,
+            exc.error_count(),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="response failed contract validation",
+        ) from exc
+    return _conditional_response(
+        request,
+        validated.model_dump(mode="json"),
+        max_age=max_age,
+        status_code=status_code,
+    )

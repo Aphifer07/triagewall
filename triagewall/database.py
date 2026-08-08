@@ -37,7 +37,12 @@ def connect_database(
             timeout=connect_timeout_seconds,
         )
     else:
-        conn = sqlite3.connect(path, timeout=connect_timeout_seconds)
+        # `uri=True` with a plain (non-"file:") path leaves this database's
+        # filename handling untouched, but it enables SQLite URI filenames on
+        # the connection. Retention's backup authorization needs that so it can
+        # `ATTACH ... ?mode=ro`; without it SQLite treats the URI as a literal
+        # filename and the read-only request is silently lost.
+        conn = sqlite3.connect(path, uri=True, timeout=connect_timeout_seconds)
 
     try:
         conn.execute(f"PRAGMA busy_timeout={effective_busy_timeout_ms}")

@@ -30,6 +30,11 @@ from triagewall.dashboard.api.auth import (
     issue_dashboard_write_cookie,
 )
 from triagewall.dashboard.api.legacy import create_legacy_router
+from triagewall.dashboard.api.pseudonym import (
+    ENV_DASHBOARD_WRITE_SECRET,
+    ENV_IP_HASH_SECRET,
+    load_ip_pseudonym_secret,
+)
 from triagewall.dashboard.api import services
 from triagewall.dashboard.api.v1.router import create_metrics_handler, create_v1_router
 from triagewall.database import connect_database
@@ -100,8 +105,23 @@ API_REDACT_IPS = parse_boolean(
     os.environ.get("TRIAGEWALL_API_REDACT_IPS", "false"),
     "TRIAGEWALL_API_REDACT_IPS",
 )
+# The dashboard write cookie is same-origin CSRF resistance for the built-in
+# UI, not user authentication. Set this when the dashboard is served over
+# HTTPS so the browser refuses to send the cookie over plaintext.
+DASHBOARD_COOKIE_SECURE = parse_boolean(
+    os.environ.get("TRIAGEWALL_DASHBOARD_COOKIE_SECURE", "false"),
+    "TRIAGEWALL_DASHBOARD_COOKIE_SECURE",
+)
 
 auth_state = AuthState()
+
+# Validated at import time: enabling IP redaction without a usable secret would
+# otherwise degrade silently to reversible hashing, so startup fails instead.
+API_IP_HASH_SECRET = load_ip_pseudonym_secret(
+    os.environ.get(ENV_IP_HASH_SECRET),
+    redact_ips=API_REDACT_IPS,
+    dashboard_write_secret=os.environ.get(ENV_DASHBOARD_WRITE_SECRET),
+)
 
 # Back-compat aliases for existing tests that reset module-level caches.
 _stats_cache = services._stats_cache
@@ -240,8 +260,8 @@ def row_to_dict(row):
             "agent": None,
         }
     elif API_REDACT_IPS:
-        d["src_ip"] = services.hash_ip(d.get("src_ip"))
-        d["dest_ip"] = services.hash_ip(d.get("dest_ip"))
+        d["src_ip"] = services.hash_ip(d.get("src_ip"), API_IP_HASH_SECRET)
+        d["dest_ip"] = services.hash_ip(d.get("dest_ip"), API_IP_HASH_SECRET)
     return d
 
 
@@ -261,6 +281,10 @@ def _redact_ips() -> bool:
     return API_REDACT_IPS
 
 
+def _get_ip_secret() -> bytes | None:
+    return API_IP_HASH_SECRET
+
+
 _router_kwargs = dict(
     auth=auth_state,
     db_factory=db,
@@ -270,6 +294,7 @@ _router_kwargs = dict(
     row_to_dict=row_to_dict,
     mask_ip_fn=mask_ip,
     redact_ips=_redact_ips,
+    get_ip_secret=_get_ip_secret,
 )
 
 app.include_router(create_v1_router(**_router_kwargs))
@@ -318,11 +343,14 @@ app.openapi = custom_openapi
 @app.head("/")
 def index():
     response = FileResponse(STATIC_DIR / "index.html")
+    # Same-origin CSRF resistance for the built-in UI, not a user login. See
+    # docs/api.md: remote access still needs a VPN or an authenticated proxy.
     response.set_cookie(
         key=DASHBOARD_WRITE_COOKIE,
         value=issue_dashboard_write_cookie(auth_state.dashboard_write_secret),
         httponly=True,
         samesite="strict",
+        secure=DASHBOARD_COOKIE_SECURE,
         path="/",
     )
     return response
