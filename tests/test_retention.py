@@ -1881,6 +1881,66 @@ class BackupAuthorizationCleanupTests(unittest.TestCase):
             retention._detach_verified_backup(self.conn)
         self.assertIn("detach the verified backup", str(ctx.exception))
 
+    def test_cleanup_failure_reaches_the_cli_as_a_handled_failure(self):
+        """A detach failure must not escape ``main()`` as a traceback.
+
+        ``RetentionCleanupError`` is a bare ``RuntimeError`` raised after the
+        backup comparison has already run, so leaving it out of ``main()``'s
+        handled tuple turns a controlled fail-closed refusal into an unhandled
+        crash. That breaks the stable ``retention failed: …`` + exit 1 contract
+        operators and ``scripts/retention-cycle.sh`` depend on -- and before
+        this error type existed, the same detach failure surfaced as a
+        ``sqlite3.OperationalError``, which *was* handled.
+        """
+        manifest_path = self._prepare_verified_backup(reviewed_rows=5)
+        self.conn.close()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            retention,
+            "_detach_verified_backup",
+            side_effect=retention.RetentionCleanupError(
+                "could not detach the verified backup after authorization; "
+                "the source connection may still have it attached"
+            ),
+        ):
+            # Reaching an assertion at all proves main() handled it: an
+            # unhandled RetentionCleanupError would propagate out of this call.
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                result = retention.main(
+                    [
+                        "prune",
+                        "--db",
+                        str(self.db_path),
+                        "--keep-days",
+                        "30",
+                        "--apply",
+                        "--confirm-writers-stopped",
+                        "--include-reviewed",
+                        "--verified-backup-manifest",
+                        str(manifest_path),
+                        "--max-runtime-seconds",
+                        "60",
+                        "--pause-ms",
+                        "0",
+                        "--json",
+                    ]
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("retention failed:", stderr.getvalue())
+        self.assertIn("detach the verified backup", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        # Fail closed: authorization never completed, so nothing was pruned.
+        verify_conn = connect_database(self.db_path)
+        try:
+            remaining = verify_conn.execute(
+                "SELECT COUNT(*) FROM triage_events"
+            ).fetchone()[0]
+        finally:
+            verify_conn.close()
+        self.assertEqual(remaining, 5)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
