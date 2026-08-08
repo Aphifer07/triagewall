@@ -24,9 +24,9 @@ All notable changes to Triagewall are documented in this file.
 - Operator docs: [docs/api.md](docs/api.md).
 - A two-layer gold-set change-validation gate: deterministic production
   behavior fingerprints in CI and sanitized operator-side evaluation of both
-  end-to-end and model-only metrics against human labels. The shipped baseline
-  remains uncalibrated until a separate reviewed change approves evidence and
-  thresholds.
+  end-to-end and model-only metrics against human labels. The v0.3 baseline is
+  approved from a complete 266-alert run and fails closed on guarded behavior,
+  dataset, asset-inventory, invalid-output, kappa, or recall regressions.
 
 ### Changed
 

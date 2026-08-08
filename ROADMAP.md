@@ -117,11 +117,10 @@ complete.
 - [x] **Gold-set change-validation implementation.** Fingerprint production
   behavior deterministically, evaluate the real pipeline against human labels,
   validate evidence integrity, and compare both pipeline and model-only metrics.
-- [ ] **Gold-set calibration.** Review a complete operator evaluation, approve
-  thresholds in a separate change, and require the calibrated baseline for
-  release evidence. The first complete v0.3 candidate has been recorded; until
-  it is reviewed and approved, deterministic checks run but no performance
-  threshold is enforced.
+- [x] **Gold-set calibration.** Approved the complete 266-alert operator
+  evaluation as the v0.3 baseline, with fail-closed inventory identity checks,
+  zero invalid output, and `0.05` maximum decreases for Cohen's kappa and
+  true-positive recall in both metric scopes.
 - [ ] Extend Garak coverage across the multi-source pipeline.
 
 #### Operational usability and provenance

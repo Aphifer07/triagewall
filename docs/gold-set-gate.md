@@ -61,8 +61,15 @@ Two values are normalized out before hashing:
   code. Normalizing it keeps the fingerprint portable across deployments and
   keeps network topology out of published evidence.
 
-Everything else that changes what the model sees moves the fingerprint. A
-comment or refactor that does not change the request does not.
+Live asset-inventory contents are also kept out of the portable fingerprint.
+An operator evaluation records their non-disclosing revision hash and count;
+`verify --require-calibrated` and candidate comparison fail if that identity
+differs from the approved run. Ordinary CI checks the inventory-handling logic
+with fixtures but does not need access to private operator configuration.
+
+Everything else in guarded code or configuration that changes what the model
+sees moves the fingerprint. A comment or refactor that does not change the
+request does not.
 
 ## Running it
 
@@ -78,8 +85,8 @@ Verify committed evidence is current (what CI runs):
 python3 scripts/gold_gate.py verify
 ```
 
-Fail unless an approved real-model baseline exists (use when collecting
-release evidence):
+Fail unless an approved real-model baseline exists and the live operator asset
+inventory still matches it (use when collecting release evidence):
 
 ```bash
 python3 scripts/gold_gate.py verify --require-calibrated
@@ -97,25 +104,21 @@ Compare a fresh run against the approved baseline:
 python3 scripts/gold_gate.py compare --candidate gold-evidence.json
 ```
 
-## Current state: uncalibrated
+## Current state: approved v0.3 baseline
 
-`evidence/gold-set/baseline.json` ships with `status: "uncalibrated"`. No
-approved real-model baseline exists for the v0.3 pipeline yet, because none
-has been measured — the v0.2 figures do not describe it.
+`evidence/gold-set/baseline.json` ships with `status: "approved"`. The first
+v0.3 baseline was measured on omv1 and approved from commit `89e24fb`.
 
 In this state:
 
-- Layer 1 deterministic checks run on every pull request and can fail the build.
-- No performance threshold is enforced.
-- `verify --require-calibrated` fails, so release-evidence collection cannot
-  mistake an uncalibrated gate for an approved one.
+- Layer 1 deterministic checks run on every pull request and fail when guarded
+  production behavior drifts from the approved evidence.
+- `verify --require-calibrated` additionally requires the live operator asset
+  inventory revision and count to match the approved run.
+- Candidate comparison requires the same dataset revision, class counts, and
+  asset inventory before applying performance thresholds.
 
-To calibrate: run `evaluate` on the operator host, review the measured
-pipeline and model-only metrics, then set thresholds and flip `status` to
-`approved` in a separate reviewed change. Thresholds are a human decision and
-this tool never sets them.
-
-### First v0.3 calibration candidate
+### Approved v0.3 calibration
 
 A complete operator run was recorded on 2026-08-08 for commit `89e24fb`:
 
@@ -129,12 +132,17 @@ and produced zero invalid outputs, transport errors, or unexpected errors. One
 human-labeled false positive was classified conservatively as `uncertain`; all
 six human-labeled real alerts were classified `real`.
 
-This result is a **calibration candidate, not an approved baseline**. The set is
-highly imbalanced (259 false positives, six real alerts, and one uncertain
-alert), and every labeled row is currently Suricata. Wazuh behavior is covered
-structurally but does not yet have a measured performance claim. A separate
-reviewed change must decide regression tolerances and approve the exact
-evidence before `verify --require-calibrated` can pass.
+The approved thresholds allow at most a `0.05` decrease in Cohen's kappa and
+true-positive recall in both metric scopes. Because the set contains six real
+alerts, the recall tolerance is tighter than one missed-alert step (`1/6`), so
+any newly missed real alert blocks. Runs must complete, produce zero invalid
+outputs, and preserve the approved dataset revision and class counts.
+
+The set remains highly imbalanced (259 false positives, six real alerts, and
+one uncertain alert), and every labeled row is currently Suricata. Wazuh
+behavior is covered structurally but does not yet have a measured performance
+claim. Changes to guarded behavior, the labeled dataset, or the operator asset
+inventory require a fresh operator evaluation and explicit reapproval.
 
 ## Two metric scopes
 

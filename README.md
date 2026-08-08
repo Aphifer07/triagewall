@@ -45,12 +45,12 @@ dependency locks, regression CI, and CodeQL coverage are implemented.
 The release is in closeout rather than tagged as complete. The current
 multi-sensor build has been exercised against live Suricata and Wazuh streams;
 bounded backup-first retention and a single-owner startup migration phase are
-implemented. The gold-set gate is present, but its real-model baseline remains
-uncalibrated until an operator evaluation is reviewed and thresholds are
-approved. Remaining work is concentrated on that calibration, multi-source
-Garak coverage, and fresh-install, upgrade, rollback, Core-only, and
-Core-plus-Wazuh release evidence. The existing Core installation remains the
-supported operational product throughout this work.
+implemented. The v0.3 real-model gold-set baseline is approved from a complete
+266-alert operator evaluation, with regression thresholds enforced for both
+end-to-end and model-only metrics. Remaining work is concentrated on
+multi-source Garak coverage and fresh-install, upgrade, rollback, Core-only,
+and Core-plus-Wazuh release evidence. The existing Core installation remains
+the supported operational product throughout this work.
 
 ### Foundation from v0.2
 
