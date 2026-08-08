@@ -631,6 +631,114 @@ class RetentionTests(unittest.TestCase):
                 include_reviewed=True,
             )
 
+    def test_manifest_rejects_post_backup_feedback_with_null_reviewed_at(self):
+        """NULL reviewed_at must not bypass include-reviewed authorization."""
+        event_id = self.insert_event(age_days=60, signature_id=333)
+        backup_path = Path(self.temp_dir.name) / "null-reviewed.db"
+        manifest_path = Path(self.temp_dir.name) / "null-reviewed.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        self.conn.execute(
+            """UPDATE triage_events
+               SET human_verdict = 'false_positive',
+                   human_notes = 'sql review without reviewed_at',
+                   agreed = 1,
+                   reviewed_at = NULL
+               WHERE id = ?""",
+            (event_id,),
+        )
+        self.conn.commit()
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+
+        validate_backup_manifest(
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+            cutoff=cutoff,
+        )
+        with self.assertRaisesRegex(ValueError, "latest feedback"):
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+                cutoff=cutoff,
+                include_reviewed=True,
+            )
+
+    def test_manifest_allows_pre_backup_feedback_with_null_reviewed_at(self):
+        """Unchanged pre-backup feedback is authorized even without reviewed_at."""
+        self.insert_event(
+            age_days=60,
+            signature_id=334,
+            human_verdict="real",
+        )
+        backup_path = Path(self.temp_dir.name) / "pre-backup-feedback.db"
+        manifest_path = Path(self.temp_dir.name) / (
+            "pre-backup-feedback.manifest.json"
+        )
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        validate_backup_manifest(
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+            cutoff=cutoff,
+            include_reviewed=True,
+        )
+
+    def test_manifest_rejects_feedback_mutation_with_stale_reviewed_at(self):
+        """Mutating feedback while leaving an old reviewed_at must fail closed."""
+        event_id = self.insert_event(age_days=60, signature_id=335)
+        old_reviewed_at = format_utc_timestamp(
+            self.now - timedelta(days=40)
+        )
+        self.conn.execute(
+            """UPDATE triage_events
+               SET human_verdict = 'real', human_notes = 'original',
+                   agreed = 0, reviewed_at = ?
+               WHERE id = ?""",
+            (old_reviewed_at, event_id),
+        )
+        self.conn.commit()
+        backup_path = Path(self.temp_dir.name) / "stale-reviewed.db"
+        manifest_path = Path(self.temp_dir.name) / "stale-reviewed.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        self.conn.execute(
+            """UPDATE triage_events
+               SET human_verdict = 'false_positive',
+                   human_notes = 'changed without bumping reviewed_at',
+                   agreed = 1
+               WHERE id = ?""",
+            (event_id,),
+        )
+        self.conn.commit()
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        with self.assertRaisesRegex(ValueError, "latest feedback"):
+            validate_backup_manifest(
+                manifest_path,
+                source_conn=self.conn,
+                source_path=self.db_path,
+                cutoff=cutoff,
+                include_reviewed=True,
+            )
+
     def test_verify_rejects_backup_provenance_from_another_database(self):
         other_path = Path(self.temp_dir.name) / "other.db"
         other_conn = connect_database(other_path)
@@ -1475,6 +1583,363 @@ class RetentionTests(unittest.TestCase):
         details = " ".join(row[3] for row in plan)
         self.assertIn("idx_triage_src_asset_snapshot", details)
         self.assertIn("idx_triage_dest_asset_snapshot", details)
+
+
+class BackupFeedbackAuthorizationPlanTests(unittest.TestCase):
+    """The backup comparison must be a keyed lookup, not a per-row scan."""
+
+    ROW_COUNT = 4_000
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        self.db_path = root / "triage.db"
+        self.backup_path = root / "verified-backup.db"
+        schema = (PROJECT_ROOT / "triagewall" / "schema.sql").read_text()
+
+        # A realistically populated pair: a one-row fixture would make any plan
+        # look acceptable, so both sides carry thousands of reviewed rows.
+        for path in (self.db_path, self.backup_path):
+            conn = connect_database(path)
+            try:
+                conn.executescript(schema)
+                conn.executemany(
+                    """INSERT INTO triage_events (
+                           id, timestamp, signature_id, signature, raw_alert,
+                           verdict, model_used, processed_at,
+                           human_verdict, human_notes, agreed, reviewed_at
+                       ) VALUES (?, ?, ?, ?, '{}', 'real', 'm', ?, ?, ?, ?, ?)""",
+                    [self._row(index) for index in range(1, self.ROW_COUNT + 1)],
+                )
+                conn.commit()
+                conn.execute("ANALYZE")
+                conn.commit()
+            finally:
+                conn.close()
+
+        self.conn = connect_database(self.db_path)
+        self.addCleanup(self.conn.close)
+
+    @staticmethod
+    def _row(index: int):
+        stamp = f"2026-01-{(index % 28) + 1:02d}T00:00:00+00:00"
+        reviewed = index % 3 == 0
+        return (
+            index,
+            stamp,
+            1_000 + index,
+            f"Signature {index}",
+            stamp,
+            "real" if reviewed else None,
+            f"note {index}" if reviewed else None,
+            1 if reviewed else None,
+            stamp if reviewed else None,
+        )
+
+    def _attach_backup(self):
+        self.conn.execute(
+            "ATTACH DATABASE ? AS verified_backup",
+            (retention._readonly_backup_uri(self.backup_path),),
+        )
+        self.addCleanup(self._detach_quietly)
+
+    def _detach_quietly(self):
+        try:
+            self.conn.execute("DETACH DATABASE verified_backup")
+        except sqlite3.Error:
+            pass
+
+    def test_backup_side_uses_a_primary_key_lookup(self):
+        self._attach_backup()
+        plan = self.conn.execute(
+            "EXPLAIN QUERY PLAN "
+            + retention._backup_feedback_authorization_sql(),
+            (self.ROW_COUNT, "2026-06-01T00:00:00+00:00"),
+        ).fetchall()
+        details = [row[3] for row in plan]
+        joined = " | ".join(details)
+
+        backup_steps = [step for step in details if " bak" in f" {step}"]
+        self.assertTrue(backup_steps, f"no backup access step in plan: {joined}")
+        for step in backup_steps:
+            # Reject a full scan of the backup feedback table per live row.
+            self.assertNotIn(
+                "SCAN",
+                step,
+                f"backup side must not be scanned per live row: {joined}",
+            )
+            self.assertIn(
+                "INTEGER PRIMARY KEY",
+                step,
+                f"backup side must be a primary-key lookup: {joined}",
+            )
+
+    def test_live_side_stays_bounded_by_the_cutoff(self):
+        self._attach_backup()
+        plan = self.conn.execute(
+            "EXPLAIN QUERY PLAN "
+            + retention._backup_feedback_authorization_sql(),
+            (self.ROW_COUNT, "2026-06-01T00:00:00+00:00"),
+        ).fetchall()
+        joined = " | ".join(row[3] for row in plan)
+        live_steps = [row[3] for row in plan if " live" in f" {row[3]}"]
+        self.assertTrue(live_steps, f"no live access step in plan: {joined}")
+        for step in live_steps:
+            self.assertNotIn(
+                "SCAN live",
+                step,
+                f"live side must stay bounded, not scan the table: {joined}",
+            )
+
+    def test_authorization_predicate_matches_the_prune_predicate(self):
+        sql = retention._backup_feedback_authorization_sql()
+        self.assertIn(
+            retention._retention_predicate(True, alias="live"),
+            sql,
+        )
+        # Only reviewed rows can carry feedback worth authorizing.
+        self.assertIn("live.human_verdict IS NOT NULL", sql)
+        # And the scan is bounded by the verified backup sequence.
+        self.assertIn("live.id <= ?", sql)
+
+    def test_attached_backup_is_read_only(self):
+        self._attach_backup()
+        with self.assertRaises(sqlite3.OperationalError) as ctx:
+            self.conn.execute(
+                "UPDATE verified_backup.triage_events SET agreed = 0 WHERE id = 1"
+            )
+        self.assertIn("readonly", str(ctx.exception).replace(" ", "").lower())
+
+
+class BackupAuthorizationCleanupTests(unittest.TestCase):
+    """An interrupted comparison must leave the connection clean and usable."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.db_path = Path(self.temp_dir.name) / "triage.db"
+        self.conn = connect_database(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.conn.executescript(
+            (PROJECT_ROOT / "triagewall" / "schema.sql").read_text()
+        )
+        self.now = datetime.now(timezone.utc)
+
+    def insert_event(self, *, age_days: int, signature_id: int,
+                     human_verdict: str | None = None) -> int:
+        timestamp = format_utc_timestamp(self.now - timedelta(days=age_days))
+        cursor = self.conn.execute(
+            """INSERT INTO triage_events (
+                   timestamp, signature_id, signature, raw_alert,
+                   verdict, model_used, processed_at, human_verdict
+               ) VALUES (?, ?, ?, ?, 'false_positive', 'prefilter', ?, ?)""",
+            (
+                timestamp,
+                signature_id,
+                f"Test {signature_id}",
+                '{"padding":"' + ("x" * 1_024) + '"}',
+                timestamp,
+                human_verdict,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def _prepare_verified_backup(self, reviewed_rows: int = 400):
+        for index in range(reviewed_rows):
+            self.insert_event(
+                age_days=60,
+                signature_id=5_000 + index,
+                human_verdict="real",
+            )
+        backup_path = Path(self.temp_dir.name) / "cleanup.db"
+        manifest_path = Path(self.temp_dir.name) / "cleanup.manifest.json"
+        create_backup_copy(self.conn, backup_path)
+        verify_backup(
+            backup_path,
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+        )
+        return manifest_path
+
+    def _attached_databases(self):
+        return {
+            row[1]
+            for row in self.conn.execute("PRAGMA database_list").fetchall()
+        }
+
+    def test_deadline_interrupt_detaches_and_leaves_connection_usable(self):
+        manifest_path = self._prepare_verified_backup()
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        # Deliberately above the bound the deadline will impose, so restoring
+        # the caller's policy is observable rather than a no-op.
+        self.conn.execute("PRAGMA busy_timeout=25000")
+        original_busy_timeout = int(
+            self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        )
+        self.assertEqual(original_busy_timeout, 25_000)
+
+        # Trip the deadline exactly when the backup comparison statement is
+        # built -- after ATTACH succeeded -- so the interrupt provably lands
+        # inside the attached-database query, not in the cheap pre-check or in
+        # ATTACH itself.
+        state = {"armed": False, "attached_during_query": None}
+        deadline = 10.0
+
+        def clock():
+            return 11.0 if state["armed"] else 0.0
+
+        real_sql = retention._backup_feedback_authorization_sql
+
+        def arm_then_build():
+            state["attached_during_query"] = "verified_backup" in {
+                row[1]
+                for row in self.conn.execute("PRAGMA database_list").fetchall()
+            }
+            state["armed"] = True
+            return real_sql()
+
+        with mock.patch.object(
+            retention,
+            "_backup_feedback_authorization_sql",
+            side_effect=arm_then_build,
+        ):
+            with self.assertRaises(retention.RetentionDeadlineExceeded):
+                validate_backup_manifest(
+                    manifest_path,
+                    source_conn=self.conn,
+                    source_path=self.db_path,
+                    cutoff=cutoff,
+                    include_reviewed=True,
+                    deadline=deadline,
+                    clock=clock,
+                )
+
+        # The backup really was attached for the comparison...
+        self.assertTrue(state["attached_during_query"])
+        # ...and must not still be attached afterwards.
+        self.assertNotIn("verified_backup", self._attached_databases())
+        # The busy timeout must be restored.
+        self.assertEqual(
+            int(self.conn.execute("PRAGMA busy_timeout").fetchone()[0]),
+            original_busy_timeout,
+        )
+        # The progress callback must be gone. The fake clock is still past the
+        # deadline, so a lingering handler would interrupt this query, which is
+        # deliberately long enough to cross the 1000-instruction callback
+        # period many times over.
+        self.assertTrue(state["armed"])
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM triage_events AS a JOIN triage_events AS b"
+        ).fetchone()[0]
+        self.assertEqual(total, 400 * 400)
+
+    def test_successful_authorization_detaches_and_restores_timeout(self):
+        manifest_path = self._prepare_verified_backup(reviewed_rows=5)
+        cutoff = format_utc_timestamp(self.now - timedelta(days=30))
+        original_busy_timeout = int(
+            self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        )
+        clock = FakeClock()
+
+        validate_backup_manifest(
+            manifest_path,
+            source_conn=self.conn,
+            source_path=self.db_path,
+            cutoff=cutoff,
+            include_reviewed=True,
+            deadline=clock.now + 600.0,
+            clock=clock,
+        )
+
+        self.assertNotIn("verified_backup", self._attached_databases())
+        self.assertEqual(
+            int(self.conn.execute("PRAGMA busy_timeout").fetchone()[0]),
+            original_busy_timeout,
+        )
+
+    def test_detach_failure_does_not_mask_the_original_error(self):
+        """Cleanup must never replace the diagnosis being unwound."""
+        raised = []
+        try:
+            raise ValueError("original failure")
+        except ValueError:
+            # Nothing is attached, so DETACH fails -- but an error is in flight.
+            stderr = io.StringIO()
+            try:
+                with redirect_stderr(stderr):
+                    retention._detach_verified_backup(self.conn)
+            except Exception as exc:  # pragma: no cover - must not happen
+                raised.append(exc)
+        self.assertEqual(raised, [])
+        self.assertIn("could not detach the verified backup", stderr.getvalue())
+
+    def test_detach_failure_without_an_in_flight_error_is_explicit(self):
+        with self.assertRaises(retention.RetentionCleanupError) as ctx:
+            retention._detach_verified_backup(self.conn)
+        self.assertIn("detach the verified backup", str(ctx.exception))
+
+    def test_cleanup_failure_reaches_the_cli_as_a_handled_failure(self):
+        """A detach failure must not escape ``main()`` as a traceback.
+
+        ``RetentionCleanupError`` is a bare ``RuntimeError`` raised after the
+        backup comparison has already run, so leaving it out of ``main()``'s
+        handled tuple turns a controlled fail-closed refusal into an unhandled
+        crash. That breaks the stable ``retention failed: …`` + exit 1 contract
+        operators and ``scripts/retention-cycle.sh`` depend on -- and before
+        this error type existed, the same detach failure surfaced as a
+        ``sqlite3.OperationalError``, which *was* handled.
+        """
+        manifest_path = self._prepare_verified_backup(reviewed_rows=5)
+        self.conn.close()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            retention,
+            "_detach_verified_backup",
+            side_effect=retention.RetentionCleanupError(
+                "could not detach the verified backup after authorization; "
+                "the source connection may still have it attached"
+            ),
+        ):
+            # Reaching an assertion at all proves main() handled it: an
+            # unhandled RetentionCleanupError would propagate out of this call.
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                result = retention.main(
+                    [
+                        "prune",
+                        "--db",
+                        str(self.db_path),
+                        "--keep-days",
+                        "30",
+                        "--apply",
+                        "--confirm-writers-stopped",
+                        "--include-reviewed",
+                        "--verified-backup-manifest",
+                        str(manifest_path),
+                        "--max-runtime-seconds",
+                        "60",
+                        "--pause-ms",
+                        "0",
+                        "--json",
+                    ]
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("retention failed:", stderr.getvalue())
+        self.assertIn("detach the verified backup", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        # Fail closed: authorization never completed, so nothing was pruned.
+        verify_conn = connect_database(self.db_path)
+        try:
+            remaining = verify_conn.execute(
+                "SELECT COUNT(*) FROM triage_events"
+            ).fetchone()[0]
+        finally:
+            verify_conn.close()
+        self.assertEqual(remaining, 5)
 
 
 if __name__ == "__main__":

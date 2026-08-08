@@ -83,6 +83,42 @@ class DatabaseConnectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             connect_database(":memory:", busy_timeout_ms=-1)
 
+    def test_write_connection_supports_read_only_uri_attach(self):
+        """Retention's backup authorization depends on URI filenames."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "triage.db"
+            other_path = Path(temp_dir) / "verified-backup.db"
+            for path in (db_path, other_path):
+                seed = connect_database(path)
+                try:
+                    seed.execute("CREATE TABLE example (id INTEGER PRIMARY KEY)")
+                    seed.execute("INSERT INTO example (id) VALUES (1)")
+                    seed.commit()
+                finally:
+                    seed.close()
+
+            conn = connect_database(db_path)
+            try:
+                # Without SQLITE_OPEN_URI on this connection, SQLite treats the
+                # URI as a literal filename and the read-only request is lost.
+                conn.execute(
+                    "ATTACH DATABASE ? AS verified_backup",
+                    (f"{other_path.resolve().as_uri()}?mode=ro",),
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT id FROM verified_backup.example"
+                    ).fetchone()[0],
+                    1,
+                )
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute(
+                        "INSERT INTO verified_backup.example (id) VALUES (2)"
+                    )
+                conn.execute("DETACH DATABASE verified_backup")
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
