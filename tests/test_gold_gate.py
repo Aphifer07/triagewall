@@ -401,7 +401,9 @@ def sample_evidence(pipeline=None, model_only=None, **overrides):
         "run": {
             "completed": True,
             "scored": pipeline_metrics["scored"],
-            "prefilter_resolved": 40,
+            "prefilter_resolved": (
+                pipeline_metrics["scored"] - model_only_metrics["scored"]
+            ),
             "errors": {"transport": 0, "unexpected": 0},
             "invalid_output": 0,
         },
@@ -541,6 +543,46 @@ class EvidenceSchemaTests(unittest.TestCase):
         with self.assertRaises(GoldGateError) as ctx:
             gold_gate.validate_evidence(evidence)
         self.assertIn("run.scored disagrees", str(ctx.exception))
+
+    def test_complete_run_must_cover_every_scorable_dataset_row(self):
+        evidence = sample_evidence()
+        partial = {"real": {"real": 1}, "false_positive": {"false_positive": 2}}
+        evidence["metrics"]["pipeline"] = gold_gate.summarize(partial)
+        evidence["metrics"]["model_only"] = gold_gate.summarize(partial)
+        evidence["run"]["scored"] = 3
+        evidence["run"]["prefilter_resolved"] = 0
+        with self.assertRaises(GoldGateError) as ctx:
+            gold_gate.validate_evidence(evidence)
+        self.assertIn("completed run scored", str(ctx.exception))
+
+    def test_dataset_totals_must_reconcile(self):
+        evidence = sample_evidence()
+        evidence["dataset"]["total"] += 1
+        with self.assertRaises(GoldGateError) as ctx:
+            gold_gate.validate_evidence(evidence)
+        self.assertIn("dataset.total disagrees", str(ctx.exception))
+
+    def test_pipeline_scope_must_reconcile_with_prefilter_and_model_only(self):
+        evidence = sample_evidence()
+        evidence["run"]["prefilter_resolved"] += 1
+        with self.assertRaises(GoldGateError) as ctx:
+            gold_gate.validate_evidence(evidence)
+        self.assertIn("prefilter_resolved", str(ctx.exception))
+
+    def test_incomplete_run_may_record_partial_scoring(self):
+        evidence = sample_evidence()
+        partial = {"real": {"real": 1}, "false_positive": {"false_positive": 2}}
+        evidence["metrics"]["pipeline"] = gold_gate.summarize(partial)
+        evidence["metrics"]["model_only"] = gold_gate.summarize(partial)
+        evidence["run"].update(
+            {
+                "completed": False,
+                "scored": 3,
+                "prefilter_resolved": 0,
+                "errors": {"transport": 1, "unexpected": 0},
+            }
+        )
+        self.assertIsNotNone(gold_gate.validate_evidence(evidence))
 
     def test_consistent_evidence_from_a_real_evaluation_validates(self):
         """The recomputation must accept genuine output, not just reject edits."""
@@ -726,7 +768,10 @@ class CompareTests(unittest.TestCase):
 
     def test_class_count_mismatch_fails(self):
         candidate = sample_evidence()
-        candidate["dataset"]["class_counts"] = {"real": 11, "false_positive": 19}
+        candidate["dataset"]["class_counts"] = {
+            "real": 101,
+            "false_positive": 219,
+        }
         failures = gold_gate.compare_evidence(approved_baseline(), candidate)
         self.assertTrue(any("class counts differ" in f for f in failures))
 
@@ -741,6 +786,21 @@ class CompareTests(unittest.TestCase):
         candidate["asset_inventory"]["revision"] = "sha256:" + "9" * 64
         failures = gold_gate.compare_evidence(approved_baseline(), candidate)
         self.assertTrue(any("asset inventory differs" in f for f in failures))
+
+    def test_candidate_cannot_shrink_scorable_source_counts(self):
+        candidate = sample_evidence()
+        partial = {"real": {"real": 1}, "false_positive": {"false_positive": 2}}
+        candidate["metrics"]["pipeline"] = gold_gate.summarize(partial)
+        candidate["metrics"]["model_only"] = gold_gate.summarize(partial)
+        candidate["run"]["scored"] = 3
+        candidate["run"]["prefilter_resolved"] = 0
+        candidate["dataset"]["total"] = 3
+        candidate["dataset"]["class_counts"] = {"real": 1, "false_positive": 2}
+        candidate["dataset"]["source_counts"] = {"suricata": 3}
+        failures = gold_gate.compare_evidence(
+            approved_baseline(require_matching_class_counts=False), candidate
+        )
+        self.assertTrue(any("source counts differ" in f for f in failures))
 
     def test_dataset_revision_mismatch_fails_even_when_class_counts_are_optional(self):
         """Revision identity must not be gated on require_matching_class_counts.

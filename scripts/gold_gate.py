@@ -639,6 +639,22 @@ def validate_evidence(manifest) -> dict:
     )
     _require_counts(manifest["dataset"]["class_counts"], "dataset.class_counts")
     _require_counts(manifest["dataset"]["source_counts"], "dataset.source_counts")
+    _require(
+        isinstance(manifest["dataset"]["total"], int)
+        and not isinstance(manifest["dataset"]["total"], bool)
+        and manifest["dataset"]["total"] >= 0,
+        "dataset.total must be a non-negative integer",
+    )
+    _require(
+        manifest["dataset"]["total"]
+        == sum(manifest["dataset"]["class_counts"].values()),
+        "dataset.total disagrees with dataset.class_counts",
+    )
+    _require(
+        manifest["dataset"]["total"]
+        == sum(manifest["dataset"]["source_counts"].values()),
+        "dataset.total disagrees with dataset.source_counts",
+    )
 
     _require_keys(
         manifest["run"],
@@ -649,6 +665,13 @@ def validate_evidence(manifest) -> dict:
         isinstance(manifest["run"]["completed"], bool), "run.completed must be a boolean"
     )
     _require_counts(manifest["run"]["errors"], "run.errors")
+    for key in ("scored", "prefilter_resolved", "invalid_output"):
+        _require(
+            isinstance(manifest["run"][key], int)
+            and not isinstance(manifest["run"][key], bool)
+            and manifest["run"][key] >= 0,
+            f"run.{key} must be a non-negative integer",
+        )
 
     _require_keys(manifest["metrics"], {"pipeline", "model_only"}, "metrics")
     _validate_metrics(manifest["metrics"]["pipeline"], "metrics.pipeline")
@@ -662,6 +685,29 @@ def validate_evidence(manifest) -> dict:
         f"({manifest['run']['scored']} vs "
         f"{manifest['metrics']['pipeline']['scored']})",
     )
+    _require(
+        manifest["run"]["prefilter_resolved"]
+        + manifest["metrics"]["model_only"]["scored"]
+        == manifest["metrics"]["pipeline"]["scored"],
+        "run.prefilter_resolved plus metrics.model_only.scored disagrees "
+        "with metrics.pipeline.scored",
+    )
+
+    scorable = manifest["dataset"]["source_counts"].get("suricata", 0)
+    _require(
+        manifest["run"]["scored"] <= scorable,
+        "run.scored exceeds the recorded Suricata dataset count",
+    )
+    if manifest["run"]["completed"]:
+        _require(
+            manifest["run"]["scored"] == scorable,
+            "completed run scored "
+            f"{manifest['run']['scored']} of {scorable} Suricata rows",
+        )
+        _require(
+            sum(manifest["run"]["errors"].values()) == 0,
+            "completed run records transport or unexpected errors",
+        )
     return manifest
 
 
@@ -827,6 +873,11 @@ def compare_evidence(baseline: dict, candidate: dict) -> list[str]:
         failures.append(
             "candidate dataset revision differs from the approved set; "
             "re-approve the evaluation set before comparing"
+        )
+    if candidate["dataset"]["source_counts"] != approved["dataset"]["source_counts"]:
+        failures.append(
+            "candidate dataset source counts differ from the approved set; "
+            "the scored population is not comparable"
         )
     if thresholds["require_matching_class_counts"]:
         if candidate["dataset"]["class_counts"] != approved["dataset"]["class_counts"]:
