@@ -130,6 +130,57 @@ responses fail closed.
 - New Wazuh identities are deduplicated by source type, source instance, and
   source event ID. Instance-less identities use a separate unique constraint.
 
+#### Suricata `eve.json` rotation
+
+The Suricata checkpoint names a specific inode and byte offset. It is never
+abandoned merely because the live `eve.json` path now resolves to a different
+inode.
+
+- When the checkpointed inode is not the live inode, the rotated archive that
+  still owns that inode is drained first. Only affirmative evidence of a
+  complete drain — reopening that exact inode and observing a stable EOF —
+  allows the checkpoint to move on.
+- If the checkpointed inode is no longer present beside `eve.json`, ingest
+  fails closed and exits non-zero. A saved offset of `0` is *not* treated as
+  proof that the archive was read; it just as plausibly means the whole file
+  was still unread.
+- A renamed log is not assumed to be immutable. `logrotate` can move the path
+  while Suricata still holds the old descriptor and appends more records
+  through it, so EOF is confirmed across consecutive observations separated by
+  a bounded settle interval. Late appends are drained before the checkpoint
+  moves. The wait is bounded and yields to graceful shutdown.
+- Rotated-archive discovery is bounded: a single non-recursive scan of the
+  `eve.json` directory, restricted to regular files whose names begin with the
+  live file's name, rejecting symlinks, directories, devices, sockets and
+  FIFOs. Two separate caps apply — one on `eve.json*` siblings and a much
+  larger one on total directory entries — so unrelated logs sharing the mount
+  cannot consume the archive budget. Exceeding either cap, or failing to read
+  the directory at all, fails closed. A partial chain is never returned: it is
+  indistinguishable from a complete one, and acting on it would silently skip
+  any archive that fell outside the scan.
+- Compressed archives (`.gz`, `.bz2`, `.xz`, `.zst`) are recognised as chain
+  members — they are evidence that a rotation happened and they hold their slot
+  in the ordering — but Triagewall reads `eve.json` as plain JSON-Lines and
+  never decompresses them. A compressed file can therefore never become a read
+  source or a persisted checkpoint. If the next unread archive is compressed,
+  ingest fails closed with the checkpoint left on the preceding file and asks
+  the operator to decompress or restore it. It is never skipped.
+- Rotation ordering follows the documented schemes — `logrotate` numbering
+  (a higher index is older) and Suricata's dated archives — so a second
+  rotation that happens while ingest is still catching up drains the displaced
+  file before the new live file.
+- A file that shrank behind the saved offset, and an inode that changes between
+  `stat()` and `open()`, both leave the checkpoint untouched.
+- Known limitation: if the rotation chain position cannot be re-established
+  after a drain (for example, the archive was compressed and unlinked and no
+  recorded successor remains), ingest fails closed and asks an operator to
+  resolve the chain rather than guessing which archive comes next.
+- A corrupt or unwritable checkpoint and a rotation that cannot be advanced
+  safely are one error family (`IngestCheckpointError` subclasses
+  `EveCheckpointError`), so both terminate the daemon non-zero through a single
+  handler rather than one of them falling into the generic retry path and
+  continuing on an in-memory cursor.
+
 ### API contract
 
 - Every `/api/v1/*` response is validated against its declared Pydantic model
