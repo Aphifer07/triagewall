@@ -138,6 +138,9 @@ The asset inventory follows the versioned contract in
 Keep populated copies outside Git and mount one with `HOST_ASSET_INVENTORY`.
 Inventory changes are validated and loaded when the ingest container starts;
 missing, malformed, oversized, or ambiguous inventories fail startup.
+`HOST_ASSET_INVENTORY` is the Compose mount source. Direct Python operator
+tools do not read it automatically; set `ASSET_INVENTORY_PATH` to that same
+host file before running gold-set release verification or evaluation.
 Each asset is limited to 64 IP addresses and 64 exposed ports, and validation
 keeps the complete two-sided asset context within 2 KiB so trusted context
 cannot exhaust the model prompt budget.

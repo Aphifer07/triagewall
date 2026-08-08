@@ -85,6 +85,16 @@ Verify committed evidence is current (what CI runs):
 python3 scripts/gold_gate.py verify
 ```
 
+Operator-side release and evaluation commands must load the same private
+inventory that Compose mounts through `HOST_ASSET_INVENTORY`. Direct Python
+processes do not read that Compose variable; set `ASSET_INVENTORY_PATH` to the
+same host file before running them:
+
+```bash
+export ASSET_INVENTORY_PATH=/absolute/path/to/private/assets.json
+test -r "$ASSET_INVENTORY_PATH"
+```
+
 Fail unless an approved real-model baseline exists and the live operator asset
 inventory still matches it (use when collecting release evidence):
 
