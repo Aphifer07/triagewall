@@ -38,16 +38,19 @@ The v0.3 implementation now provides one source-aware triage pipeline for
 Suricata network alerts and actionable Wazuh alerts. The multi-source
 foundation, Wazuh adapter, least-privilege optional Compose integration, exact-IP
 asset context, scoped prefilter policy, durable checkpoints, migration
-hardening, bounded queries, runtime dependency locks, regression CI, and
-CodeQL coverage are implemented.
+hardening, fail-closed Suricata rotation recovery, bounded retention, a
+versioned authenticated API, deterministic gold-set change validation, runtime
+dependency locks, regression CI, and CodeQL coverage are implemented.
 
 The release is in closeout rather than tagged as complete. The current
 multi-sensor build has been exercised against live Suricata and Wazuh streams;
 bounded backup-first retention and a single-owner startup migration phase are
-implemented. Remaining work is concentrated on multi-source security and
-accuracy gates plus fresh-install, upgrade, rollback, Core-only, and
-Core-plus-Wazuh release evidence. The existing Core installation remains the
-supported operational product throughout this work.
+implemented. The v0.3 real-model gold-set baseline is approved from a complete
+266-alert operator evaluation, with regression thresholds enforced for both
+end-to-end and model-only metrics. Remaining work is concentrated on
+multi-source Garak coverage and fresh-install, upgrade, rollback, Core-only,
+and Core-plus-Wazuh release evidence. The existing Core installation remains
+the supported operational product throughout this work.
 
 ### Foundation from v0.2
 
@@ -135,6 +138,9 @@ The asset inventory follows the versioned contract in
 Keep populated copies outside Git and mount one with `HOST_ASSET_INVENTORY`.
 Inventory changes are validated and loaded when the ingest container starts;
 missing, malformed, oversized, or ambiguous inventories fail startup.
+`HOST_ASSET_INVENTORY` is the Compose mount source. Direct Python operator
+tools do not read it automatically; set `ASSET_INVENTORY_PATH` to that same
+host file before running gold-set release verification or evaluation.
 Each asset is limited to 64 IP addresses and 64 exposed ports, and validation
 keeps the complete two-sided asset context within 2 KiB so trusted context
 cannot exhaust the model prompt budget.
