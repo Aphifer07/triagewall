@@ -30,8 +30,15 @@ def create_legacy_router(
     row_to_dict: Callable,
     mask_ip_fn: Callable,
     redact_ips: Callable[[], bool],
+    get_ip_secret: Callable[[], bytes | None] = lambda: None,
 ) -> APIRouter:
-    """Thin deprecated aliases preserving dashboard response shapes."""
+    """Thin deprecated aliases preserving dashboard response shapes.
+
+    These keep ``cached_json_response`` rather than the validating helper used
+    by v1: their shapes are frozen until removal on 2026-12-31, and their
+    filter values stay lenient so existing clients that pass an unrecognized
+    value keep the historical "no filter" behaviour instead of newly failing.
+    """
     router = APIRouter(tags=["legacy"], deprecated=True)
     require_read = auth.require_read
     require_write = auth.require_feedback_write
@@ -135,6 +142,7 @@ def create_legacy_router(
             mode=get_mode(),
             mask_ip_fn=mask_ip_fn,
             redact_ips=redact_ips(),
+            ip_secret=get_ip_secret(),
         )
         body = {"generated_at": generated_at, **payload}
         return cached_json_response(

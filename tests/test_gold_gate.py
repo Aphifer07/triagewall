@@ -691,6 +691,22 @@ class CompareTests(unittest.TestCase):
         failures = gold_gate.compare_evidence(approved_baseline(), candidate)
         self.assertTrue(any("dataset revision differs" in f for f in failures))
 
+    def test_dataset_revision_mismatch_fails_even_when_class_counts_are_optional(self):
+        """Revision identity must not be gated on require_matching_class_counts.
+
+        That flag only relaxes the class-count equality check. Nesting the
+        revision comparison under it lets a candidate measured on a different
+        labeled set reuse approved thresholds whenever an operator disables
+        class-count matching.
+        """
+        candidate = sample_evidence()
+        candidate["dataset"]["revision"] = "sha256:" + "9" * 64
+        failures = gold_gate.compare_evidence(
+            approved_baseline(require_matching_class_counts=False),
+            candidate,
+        )
+        self.assertTrue(any("dataset revision differs" in f for f in failures))
+
     def test_uncalibrated_baseline_cannot_be_compared_against(self):
         failures = gold_gate.compare_evidence(
             gold_gate.load_baseline(), sample_evidence()
@@ -851,6 +867,185 @@ class EvaluateTests(unittest.TestCase):
         ):
             with self.subTest(secret=secret):
                 self.assertNotIn(secret, rendered)
+
+    def test_evidence_carries_only_the_aggregate_dataset_revision(self):
+        """Per-row alert digests must never reach committed evidence.
+
+        An individual alert hash lets anyone holding a candidate alert confirm
+        whether that exact host, address or signature is in the labeled set.
+        """
+        rows = gold_gate.load_labeled_rows(self.db_path)
+        with patch("urllib.request.urlopen", fake_urlopen_factory(valid_body("real"))):
+            manifest = gold_gate.evaluate(self.db_path, commit="test")
+        rendered = json.dumps(manifest)
+
+        for row in rows:
+            per_row = gold_gate.digest(row["alert"])
+            with self.subTest(row=row["id"]):
+                self.assertNotIn(per_row, rendered)
+            # Nor the full alert JSON, in either key ordering.
+            self.assertNotIn(gold_gate.canonical_json(row["alert"]), rendered)
+
+        self.assertEqual(
+            manifest["dataset"]["revision"], gold_gate.dataset_revision(rows)
+        )
+        self.assertEqual(
+            set(manifest["dataset"]),
+            {"revision", "total", "class_counts", "source_counts"},
+        )
+
+    def test_reported_dataset_revision_matches_the_helper(self):
+        rows = gold_gate.load_labeled_rows(self.db_path)
+        with patch("urllib.request.urlopen", fake_urlopen_factory(valid_body("real"))):
+            manifest = gold_gate.evaluate(self.db_path, commit="test")
+        self.assertEqual(
+            manifest["dataset"]["revision"], gold_gate.dataset_revision(rows)
+        )
+        self.assertTrue(manifest["dataset"]["revision"].startswith("sha256:"))
+
+
+class DatasetRevisionTests(unittest.TestCase):
+    """The revision must track what the gate is actually measuring."""
+
+    @staticmethod
+    def _rows():
+        return [
+            {
+                "id": 1,
+                "alert": {
+                    "timestamp": "2026-08-06T00:00:00+00:00",
+                    "src_ip": "10.0.0.11",
+                    "alert": {"signature_id": 2000001, "signature": "ET MALWARE"},
+                },
+                "human_verdict": "real",
+                "source_type": "suricata",
+            },
+            {
+                "id": 2,
+                "alert": {
+                    "timestamp": "2026-08-06T00:01:00+00:00",
+                    "src_ip": "10.0.0.12",
+                    "alert": {"signature_id": 2000002, "signature": "ET INFO"},
+                },
+                "human_verdict": "false_positive",
+                "source_type": "suricata",
+            },
+        ]
+
+    def test_changing_alert_content_changes_the_revision(self):
+        """Same id, same label, same source -- different alert."""
+        baseline = self._rows()
+        mutated = self._rows()
+        mutated[0]["alert"]["src_ip"] = "10.0.0.99"
+
+        self.assertEqual(mutated[0]["id"], baseline[0]["id"])
+        self.assertEqual(
+            mutated[0]["human_verdict"], baseline[0]["human_verdict"]
+        )
+        self.assertEqual(mutated[0]["source_type"], baseline[0]["source_type"])
+        self.assertNotEqual(
+            gold_gate.dataset_revision(baseline),
+            gold_gate.dataset_revision(mutated),
+        )
+
+    def test_nested_alert_content_change_changes_the_revision(self):
+        baseline = self._rows()
+        mutated = self._rows()
+        mutated[1]["alert"]["alert"]["signature"] = "ET INFO (edited)"
+        self.assertNotEqual(
+            gold_gate.dataset_revision(baseline),
+            gold_gate.dataset_revision(mutated),
+        )
+
+    def test_reordering_json_keys_does_not_change_the_revision(self):
+        baseline = self._rows()
+        reordered = self._rows()
+        original = reordered[0]["alert"]
+        reordered[0]["alert"] = {
+            "alert": {
+                "signature": original["alert"]["signature"],
+                "signature_id": original["alert"]["signature_id"],
+            },
+            "src_ip": original["src_ip"],
+            "timestamp": original["timestamp"],
+        }
+        self.assertNotEqual(
+            list(baseline[0]["alert"]), list(reordered[0]["alert"])
+        )
+        self.assertEqual(
+            gold_gate.dataset_revision(baseline),
+            gold_gate.dataset_revision(reordered),
+        )
+
+    def test_changing_a_human_label_changes_the_revision(self):
+        baseline = self._rows()
+        relabeled = self._rows()
+        relabeled[0]["human_verdict"] = "false_positive"
+        self.assertNotEqual(
+            gold_gate.dataset_revision(baseline),
+            gold_gate.dataset_revision(relabeled),
+        )
+
+    def test_changing_source_type_changes_the_revision(self):
+        baseline = self._rows()
+        resourced = self._rows()
+        resourced[1]["source_type"] = "wazuh"
+        self.assertNotEqual(
+            gold_gate.dataset_revision(baseline),
+            gold_gate.dataset_revision(resourced),
+        )
+
+    def test_changing_row_identity_changes_the_revision(self):
+        baseline = self._rows()
+        renumbered = self._rows()
+        renumbered[1]["id"] = 99
+        self.assertNotEqual(
+            gold_gate.dataset_revision(baseline),
+            gold_gate.dataset_revision(renumbered),
+        )
+
+    def test_changing_the_evaluation_population_changes_the_revision(self):
+        baseline = self._rows()
+        self.assertNotEqual(
+            gold_gate.dataset_revision(baseline),
+            gold_gate.dataset_revision(baseline[:1]),
+        )
+        extended = self._rows()
+        extended.append(
+            {
+                "id": 3,
+                "alert": {"timestamp": "2026-08-06T00:02:00+00:00"},
+                "human_verdict": "uncertain",
+                "source_type": "suricata",
+            }
+        )
+        self.assertNotEqual(
+            gold_gate.dataset_revision(baseline),
+            gold_gate.dataset_revision(extended),
+        )
+
+    def test_revision_is_stable_across_repeated_computation(self):
+        rows = self._rows()
+        self.assertEqual(
+            gold_gate.dataset_revision(rows),
+            gold_gate.dataset_revision(self._rows()),
+        )
+
+    def test_revision_is_a_prefixed_sha256_digest(self):
+        revision = gold_gate.dataset_revision(self._rows())
+        self.assertTrue(revision.startswith("sha256:"))
+        self.assertEqual(len(revision), len("sha256:") + 64)
+
+    def test_revision_differs_from_the_identity_only_scheme(self):
+        """Regression: the old revision ignored alert content entirely."""
+        rows = self._rows()
+        identity_only = gold_gate.digest(
+            [
+                [row["id"], row["human_verdict"], row["source_type"]]
+                for row in rows
+            ]
+        )
+        self.assertNotEqual(gold_gate.dataset_revision(rows), identity_only)
 
 
 if __name__ == "__main__":

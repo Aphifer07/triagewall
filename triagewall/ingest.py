@@ -126,8 +126,17 @@ CHECKPOINT_LINE = LineResult(processed=False, checkpoint=True)
 RETRY_LINE = LineResult(processed=False, checkpoint=False)
 
 
-class IngestCheckpointError(RuntimeError):
-    """Raised when the durable eve.json checkpoint cannot be advanced safely."""
+class EveCheckpointError(RuntimeError):
+    """Suricata checkpoint is corrupt, unwritable, or otherwise unusable."""
+
+
+class IngestCheckpointError(EveCheckpointError):
+    """Suricata ingest cannot safely advance the durable checkpoint.
+
+    A subclass so that one ``except EveCheckpointError`` guard fails closed on
+    the whole family: a checkpoint that cannot be read or written, and a
+    rotation chain that cannot be followed without risking an alert gap.
+    """
 
 
 # Graceful shutdown
@@ -141,19 +150,81 @@ signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
 
-def load_position():
-    """Return dict with last-read state, or empty if first run."""
-    if POSITION_PATH.exists():
-        try:
-            return json.loads(POSITION_PATH.read_text())
-        except Exception as e:
-            log.warning(f"Could not read position file: {e}; starting fresh")
+def _empty_position():
     return {"offset": 0, "inode": None, "size": 0}
 
 
+def _validate_position(state):
+    """Reject checkpoints that cannot be trusted as a durable read cursor."""
+    if not isinstance(state, dict) or set(state) != {"offset", "inode", "size"}:
+        raise EveCheckpointError("Suricata checkpoint has an invalid schema")
+    for field in ("offset", "size"):
+        value = state[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise EveCheckpointError(
+                f"Suricata checkpoint {field} must be a non-negative integer"
+            )
+    inode = state["inode"]
+    if inode is not None and (
+        isinstance(inode, bool) or not isinstance(inode, int)
+    ):
+        raise EveCheckpointError("Suricata checkpoint inode is invalid")
+    return state
+
+
+def load_position():
+    """Return the durable read cursor, or an empty cursor on first run.
+
+    A corrupt or schema-invalid checkpoint fails closed. Silently rewinding to
+    offset 0 would re-ingest already-triaged alerts: flow-less Suricata alerts
+    are not covered by ``is_duplicate``, so a rewind creates duplicate
+    ``triage_events`` rows. Wazuh ingest already fails closed for the same
+    reason.
+    """
+    if not POSITION_PATH.exists():
+        return _empty_position()
+    try:
+        state = json.loads(POSITION_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise EveCheckpointError(
+            "could not read Suricata checkpoint"
+        ) from exc
+    return _validate_position(state)
+
+
 def save_position(state):
-    POSITION_PATH.parent.mkdir(parents=True, exist_ok=True)
-    POSITION_PATH.write_text(json.dumps(state))
+    """Atomically replace the Suricata checkpoint.
+
+    A plain ``write_text`` truncates the existing file first. A crash in the
+    middle leaves a partial JSON document; the previous loader treated that as
+    "start fresh" and rewound to offset 0. Write to a temp file, fsync, then
+    ``os.replace`` so readers either see the old complete checkpoint or the
+    new one — never a torn file.
+    """
+    validated = _validate_position(state)
+    temporary = POSITION_PATH.with_name(
+        f".{POSITION_PATH.name}.{os.getpid()}.tmp"
+    )
+    try:
+        try:
+            POSITION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(
+                    validated, handle, sort_keys=True, separators=(",", ":")
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, POSITION_PATH)
+        except OSError as exc:
+            raise EveCheckpointError(
+                "could not write Suricata checkpoint"
+            ) from exc
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _rotation_sort_key(name: str, live_name: str):
@@ -781,7 +852,16 @@ def tail_file():
                         f"(offset now {state['offset']})"
                     )
 
-            except IngestCheckpointError:
+            except EveCheckpointError as exc:
+                # Fail closed on the whole checkpoint-error family. This single
+                # guard covers both a corrupt or unwritable checkpoint and a
+                # rotation the daemon cannot advance across safely, because
+                # IngestCheckpointError subclasses EveCheckpointError.
+                # Continuing with an in-memory cursor ahead of a durable
+                # checkpoint would skip or duplicate alerts across a restart.
+                log.critical(
+                    "Suricata ingest stopped to prevent an alert gap: %s", exc
+                )
                 raise
             except Exception as e:
                 log.error(f"Loop error: {type(e).__name__}: {e}")
@@ -798,12 +878,16 @@ def main() -> int:
             demo_loop()
         else:
             tail_file()
-    except IngestCheckpointError as exc:
-        # Fail closed: the daemon exits non-zero rather than skipping alerts.
+    except EveCheckpointError as exc:
+        # One handler for the whole checkpoint-error family: a corrupt or
+        # unwritable checkpoint and a rotation that cannot be advanced safely
+        # both terminate here, non-zero, rather than skipping alerts.
+        # IngestCheckpointError subclasses EveCheckpointError, so listing the
+        # subclass separately would be dead code and could drift apart.
         log.critical("Suricata ingest stopped to avoid skipping alerts: %s", exc)
         return 1
     except (OSError, RuntimeError, sqlite3.Error) as exc:
-        log.critical("Suricata ingest startup failed: %s", exc)
+        log.critical("Suricata ingest failed: %s", exc)
         return 1
     return 0
 

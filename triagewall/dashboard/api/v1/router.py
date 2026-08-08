@@ -8,17 +8,20 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from triagewall.dashboard.api.auth import AuthContext, AuthState
-from triagewall.dashboard.api.cache_headers import cached_json_response
+from triagewall.dashboard.api.cache_headers import validated_json_response
 from triagewall.dashboard.api import metrics as metrics_mod
 from triagewall.dashboard.api import services
 from triagewall.dashboard.api.v1.models import (
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
+    ModelFilter,
     SpcAnomaliesResponse,
     StatsModel,
     StatsResponse,
+    TimelineInterval,
     TimelineResponse,
+    VerdictFilter,
     VerdictsResponse,
 )
 from triagewall.time_utils import utc_now_iso
@@ -34,6 +37,7 @@ def create_v1_router(
     row_to_dict: Callable,
     mask_ip_fn: Callable,
     redact_ips: Callable[[], bool],
+    get_ip_secret: Callable[[], bytes | None] = lambda: None,
 ) -> APIRouter:
     """Build the v1 router with injected app dependencies."""
     router = APIRouter(prefix="/api/v1", tags=["v1"])
@@ -52,9 +56,10 @@ def create_v1_router(
             stale_threshold_seconds=get_stale_threshold(),
             include_storage=False,
         )
-        return cached_json_response(
+        return validated_json_response(
             request,
             payload,
+            model=HealthResponse,
             max_age=5,
             status_code=status_code,
         )
@@ -70,20 +75,31 @@ def create_v1_router(
             "mode": get_mode(),
             "stats": StatsModel.model_validate(stats_dict).model_dump(),
         }
-        return cached_json_response(
+        return validated_json_response(
             request,
             payload,
+            model=StatsResponse,
             max_age=int(services.STATS_TTL),
         )
 
     @router.get("/verdicts", response_model=VerdictsResponse)
     def list_verdicts(
         request: Request,
-        verdict: str | None = None,
-        signature: str | None = None,
-        model: str | None = None,
-        limit: int = Query(default=services.DEFAULT_VERDICT_LIMIT, ge=1, le=500),
-        cursor: str | None = None,
+        verdict: VerdictFilter | None = None,
+        signature: str | None = Query(
+            default=None,
+            max_length=services.MAX_SIGNATURE_SEARCH_LENGTH,
+        ),
+        model: ModelFilter | None = None,
+        limit: int = Query(
+            default=services.DEFAULT_VERDICT_LIMIT,
+            ge=1,
+            le=services.MAX_VERDICT_LIMIT,
+        ),
+        cursor: str | None = Query(
+            default=None,
+            max_length=services.MAX_CURSOR_LENGTH,
+        ),
         _auth: AuthContext = Depends(require_read),
     ):
         with db_factory(readonly=True) as conn:
@@ -101,7 +117,12 @@ def create_v1_router(
             "verdicts": [row_to_dict(r) for r in rows],
             "next_cursor": next_cursor,
         }
-        return cached_json_response(request, payload, max_age=5)
+        return validated_json_response(
+            request,
+            payload,
+            model=VerdictsResponse,
+            max_age=5,
+        )
 
     @router.post(
         "/feedback/{event_id}",
@@ -124,7 +145,7 @@ def create_v1_router(
     def timeline(
         request: Request,
         hours: int = Query(default=24, ge=1, le=services.MAX_TIMELINE_HOURS),
-        interval: str = Query(default="1h"),
+        interval: TimelineInterval = Query(default="1h"),
         _auth: AuthContext = Depends(require_read),
     ):
         buckets, generated_at = services.get_timeline(
@@ -135,12 +156,13 @@ def create_v1_router(
         payload = {
             "generated_at": generated_at,
             "hours": hours,
-            "interval": "1h",
+            "interval": interval,
             "buckets": buckets,
         }
-        return cached_json_response(
+        return validated_json_response(
             request,
             payload,
+            model=TimelineResponse,
             max_age=int(services.TIMELINE_TTL),
         )
 
@@ -154,11 +176,13 @@ def create_v1_router(
             mode=get_mode(),
             mask_ip_fn=mask_ip_fn,
             redact_ips=redact_ips(),
+            ip_secret=get_ip_secret(),
         )
         body = {"generated_at": generated_at, **payload}
-        return cached_json_response(
+        return validated_json_response(
             request,
             body,
+            model=SpcAnomaliesResponse,
             max_age=int(services.SPC_TTL),
         )
 

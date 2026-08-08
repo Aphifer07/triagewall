@@ -164,6 +164,19 @@ inode.
   recorded successor remains), ingest fails closed and asks an operator to
   resolve the chain rather than guessing which archive comes next.
 
+### API contract
+
+- Every `/api/v1/*` response is validated against its declared Pydantic model
+  at runtime, before the ETag is computed and before any bytes are written.
+  Response models forbid undocumented fields, so a stray value fails closed
+  instead of leaking into the stable contract. Operator-defined asset-inventory
+  contents stay free-form dictionaries by design.
+- Verdict, model and timeline-interval filters are typed. An unrecognized value
+  returns 422 rather than silently behaving like no filter.
+- Free-form inputs are bounded: signature search, cursor length and feedback
+  notes each have a documented maximum, so one request cannot make the database
+  or the application do unbounded work.
+
 ### Operator-facing output
 
 - Dashboard values are HTML-escaped.
@@ -206,6 +219,23 @@ HttpOnly write cookie for the built-in UI. Writes always require a credential.
 Unauthenticated reads remain available only when
 `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true` (default). See
 [docs/api.md](api.md).
+
+**Not every write credential identifies a user.** An API key names a caller;
+the dashboard write cookie does not. It is same-origin CSRF resistance for the
+trusted built-in interface — it establishes that a write came from a page
+Triagewall served, not who sent it, and any browser that can load the dashboard
+receives one. `TRIAGEWALL_DASHBOARD_COOKIE_SECURE=true` keeps it off plaintext
+transports, but the trusted-LAN boundary is what actually protects it.
+
+**API IP redaction is pseudonymization, not anonymization.**
+`TRIAGEWALL_API_REDACT_IPS=true` replaces addresses with
+`HMAC-SHA256(TRIAGEWALL_API_IP_HASH_SECRET, domain || address)`. An unkeyed
+digest would be reversible by exhaustive search over the address space, so
+enabling redaction without a valid secret fails startup. Because the mapping is
+deterministic within a deployment — which is what makes correlation useful — an
+attacker who learns the secret can still re-identify addresses, and one who can
+observe traffic can confirm a guessed address. Demo-mode masking is separate
+and unaffected.
 
 **Retention remains an operator-controlled maintenance action.** The bounded,
 backup-first host runner restores monitoring between short deletion pauses and

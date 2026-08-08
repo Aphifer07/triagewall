@@ -731,5 +731,75 @@ class EveRotationCheckpointTests(unittest.TestCase):
             opened[0].execute("SELECT 1")
 
 
+class SuricataCheckpointDurabilityTests(unittest.TestCase):
+    """Atomic writes and fail-closed loads for position.json."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.position_path = Path(self.temp_dir.name) / "position.json"
+        self.position_patch = patch.object(
+            ingest, "POSITION_PATH", self.position_path
+        )
+        self.position_patch.start()
+
+    def tearDown(self):
+        self.position_patch.stop()
+        self.temp_dir.cleanup()
+
+    def test_missing_checkpoint_starts_at_origin(self):
+        self.assertEqual(
+            ingest.load_position(),
+            {"offset": 0, "inode": None, "size": 0},
+        )
+
+    def test_save_position_is_atomic_and_leaves_no_tmp(self):
+        state = {"offset": 42, "inode": 7, "size": 99}
+        ingest.save_position(state)
+        self.assertEqual(ingest.load_position(), state)
+        self.assertFalse(any(self.position_path.parent.glob("*.tmp")))
+
+    def test_save_position_replaces_previous_checkpoint(self):
+        ingest.save_position({"offset": 1, "inode": 1, "size": 1})
+        ingest.save_position({"offset": 8, "inode": 2, "size": 8})
+        self.assertEqual(
+            ingest.load_position(),
+            {"offset": 8, "inode": 2, "size": 8},
+        )
+
+    def test_corrupt_checkpoint_fails_closed_instead_of_rewinding(self):
+        """A torn write must not silently restart at offset 0.
+
+        Trigger: crash mid-``write_text`` leaves truncated JSON. The old loader
+        caught the decode error and returned offset 0, which re-ingests the
+        whole eve.json. Flow-less alerts bypass ``is_duplicate`` and land as
+        duplicate ``triage_events`` rows.
+        """
+        self.position_path.write_text('{"offset": 12, "inode":')
+        with self.assertRaises(ingest.EveCheckpointError) as ctx:
+            ingest.load_position()
+        self.assertIn("could not read Suricata checkpoint", str(ctx.exception))
+
+    def test_invalid_checkpoint_schema_fails_closed(self):
+        self.position_path.write_text(json.dumps({"offset": 0}))
+        with self.assertRaises(ingest.EveCheckpointError) as ctx:
+            ingest.load_position()
+        self.assertIn("invalid schema", str(ctx.exception))
+
+    def test_negative_offset_fails_closed(self):
+        self.position_path.write_text(
+            json.dumps({"offset": -1, "inode": None, "size": 0})
+        )
+        with self.assertRaises(ingest.EveCheckpointError):
+            ingest.load_position()
+
+    def test_bool_offset_fails_closed(self):
+        # bool is a subclass of int; must not be accepted as a cursor.
+        self.position_path.write_text(
+            json.dumps({"offset": True, "inode": None, "size": 0})
+        )
+        with self.assertRaises(ingest.EveCheckpointError):
+            ingest.load_position()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

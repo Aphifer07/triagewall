@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import sqlite3
 import time
@@ -12,6 +11,10 @@ from typing import Any, Callable
 
 from fastapi import HTTPException
 
+from triagewall.dashboard.api.pseudonym import (
+    IpPseudonymConfigError,
+    pseudonymize_ip,
+)
 from triagewall.dashboard.stats import get_dashboard_stats
 from triagewall.storage import get_storage_metrics
 from triagewall.time_utils import (
@@ -28,6 +31,15 @@ MAX_TIMELINE_HOURS = 168
 MAX_VERDICT_LIMIT = 500
 DEFAULT_VERDICT_LIMIT = 100
 
+# Bounds on free-form input. These exist so one request cannot make the
+# database or the application do unbounded work: a long LIKE pattern is scanned
+# against every candidate row, and an oversized cursor or note is stored and
+# echoed back. The values are generous for real use and documented in
+# docs/api.md.
+MAX_SIGNATURE_SEARCH_LENGTH = 200
+MAX_CURSOR_LENGTH = 512
+MAX_FEEDBACK_NOTES_LENGTH = 2_000
+
 _stats_cache: dict[str, Any] = {"data": None, "ts": 0.0, "generated_at": None}
 _timeline_cache: dict[str, Any] = {"data": None, "ts": 0.0, "key": None}
 _spc_cache: dict[str, Any] = {"data": None, "ts": 0.0}
@@ -40,11 +52,20 @@ def reset_caches() -> None:
     _spc_cache.update(data=None, ts=0.0)
 
 
-def hash_ip(ip: str | None) -> str | None:
+def hash_ip(ip: str | None, secret: bytes | None = None) -> str | None:
+    """Pseudonymize one IP address for API output.
+
+    Keyed with HMAC-SHA256: an unsalted digest of an IP address is reversible
+    by exhaustive search, so it never provided the redaction it implied. The
+    secret is validated at startup, which is why it is required here.
+    """
     if not ip:
         return ip
-    digest = hashlib.sha256(ip.encode("utf-8")).hexdigest()[:12]
-    return f"ip_{digest}"
+    if not secret:
+        raise IpPseudonymConfigError(
+            "IP redaction is enabled but no pseudonymization secret is loaded"
+        )
+    return pseudonymize_ip(ip, secret)
 
 
 def encode_cursor(processed_at: str | None, event_id: int) -> str:
@@ -272,6 +293,7 @@ def get_spc_anomalies(
     mode: str,
     mask_ip_fn: Callable[[str | None], str | None],
     redact_ips: bool,
+    ip_secret: bytes | None = None,
 ) -> tuple[dict[str, Any], str]:
     now = time.time()
     if _spc_cache["data"] is not None and (now - _spc_cache["ts"]) < SPC_TTL:
@@ -310,7 +332,7 @@ def get_spc_anomalies(
             ts = None
         ip_value = mask_ip_fn(row["ip"]) if mode == "demo" else row["ip"]
         if redact_ips and mode != "demo":
-            ip_value = hash_ip(ip_value)
+            ip_value = hash_ip(ip_value, ip_secret)
         out["anomalies"].append(
             {
                 "detected_at": ts,
