@@ -430,6 +430,17 @@ def approved_baseline(evidence=None, **threshold_overrides):
     }
 
 
+def uncalibrated_baseline():
+    return {
+        "manifest_version": 1,
+        "kind": gold_gate.BASELINE_KIND,
+        "status": "uncalibrated",
+        "notes": [],
+        "thresholds": None,
+        "evidence": None,
+    }
+
+
 class EvidenceSchemaTests(unittest.TestCase):
     def test_valid_evidence_passes(self):
         self.assertIsNotNone(gold_gate.validate_evidence(sample_evidence()))
@@ -588,12 +599,11 @@ class VerifyTests(unittest.TestCase):
         self.fingerprint = gold_gate.compute_behavior_fingerprint(triage)
 
     def test_uncalibrated_baseline_passes_ordinary_ci(self):
-        baseline = gold_gate.load_baseline()
-        self.assertEqual(baseline["status"], "uncalibrated")
+        baseline = uncalibrated_baseline()
         self.assertEqual(gold_gate.verify_baseline(baseline, self.fingerprint), [])
 
     def test_uncalibrated_baseline_fails_when_calibration_is_required(self):
-        baseline = gold_gate.load_baseline()
+        baseline = uncalibrated_baseline()
         failures = gold_gate.verify_baseline(
             baseline, self.fingerprint, require_calibrated=True
         )
@@ -709,7 +719,7 @@ class CompareTests(unittest.TestCase):
 
     def test_uncalibrated_baseline_cannot_be_compared_against(self):
         failures = gold_gate.compare_evidence(
-            gold_gate.load_baseline(), sample_evidence()
+            uncalibrated_baseline(), sample_evidence()
         )
         self.assertTrue(any("uncalibrated baseline" in f for f in failures))
 
