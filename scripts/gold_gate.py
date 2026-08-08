@@ -639,6 +639,22 @@ def validate_evidence(manifest) -> dict:
     )
     _require_counts(manifest["dataset"]["class_counts"], "dataset.class_counts")
     _require_counts(manifest["dataset"]["source_counts"], "dataset.source_counts")
+    _require(
+        isinstance(manifest["dataset"]["total"], int)
+        and not isinstance(manifest["dataset"]["total"], bool)
+        and manifest["dataset"]["total"] >= 0,
+        "dataset.total must be a non-negative integer",
+    )
+    _require(
+        manifest["dataset"]["total"]
+        == sum(manifest["dataset"]["class_counts"].values()),
+        "dataset.total disagrees with dataset.class_counts",
+    )
+    _require(
+        manifest["dataset"]["total"]
+        == sum(manifest["dataset"]["source_counts"].values()),
+        "dataset.total disagrees with dataset.source_counts",
+    )
 
     _require_keys(
         manifest["run"],
@@ -649,6 +665,13 @@ def validate_evidence(manifest) -> dict:
         isinstance(manifest["run"]["completed"], bool), "run.completed must be a boolean"
     )
     _require_counts(manifest["run"]["errors"], "run.errors")
+    for key in ("scored", "prefilter_resolved", "invalid_output"):
+        _require(
+            isinstance(manifest["run"][key], int)
+            and not isinstance(manifest["run"][key], bool)
+            and manifest["run"][key] >= 0,
+            f"run.{key} must be a non-negative integer",
+        )
 
     _require_keys(manifest["metrics"], {"pipeline", "model_only"}, "metrics")
     _validate_metrics(manifest["metrics"]["pipeline"], "metrics.pipeline")
@@ -662,6 +685,29 @@ def validate_evidence(manifest) -> dict:
         f"({manifest['run']['scored']} vs "
         f"{manifest['metrics']['pipeline']['scored']})",
     )
+    _require(
+        manifest["run"]["prefilter_resolved"]
+        + manifest["metrics"]["model_only"]["scored"]
+        == manifest["metrics"]["pipeline"]["scored"],
+        "run.prefilter_resolved plus metrics.model_only.scored disagrees "
+        "with metrics.pipeline.scored",
+    )
+
+    scorable = manifest["dataset"]["source_counts"].get("suricata", 0)
+    _require(
+        manifest["run"]["scored"] <= scorable,
+        "run.scored exceeds the recorded Suricata dataset count",
+    )
+    if manifest["run"]["completed"]:
+        _require(
+            manifest["run"]["scored"] == scorable,
+            "completed run scored "
+            f"{manifest['run']['scored']} of {scorable} Suricata rows",
+        )
+        _require(
+            sum(manifest["run"]["errors"].values()) == 0,
+            "completed run records transport or unexpected errors",
+        )
     return manifest
 
 
@@ -733,7 +779,11 @@ def load_baseline(path: Path = BASELINE_PATH) -> dict:
 
 
 def verify_baseline(
-    baseline: dict, fingerprint: dict, *, require_calibrated: bool = False
+    baseline: dict,
+    fingerprint: dict,
+    *,
+    require_calibrated: bool = False,
+    asset_inventory: dict | None = None,
 ) -> list[str]:
     """
     Return a list of failures. An empty list means the gate passes.
@@ -767,6 +817,23 @@ def verify_baseline(
             f"missing: {missing or 'none'}). Re-run the operator evaluation "
             "and record fresh evidence."
         )
+    if require_calibrated:
+        recorded_inventory = baseline["evidence"]["asset_inventory"]
+        if asset_inventory is None:
+            failures.append(
+                "current asset inventory was not supplied for calibrated "
+                "verification; release evidence cannot be declared current"
+            )
+        elif asset_inventory != recorded_inventory:
+            failures.append(
+                "asset inventory changed since the approved gold-set evidence "
+                "was recorded "
+                f"(revision {recorded_inventory['revision']} -> "
+                f"{asset_inventory.get('revision', 'missing')}, count "
+                f"{recorded_inventory['count']} -> "
+                f"{asset_inventory.get('count', 'missing')}). Re-run the "
+                "operator evaluation and record fresh evidence."
+            )
     if not baseline["evidence"]["run"]["completed"]:
         failures.append("approved gold-set evidence records an incomplete run")
     return failures
@@ -794,6 +861,11 @@ def compare_evidence(baseline: dict, candidate: dict) -> list[str]:
             f"candidate produced {invalid} invalid model outputs, "
             f"limit is {thresholds['max_invalid_output']}"
         )
+    if candidate["asset_inventory"] != approved["asset_inventory"]:
+        failures.append(
+            "candidate asset inventory differs from the approved calibration; "
+            "re-approve after inventory changes before comparing metrics"
+        )
     # Dataset revision is an identity check, not a class-count policy. It must
     # always run: otherwise require_matching_class_counts=false would let a
     # candidate measured on a different labeled set reuse approved thresholds.
@@ -801,6 +873,11 @@ def compare_evidence(baseline: dict, candidate: dict) -> list[str]:
         failures.append(
             "candidate dataset revision differs from the approved set; "
             "re-approve the evaluation set before comparing"
+        )
+    if candidate["dataset"]["source_counts"] != approved["dataset"]["source_counts"]:
+        failures.append(
+            "candidate dataset source counts differ from the approved set; "
+            "the scored population is not comparable"
         )
     if thresholds["require_matching_class_counts"]:
         if candidate["dataset"]["class_counts"] != approved["dataset"]["class_counts"]:
@@ -1079,9 +1156,17 @@ def main(argv=None) -> int:
 
         if args.command == "verify":
             baseline = load_baseline(Path(args.baseline))
-            fingerprint = compute_behavior_fingerprint()
+            triage = import_triage()
+            fingerprint = compute_behavior_fingerprint(triage)
+            asset_inventory = {
+                "revision": triage.ASSET_INVENTORY.revision,
+                "count": triage.ASSET_INVENTORY.count,
+            }
             failures = verify_baseline(
-                baseline, fingerprint, require_calibrated=args.require_calibrated
+                baseline,
+                fingerprint,
+                require_calibrated=args.require_calibrated,
+                asset_inventory=asset_inventory,
             )
             if failures:
                 return _print_failures(failures)
