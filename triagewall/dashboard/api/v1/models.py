@@ -6,6 +6,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from triagewall.dashboard.api.services import MAX_FEEDBACK_NOTES_LENGTH
+
+# Typed filter vocabularies. Declaring them here keeps the OpenAPI schema, the
+# route signatures and the tests in agreement, and makes an unknown value a 422
+# rather than a filter that silently does nothing.
+VerdictFilter = Literal["real", "false_positive", "uncertain"]
+ModelFilter = Literal["llm", "prefilter"]
+TimelineInterval = Literal["1h"]
+
 
 class StatsModel(BaseModel):
     """Rolling 24h counters plus lifetime total."""
@@ -38,14 +47,16 @@ class StatsResponse(BaseModel):
 
 
 class AgentContext(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    """Sensor agent identity. Fixed shape; not an operator-extensible bag."""
+
+    model_config = ConfigDict(extra="forbid")
 
     id: Any = None
     name: Any = None
 
 
 class SensorContext(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     source: str | None = None
     instance: str | None = None
@@ -54,14 +65,22 @@ class SensorContext(BaseModel):
 
 
 class AssetContext(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    """Two-sided asset snapshot.
+
+    The wrapper is a fixed two-key structure, but ``source`` and
+    ``destination`` stay free-form dictionaries on purpose: their contents come
+    from the operator's own asset inventory, so enumerating them here would
+    invent a schema Triagewall does not define.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     source: dict[str, Any] | None = None
     destination: dict[str, Any] | None = None
 
 
 class VerdictRow(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     id: int
     timestamp: str | None = None
@@ -112,7 +131,7 @@ class TimelineResponse(BaseModel):
 
     generated_at: str
     hours: int
-    interval: Literal["1h"]
+    interval: TimelineInterval
     buckets: list[TimelineBucket]
 
 
@@ -147,8 +166,8 @@ class HealthResponse(BaseModel):
 class FeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    human_verdict: Literal["real", "false_positive", "uncertain"]
-    notes: str = ""
+    human_verdict: VerdictFilter
+    notes: str = Field(default="", max_length=MAX_FEEDBACK_NOTES_LENGTH)
 
 
 class FeedbackResponse(BaseModel):
