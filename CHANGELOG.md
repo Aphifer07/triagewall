@@ -16,11 +16,17 @@ All notable changes to Triagewall are documented in this file.
   (default `true`) for read BC.
 - Same-origin HttpOnly dashboard write cookie so the built-in UI can POST
   feedback without JavaScript changes.
-- `TRIAGEWALL_API_REDACT_IPS` to hash IPs for non-local consumers (default
-  `false` — real IPs remain visible on trusted LAN deployments).
+- `TRIAGEWALL_API_REDACT_IPS` to produce deployment-keyed HMAC pseudonyms for
+  non-local consumers. It defaults to `false`, so real IPs remain visible on
+  trusted LAN deployments.
 - `Cache-Control` / weak `ETag` / `If-None-Match` on poll-friendly reads, plus
   `generated_at` on v1 payloads.
 - Operator docs: [docs/api.md](docs/api.md).
+- A two-layer gold-set change-validation gate: deterministic production
+  behavior fingerprints in CI and sanitized operator-side evaluation of both
+  end-to-end and model-only metrics against human labels. The shipped baseline
+  remains uncalibrated until a separate reviewed change approves evidence and
+  thresholds.
 
 ### Changed
 
@@ -29,6 +35,27 @@ All notable changes to Triagewall are documented in this file.
 - Unversioned `/api/*` routes remain as thin deprecated aliases for the
   existing dashboard (including `/api/health` storage metrics and the
   combined `/api/verdicts` shape). Removal target: **2026-12-31**.
+- `/api/v1/*` payloads are validated against their declared response models at
+  runtime before ETag calculation or serialization. Unknown typed filters now
+  return 422, and free-form query and feedback inputs have explicit bounds.
+
+### Fixed
+
+- Suricata checkpoint writes are atomic. Corrupt, invalid, or unwritable
+  checkpoints terminate ingest instead of silently rewinding or continuing
+  with an undurable cursor.
+- Suricata rotation recovery drains the checkpointed inode through a stable
+  EOF, handles late appends and repeated rotation, bounds archive discovery,
+  rejects partial scans and compressed successors, and fails closed whenever
+  continuity cannot be proven.
+- Reviewed-row retention authorization compares the exact feedback state in
+  the verified backup through a bounded, cleanup-safe query.
+- Gold-set evidence recomputes derived fingerprints and metrics, and the
+  dataset revision now binds canonicalized alert content without emitting
+  per-alert digests.
+- Wazuh archive-day regressions now run portably across UTC-negative,
+  UTC-positive, named-zone, and daylight-saving cases while retaining Linux
+  coverage of the process-timezone path.
 
 ### Migration notes
 
@@ -42,3 +69,8 @@ All notable changes to Triagewall are documented in this file.
 4. Set a stable `TRIAGEWALL_DASHBOARD_WRITE_SECRET` in production so dashboard
    write cookies survive process restarts.
 5. Clients using `real_` should switch to `real` before 2026-12-31.
+6. Enabling `TRIAGEWALL_API_REDACT_IPS=true` now requires a persistent
+   `TRIAGEWALL_API_IP_HASH_SECRET` of at least 32 characters. It must differ
+   from the dashboard write secret.
+7. Set `TRIAGEWALL_DASHBOARD_COOKIE_SECURE=true` when the dashboard is served
+   over HTTPS.

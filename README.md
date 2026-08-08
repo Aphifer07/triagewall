@@ -38,14 +38,17 @@ The v0.3 implementation now provides one source-aware triage pipeline for
 Suricata network alerts and actionable Wazuh alerts. The multi-source
 foundation, Wazuh adapter, least-privilege optional Compose integration, exact-IP
 asset context, scoped prefilter policy, durable checkpoints, migration
-hardening, bounded queries, runtime dependency locks, regression CI, and
-CodeQL coverage are implemented.
+hardening, fail-closed Suricata rotation recovery, bounded retention, a
+versioned authenticated API, deterministic gold-set change validation, runtime
+dependency locks, regression CI, and CodeQL coverage are implemented.
 
 The release is in closeout rather than tagged as complete. The current
 multi-sensor build has been exercised against live Suricata and Wazuh streams;
 bounded backup-first retention and a single-owner startup migration phase are
-implemented. Remaining work is concentrated on multi-source security and
-accuracy gates plus fresh-install, upgrade, rollback, Core-only, and
+implemented. The gold-set gate is present, but its real-model baseline remains
+uncalibrated until an operator evaluation is reviewed and thresholds are
+approved. Remaining work is concentrated on that calibration, multi-source
+Garak coverage, and fresh-install, upgrade, rollback, Core-only, and
 Core-plus-Wazuh release evidence. The existing Core installation remains the
 supported operational product throughout this work.
 

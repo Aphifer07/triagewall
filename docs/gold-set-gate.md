@@ -115,6 +115,27 @@ pipeline and model-only metrics, then set thresholds and flip `status` to
 `approved` in a separate reviewed change. Thresholds are a human decision and
 this tool never sets them.
 
+### First v0.3 calibration candidate
+
+A complete operator run was recorded on 2026-08-08 for commit `89e24fb`:
+
+| Scope | Rows | Accuracy | Cohen's kappa | True-positive recall |
+| --- | ---: | ---: | ---: | ---: |
+| End-to-end pipeline | 266 | 0.9962 | 0.9317 | 1.0000 |
+| Model only | 66 | 0.9848 | 0.9263 | 1.0000 |
+
+The run completed all 266 rows, resolved 200 through the production prefilter,
+and produced zero invalid outputs, transport errors, or unexpected errors. One
+human-labeled false positive was classified conservatively as `uncertain`; all
+six human-labeled real alerts were classified `real`.
+
+This result is a **calibration candidate, not an approved baseline**. The set is
+highly imbalanced (259 false positives, six real alerts, and one uncertain
+alert), and every labeled row is currently Suricata. Wazuh behavior is covered
+structurally but does not yet have a measured performance claim. A separate
+reviewed change must decide regression tolerances and approve the exact
+evidence before `verify --require-calibrated` can pass.
+
 ## Two metric scopes
 
 Every run reports metrics twice:

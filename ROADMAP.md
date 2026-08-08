@@ -96,9 +96,13 @@ complete.
   level-based admission, source-aware isolation, durable checkpoints, and
   compressed-rotation recovery
 - [x] **Source-aware dashboard and API** for Suricata and Wazuh verdicts
+- [x] **Versioned authenticated API** with scoped keys, bounded pagination,
+  runtime-validated response contracts, caching, metrics, and optional keyed IP
+  pseudonymization
 - [x] **Reliability closeout** for incomplete records, retryable model/database
-  failures, UTC timestamps, bounded dashboard queries, startup indexes,
-  explicit WAL policy, and locked dashboard dependencies
+  failures, UTC timestamps, atomic checkpoints, fail-closed Suricata rotation,
+  bounded dashboard queries, startup indexes, explicit WAL policy, and locked
+  dashboard dependencies
 
 #### Closeout
 
@@ -110,8 +114,14 @@ complete.
   large databases.
 - [ ] **Release evidence.** Record supported fresh-install, upgrade, rollback,
   Core-only, and Core-plus-Wazuh checks before tagging v0.3.
-- [ ] **Gold-set change validation.** Block and report prompt, policy, model, or
-  configuration changes that regress labeled detection performance.
+- [x] **Gold-set change-validation implementation.** Fingerprint production
+  behavior deterministically, evaluate the real pipeline against human labels,
+  validate evidence integrity, and compare both pipeline and model-only metrics.
+- [ ] **Gold-set calibration.** Review a complete operator evaluation, approve
+  thresholds in a separate change, and require the calibrated baseline for
+  release evidence. The first complete v0.3 candidate has been recorded; until
+  it is reviewed and approved, deterministic checks run but no performance
+  threshold is enforced.
 - [ ] Extend Garak coverage across the multi-source pipeline.
 
 #### Operational usability and provenance
