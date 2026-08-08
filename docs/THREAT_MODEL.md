@@ -152,7 +152,19 @@ inode.
 - Rotated-archive discovery is bounded: a single non-recursive scan of the
   `eve.json` directory, restricted to regular files whose names begin with the
   live file's name, rejecting symlinks, directories, devices, sockets and
-  FIFOs, and capped at a fixed number of directory entries.
+  FIFOs. Two separate caps apply — one on `eve.json*` siblings and a much
+  larger one on total directory entries — so unrelated logs sharing the mount
+  cannot consume the archive budget. Exceeding either cap, or failing to read
+  the directory at all, fails closed. A partial chain is never returned: it is
+  indistinguishable from a complete one, and acting on it would silently skip
+  any archive that fell outside the scan.
+- Compressed archives (`.gz`, `.bz2`, `.xz`, `.zst`) are recognised as chain
+  members — they are evidence that a rotation happened and they hold their slot
+  in the ordering — but Triagewall reads `eve.json` as plain JSON-Lines and
+  never decompresses them. A compressed file can therefore never become a read
+  source or a persisted checkpoint. If the next unread archive is compressed,
+  ingest fails closed with the checkpoint left on the preceding file and asks
+  the operator to decompress or restore it. It is never skipped.
 - Rotation ordering follows the documented schemes — `logrotate` numbering
   (a higher index is older) and Suricata's dated archives — so a second
   rotation that happens while ingest is still catching up drains the displaced
@@ -163,6 +175,11 @@ inode.
   after a drain (for example, the archive was compressed and unlinked and no
   recorded successor remains), ingest fails closed and asks an operator to
   resolve the chain rather than guessing which archive comes next.
+- A corrupt or unwritable checkpoint and a rotation that cannot be advanced
+  safely are one error family (`IngestCheckpointError` subclasses
+  `EveCheckpointError`), so both terminate the daemon non-zero through a single
+  handler rather than one of them falling into the generic retry path and
+  continuing on an in-memory cursor.
 
 ### API contract
 

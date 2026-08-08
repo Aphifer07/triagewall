@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression coverage for retryable ingest checkpoint failures."""
 
+import gzip
 import json
 import os
 import sqlite3
@@ -366,16 +367,81 @@ class EveRotationChainTests(unittest.TestCase):
             names = [name for name, _p, _s in ingest._scan_eve_chain(eve_path)]
             self.assertEqual(names, expected)
 
-    def test_chain_scan_is_bounded(self):
+    def test_unrelated_files_do_not_consume_the_archive_budget(self):
+        """HOST_EVE_DIR is usually the whole Suricata log directory.
+
+        Counting every directory entry against the archive cap let unrelated
+        logs truncate the scan, which hid intermediate archives and skipped
+        their alerts. Only eve.json* siblings may consume that budget.
+        """
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             eve_path = temp_path / "eve.json"
             eve_path.write_text("x\n")
-            for index in range(20):
-                (temp_path / f"unrelated-{index}").write_text("x\n")
+            for name in ("eve.json.1", "eve.json.2"):
+                (temp_path / name).write_text("x\n")
+            # Far more unrelated files than the archive cap allows.
+            for index in range(2_000):
+                (temp_path / f"unrelated-{index}.log").write_text("x\n")
+
             with patch.object(ingest, "MAX_ROTATION_SCAN_ENTRIES", 5):
-                chain = ingest._scan_eve_chain(eve_path)
-            self.assertLessEqual(len(chain), 5)
+                names = [
+                    name for name, _p, _s in ingest._scan_eve_chain(eve_path)
+                ]
+
+            # The complete chain, not a truncated prefix of it.
+            self.assertEqual(names, ["eve.json.2", "eve.json.1", "eve.json"])
+
+    def test_exceeding_either_hard_cap_fails_closed(self):
+        """An incomplete scan must never be returned as an ordering.
+
+        A partial chain is indistinguishable from a complete one, so callers
+        would treat the live file as the successor and permanently skip any
+        archive that fell outside the scan.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            eve_path = temp_path / "eve.json"
+            eve_path.write_text("x\n")
+            for index in range(1, 9):
+                (temp_path / f"eve.json.{index}").write_text("x\n")
+
+            # Too many eve.json* siblings for the archive cap.
+            with patch.object(ingest, "MAX_ROTATION_SCAN_ENTRIES", 3):
+                with self.assertRaises(ingest.IngestCheckpointError) as ctx:
+                    ingest._scan_eve_chain(eve_path)
+            self.assertIn("rotated eve.json archives", str(ctx.exception))
+
+            # Too many directory entries overall for the directory cap.
+            with patch.object(ingest, "MAX_ROTATION_DIR_ENTRIES", 2):
+                with self.assertRaises(ingest.IngestCheckpointError) as ctx:
+                    ingest._scan_eve_chain(eve_path)
+            self.assertIn("entries", str(ctx.exception))
+
+    def test_unreadable_log_directory_fails_closed(self):
+        """A failed scandir is not evidence that no archive is pending."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            eve_path = Path(temp_dir) / "eve.json"
+            eve_path.write_text("x\n")
+            with patch.object(
+                ingest.os, "scandir", side_effect=OSError("permission denied")
+            ):
+                with self.assertRaises(ingest.IngestCheckpointError) as ctx:
+                    ingest._scan_eve_chain(eve_path)
+        self.assertIn("could not scan", str(ctx.exception))
+
+    def test_compressed_archives_are_recognised(self):
+        for name in (
+            "eve.json.1.gz",
+            "eve.json.2.bz2",
+            "eve.json.3.xz",
+            "eve.json.4.zst",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(ingest._is_compressed_archive(name))
+        for name in ("eve.json", "eve.json.1", "eve.json-20260806-000000"):
+            with self.subTest(name=name):
+                self.assertFalse(ingest._is_compressed_archive(name))
 
 
 class EveStableEofTests(unittest.TestCase):
@@ -729,6 +795,203 @@ class EveRotationCheckpointTests(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         with self.assertRaises(sqlite3.ProgrammingError):
             opened[0].execute("SELECT 1")
+
+    # --- compressed rotation successors -------------------------------------
+    def test_compressed_successor_fails_closed_before_the_checkpoint_moves(self):
+        """A compressed successor must never become the durable checkpoint.
+
+        Trigger: drain an uncompressed archive whose successor in the chain is
+        ``eve.json.1.gz``. Persisting that inode made every later poll open
+        gzip bytes as UTF-8 text; the resulting UnicodeDecodeError is not a
+        checkpoint error, so the generic retry path spun forever with the
+        checkpoint already durably moved -- and a restart reproduced it. The
+        alerts in the compressed archive, and every later record, were never
+        triaged.
+        """
+        drained = _alert(21, "unread-in-old-archive", 0)
+        old_archive = self.temp_path / "eve.json.2"
+        old_archive.write_text(drained)
+        old_inode = old_archive.stat().st_ino
+
+        # A real gzip member, so a reader really would fail to decode it.
+        compressed = self.temp_path / "eve.json.1.gz"
+        compressed.write_bytes(
+            gzip.compress(_alert(22, "unread-in-compressed", 1).encode("utf-8"))
+        )
+        self.eve_path.write_text(_alert(23, "live", 2))
+
+        self.write_position(0, old_inode)
+
+        calls = []
+
+        def capture(event, asset_context=None):
+            calls.append(event["alert"]["signature_id"])
+            return {"verdict": "real", "confidence": 0.8, "reasoning": "t"}
+
+        with self.assertRaises(ingest.IngestCheckpointError) as ctx:
+            self.run_tail(
+                call_ollama={"side_effect": capture},
+                sleep={"return_value": None},
+            )
+
+        # The readable archive was fully drained and triaged...
+        self.assertEqual(calls, [21])
+        # ...and the operator is told what to do, naming the archive.
+        self.assertIn("compressed", str(ctx.exception))
+        self.assertIn("eve.json.1.gz", str(ctx.exception))
+        # The checkpoint never moved onto the compressed inode, and never
+        # jumped over it to the live file.
+        saved = self.saved_position()
+        self.assertEqual(saved["inode"], old_inode)
+        self.assertNotEqual(saved["inode"], compressed.stat().st_ino)
+        self.assertNotEqual(saved["inode"], self.eve_path.stat().st_ino)
+
+    def test_checkpoint_on_a_compressed_archive_fails_closed(self):
+        """The checkpointed archive was compressed in place, keeping its inode."""
+        compressed = self.temp_path / "eve.json.1.gz"
+        compressed.write_bytes(gzip.compress(b'{"event_type":"alert"}\n'))
+        self.eve_path.write_text(_alert(24, "live", 0))
+        self.write_position(0, compressed.stat().st_ino)
+
+        with self.assertRaises(ingest.IngestCheckpointError) as ctx:
+            self.run_tail(sleep={"return_value": None})
+
+        self.assertIn("compressed", str(ctx.exception))
+        self.assertEqual(
+            self.saved_position()["inode"], compressed.stat().st_ino
+        )
+
+    # --- incomplete rotation scans ------------------------------------------
+    def test_truncated_scan_cannot_skip_an_intermediate_archive(self):
+        """A scan that hit its cap must not advance the checkpoint.
+
+        Fixture: the checkpointed archive and the live file are both visible,
+        but the intermediate archive falls outside the scan bound. The old
+        behaviour returned that partial chain, so successor selection saw live
+        as the next member and the intermediate archive was skipped forever.
+        """
+        old_archive = self.temp_path / "eve.json.2"
+        old_archive.write_text(_alert(31, "unread-in-old-archive", 0))
+        old_inode = old_archive.stat().st_ino
+        intermediate = self.temp_path / "eve.json.1"
+        intermediate.write_text(_alert(32, "must-not-be-skipped", 1))
+        self.eve_path.write_text(_alert(33, "live", 2))
+
+        self.write_position(0, old_inode)
+
+        calls = []
+
+        def capture(event, asset_context=None):
+            calls.append(event["alert"]["signature_id"])
+            return {"verdict": "real", "confidence": 0.8, "reasoning": "t"}
+
+        # Three eve.json* siblings exist; the cap admits fewer.
+        with patch.object(ingest, "MAX_ROTATION_SCAN_ENTRIES", 2):
+            with self.assertRaises(ingest.IngestCheckpointError) as ctx:
+                self.run_tail(
+                    call_ollama={"side_effect": capture},
+                    sleep={"return_value": None},
+                )
+
+        self.assertIn("rotated eve.json archives", str(ctx.exception))
+        # The checkpoint stayed put: no jump to live, nothing skipped.
+        saved = self.saved_position()
+        self.assertEqual(saved["inode"], old_inode)
+        self.assertNotEqual(saved["inode"], self.eve_path.stat().st_ino)
+        self.assertNotIn(33, calls)
+
+    # --- #59 checkpoint durability must survive this branch -----------------
+    def test_rotation_handoff_keeps_checkpoint_writes_atomic(self):
+        """#59's atomic save_position must still hold across a rotation.
+
+        Regression guard for the merge: the rotation work restructured the
+        same tail_file() loop that #59 made durable.
+        """
+        unread = _alert(41, "unread-before-rotation", 0)
+        after = _alert(42, "after-rotation", 1)
+        self.eve_path.write_text(unread)
+        old_inode = self.eve_path.stat().st_ino
+        self.write_position(0, old_inode)
+        self.eve_path.rename(self.temp_path / "eve.json.1")
+        self.eve_path.write_text(after)
+
+        calls = []
+
+        def capture(event, asset_context=None):
+            calls.append(event["alert"]["signature_id"])
+            if len(calls) >= 2:
+                ingest._stop = True
+            return {"verdict": "real", "confidence": 0.8, "reasoning": "t"}
+
+        self.run_tail(
+            call_ollama={"side_effect": capture},
+            sleep={"return_value": None},
+        )
+
+        self.assertEqual(calls, [41, 42])
+        # Written via temp file + os.replace, leaving no debris behind.
+        self.assertEqual(list(self.temp_path.glob("*.tmp")), [])
+        self.assertEqual(list(self.temp_path.glob(".*.tmp")), [])
+        # And the result is a schema-valid cursor, not a torn file.
+        with patch.object(ingest, "POSITION_PATH", self.position_path):
+            self.assertEqual(
+                set(ingest.load_position()), {"offset", "inode", "size"}
+            )
+
+    def test_checkpoint_write_failure_stops_ingest(self):
+        """#59: an undurable in-memory cursor must not keep running.
+
+        EveCheckpointError is not IngestCheckpointError, so this also proves
+        the single `except EveCheckpointError` guard covers both families
+        rather than dropping write failures into the generic retry path.
+        """
+        self.eve_path.write_text(_alert(51, "alert", 0))
+        self.write_position(0, self.eve_path.stat().st_ino)
+
+        def refuse(state):
+            raise ingest.EveCheckpointError("could not write Suricata checkpoint")
+
+        with self.assertRaises(ingest.EveCheckpointError):
+            self.run_tail(
+                call_ollama={
+                    "return_value": {
+                        "verdict": "real",
+                        "confidence": 0.8,
+                        "reasoning": "t",
+                    }
+                },
+                save_position={"side_effect": refuse},
+                sleep={"return_value": None},
+            )
+
+    def test_corrupt_checkpoint_still_fails_closed_in_the_daemon(self):
+        """#59: a torn position.json must not silently rewind to offset 0."""
+        self.eve_path.write_text(_alert(61, "alert", 0))
+        self.position_path.write_text('{"offset": 12, "inode":')
+
+        with self.assertRaises(ingest.EveCheckpointError):
+            self.run_tail(sleep={"return_value": None})
+
+    def test_both_checkpoint_error_families_exit_through_one_handler(self):
+        """main() must terminate both fail-closed families identically.
+
+        IngestCheckpointError subclasses EveCheckpointError precisely so a
+        single handler covers a corrupt or unwritable checkpoint *and* a
+        rotation that cannot be advanced safely. Listing only the subclass
+        would let write failures escape as an unhandled crash.
+        """
+        self.assertTrue(
+            issubclass(ingest.IngestCheckpointError, ingest.EveCheckpointError)
+        )
+        for error in (
+            ingest.EveCheckpointError("corrupt checkpoint"),
+            ingest.IngestCheckpointError("rotation cannot be advanced"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(ingest, "DEMO_MODE", False), patch.object(
+                    ingest, "tail_file", side_effect=error
+                ):
+                    self.assertEqual(ingest.main(), 1)
 
 
 class SuricataCheckpointDurabilityTests(unittest.TestCase):
