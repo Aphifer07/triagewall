@@ -112,8 +112,12 @@ complete.
 - [x] **Serialized migration phase.** Ensure one startup owner performs schema
   work before Suricata and optional Wazuh ingest begin, avoiding lock races on
   large databases.
-- [ ] **Release evidence.** Record supported fresh-install, upgrade, rollback,
-  Core-only, and Core-plus-Wazuh checks before tagging v0.3.
+- [x] **Release evidence.** Record supported fresh-install, upgrade, rollback,
+  Core-only, and Core-plus-Wazuh checks before tagging v0.3. All five are
+  recorded in [docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md),
+  collected on the maintainer host against commit `9b95bf00`, together with a
+  passing calibrated gold-set gate verified against the real private asset
+  inventory.
 - [x] **Gold-set change-validation implementation.** Fingerprint production
   behavior deterministically, evaluate the real pipeline against human labels,
   validate evidence integrity, and compare both pipeline and model-only metrics.
@@ -121,7 +125,30 @@ complete.
   evaluation as the v0.3 baseline, with fail-closed inventory identity checks,
   zero invalid output, and `0.05` maximum decreases for Cohen's kappa and
   true-positive recall in both metric scopes.
-- [ ] Extend Garak coverage across the multi-source pipeline.
+#### Post-v0.3 — does not block tagging v0.3
+
+- [ ] **Extend Garak coverage across the multi-source pipeline.** Not
+  implemented: the repository contains no Garak runner, configuration, or probe
+  set, so there is no Garak result to report. Tracked separately from the
+  deterministic gold-set gate, which is a behaviour and performance gate and
+  makes no adversarial claim. Delivering this requires:
+  - a pinned Garak runner and configuration with recorded versions;
+  - a harness driving the **full isolated pipeline**, not the bare model;
+  - probe coverage of **both** projection surfaces, Suricata and Wazuh, which
+    build different prompts from different fields;
+  - deterministic gate criteria — which probes block, what attack-success
+    threshold fails the build, and how flaky probes are handled;
+  - defined failure handling: fail-closed behaviour, reporting, and regression
+    triage;
+  - CI and release integration, including how a model-dependent suite runs when
+    required CI has no GPU or Ollama.
+
+  Related: the **Garak injection gate** under v0.2.1 remains the prerequisite
+  full-pipeline gate.
+
+- [ ] Extend the existing canary and prompt-boundary regressions to the Wazuh
+  projection path. Deterministic regression coverage, **not** Garak; currently
+  Suricata-only.
 
 #### Operational usability and provenance
 
