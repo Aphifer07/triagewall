@@ -70,9 +70,9 @@ Prompt-injection and operational hardening.
 
 Hardening work retained from the original roadmap.
 
-- [ ] **Garak injection gate.** Exercise the full isolated Triagewall pipeline
-  periodically and before releases. A regression is blocked and reported for
-  human review.
+- Moved: **Garak injection gate** — see
+  [Adversarial probing (post-v0.3)](#adversarial-probing-post-v03). It is **not**
+  a prerequisite for v0.3, which makes no Garak or adversarial-probe claim.
 - [ ] Improve the URL-injection verdict from a conservative `uncertain` result
   to an explicit `real` verdict with the injection attempt identified.
 - [ ] Refresh the architecture diagram for Foundation-Sec, scoped prefiltering,
@@ -81,8 +81,13 @@ Hardening work retained from the original roadmap.
 ### v0.3 — July–August 2026
 
 Multi-sensor Core is implemented and deployed in the maintainer environment.
-The release remains in closeout until its operational and release gates are
-complete.
+The operational and release gates below are complete: the gold-set baseline is
+calibrated and the calibrated gate passes, and all five required release-evidence
+scenarios are recorded in
+[docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md). v0.3 is **not yet
+tagged** — what remains is review, merge, and release mechanics. Adversarial
+probing is explicitly out of v0.3 scope; see
+[Adversarial probing (post-v0.3)](#adversarial-probing-post-v03).
 
 #### Implemented
 
@@ -112,8 +117,15 @@ complete.
 - [x] **Serialized migration phase.** Ensure one startup owner performs schema
   work before Suricata and optional Wazuh ingest begin, avoiding lock races on
   large databases.
-- [ ] **Release evidence.** Record supported fresh-install, upgrade, rollback,
-  Core-only, and Core-plus-Wazuh checks before tagging v0.3.
+- [x] **Release evidence.** Record supported fresh-install, upgrade, rollback,
+  Core-only, and Core-plus-Wazuh checks before tagging v0.3. All five are
+  recorded in [docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md),
+  collected on the maintainer host against commit `9b95bf00`, together with a
+  passing calibrated gold-set gate verified against the real private asset
+  inventory. Upgrade and rollback are evidenced across the real release
+  boundary — released `v0.2` (`2ec506c9`) → v0.3 candidate and back — using a
+  v0.2-origin database, not a transition between runtime-equivalent v0.3
+  development commits.
 - [x] **Gold-set change-validation implementation.** Fingerprint production
   behavior deterministically, evaluate the real pipeline against human labels,
   validate evidence integrity, and compare both pipeline and model-only metrics.
@@ -121,7 +133,63 @@ complete.
   evaluation as the v0.3 baseline, with fail-closed inventory identity checks,
   zero invalid output, and `0.05` maximum decreases for Cohen's kappa and
   true-positive recall in both metric scopes.
-- [ ] Extend Garak coverage across the multi-source pipeline.
+
+#### Adversarial probing (post-v0.3)
+
+**Maintainer scope decision.** Garak does not block v0.3. Both the initial
+full-pipeline Garak gate and its multi-source extension are post-v0.3 work, and
+**v0.3 makes no Garak or adversarial-probe claim** — the release-evidence
+document records that scenario as `NOT IMPLEMENTED / NOT RUN`. This is a
+deliberate scope decision, not a waiver of a check that was attempted.
+
+Nothing here is implemented today: the repository contains no Garak runner,
+configuration, or probe set, so there is no Garak result to report. This work is
+tracked separately from the deterministic gold-set gate, which is a behaviour
+and performance gate over human labels and makes no adversarial claim. The two
+fail for different reasons and need different review.
+
+- [ ] **Garak injection gate (full isolated pipeline).** Exercise the complete
+  isolated Triagewall pipeline rather than the bare model. A regression is
+  blocked and reported for human review. Once implemented it should run
+  periodically **and before applicable future releases** — especially any
+  release that changes the model, the prompts, field isolation, or the source
+  projections.
+- [ ] **Extend Garak coverage across the multi-source pipeline.**
+
+  Delivering the two items above requires:
+  - a pinned Garak runner and configuration with recorded versions;
+  - a harness driving the **full isolated pipeline**, not the bare model;
+  - probe coverage of **both** projection surfaces, Suricata and Wazuh, which
+    build different prompts from different fields;
+  - deterministic gate criteria — which probes block, what attack-success
+    threshold fails the build, and how flaky probes are handled;
+  - defined failure handling: fail-closed behaviour, reporting, and regression
+    triage;
+  - CI and release integration, including how a model-dependent suite runs when
+    required CI has no GPU or Ollama.
+
+- [ ] Extend the existing canary and prompt-boundary regressions to the Wazuh
+  projection path. Deterministic regression coverage, **not** Garak; currently
+  Suricata-only.
+
+- [ ] **Tested checkpoint-reconciliation tool and restore runbook.** Suricata
+  source/checkpoint disaster recovery is currently **unvalidated**. Restoring a
+  backup copies `eve.json`, which allocates a new inode, so a restored
+  `position.json` names an identity that no longer exists; copying both files
+  together does **not** resolve this. v0.3 fails closed by design. The prior
+  release only appears to cope because it restarts the file from byte zero,
+  replaying every record — that is not a recovery mechanism and must not be
+  documented as one. Deliver:
+  - a supported reconciliation step an operator runs **before** starting ingest
+    after a restore, with the resulting alert gap explicitly recorded;
+  - **bounded replay** or recorded-gap handling, so recovery never means
+    re-triaging an entire `eve.json` and never relies on duplicate detection as
+    a replay guarantee (flow-less alerts are not covered by it);
+  - tests covering restore-then-resume for both sources.
+
+  Direct same-host version switching, where file identity is intact, already
+  works and is evidenced in
+  [docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md).
 
 #### Operational usability and provenance
 

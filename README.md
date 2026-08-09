@@ -32,7 +32,7 @@ Commercial XDR products solve this with cloud-based ML and a $500/month bill. Th
 - **Records your feedback** — every verdict has Agree / Mark Different buttons in the dashboard, building a labeled dataset and a measurable agreement rate
 - **Surfaces what matters** in a clean web dashboard with hourly traffic trends
 
-### Current status: v0.3 closeout
+### Current status: v0.3 pending release
 
 The v0.3 implementation now provides one source-aware triage pipeline for
 Suricata network alerts and actionable Wazuh alerts. The multi-source
@@ -42,15 +42,24 @@ hardening, fail-closed Suricata rotation recovery, bounded retention, a
 versioned authenticated API, deterministic gold-set change validation, runtime
 dependency locks, regression CI, and CodeQL coverage are implemented.
 
-The release is in closeout rather than tagged as complete. The current
-multi-sensor build has been exercised against live Suricata and Wazuh streams;
-bounded backup-first retention and a single-owner startup migration phase are
-implemented. The v0.3 real-model gold-set baseline is approved from a complete
-266-alert operator evaluation, with regression thresholds enforced for both
-end-to-end and model-only metrics. Remaining work is concentrated on
-multi-source Garak coverage and fresh-install, upgrade, rollback, Core-only,
-and Core-plus-Wazuh release evidence. The existing Core installation remains
-the supported operational product throughout this work.
+v0.3 is not yet tagged. The current multi-sensor build has been exercised
+against live Suricata and Wazuh streams; bounded backup-first retention and a
+single-owner startup migration phase are implemented. The v0.3 real-model
+gold-set baseline is approved from a complete 266-alert operator evaluation,
+with regression thresholds enforced for both end-to-end and model-only metrics,
+and the calibrated gate passes against the maintainer host's real asset
+inventory.
+
+All five required release-evidence scenarios — fresh install, upgrade,
+rollback, Core-only, and Core-plus-Wazuh — are recorded in
+[docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md), with upgrade and
+rollback exercised across the real release boundary from the released `v0.2` tag
+and back. Garak
+adversarial probing remains **unimplemented** and is explicitly post-v0.3 work;
+v0.3 makes no Garak or adversarial-probe claim. What remains before tagging is
+ordinary review, merge, and release mechanics rather than additional runtime
+scope. The existing Core installation remains the supported operational product
+throughout.
 
 ### Foundation from v0.2
 
@@ -448,11 +457,12 @@ currently shipped component.
 
 See [ROADMAP.md](ROADMAP.md) for the full plan. Highlights:
 
-**Core v0.3 closeout:** prepare the production release that unifies Suricata
-and actionable Wazuh alerts with source provenance, trusted asset context,
-hostile-field isolation, durable recovery, and source-aware dashboard output.
-Closeout now focuses on multi-source Garak coverage, gold-set validation, and
-release evidence rather than new sensor scope.
+**Core v0.3:** the production release unifying Suricata and actionable Wazuh
+alerts with source provenance, trusted asset context, hostile-field isolation,
+durable recovery, and source-aware dashboard output. Gold-set validation is
+calibrated and passing, and all five required release-evidence scenarios are
+recorded; v0.3 is pending review, merge, and tagging rather than further runtime
+scope. Garak adversarial probing is unimplemented and explicitly post-v0.3.
 
 **Core operational usability:** add a bounded alert-detail view, source and
 time filtering, IP and asset filtering, saved views, and structured JSON
