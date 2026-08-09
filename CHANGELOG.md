@@ -4,6 +4,8 @@ All notable changes to Triagewall are documented in this file.
 
 ## Unreleased
 
+## [v0.3](https://github.com/aaronphifer/triagewall/releases/tag/v0.3) - 2026-08-09
+
 ### Added
 
 - Versioned HTTP API under `/api/v1` with Pydantic response models, OpenAPI
