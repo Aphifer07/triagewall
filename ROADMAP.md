@@ -172,6 +172,16 @@ fail for different reasons and need different review.
   projection path. Deterministic regression coverage, **not** Garak; currently
   Suricata-only.
 
+- [ ] **Restore recovery runbook and checkpoint reconciliation.** Restoring a
+  backup gives `eve.json` a new inode, so a restored `position.json` names an
+  identity that no longer exists and v0.3 ingest fails closed by design. Copying
+  both files together does not resolve this. Document — and preferably tool — the
+  supported recovery: explicit operator reconciliation of the checkpoint against
+  the restored file with any gap recorded, or starting the prior release first so
+  it adopts the restored inode. Direct same-host version switching, where file
+  identity is intact, already works and is evidenced in
+  [docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md).
+
 #### Operational usability and provenance
 
 - [ ] **Bounded alert detail.** Show the complete stored evidence projection,

@@ -13,7 +13,8 @@ inventory contents, addresses, or host identifiers.
 **Environment:** single maintainer host, Docker Compose, Core + optional Wazuh
 profile. Live project runs Core+Wazuh; isolated checks run under a separate
 Compose project, port, and data directory.
-**Evidence collected:** 2026-08-08T20:20Z – 2026-08-09T01:57Z
+**Evidence collected:** 2026-08-08T20:20Z – 2026-08-09T16:20Z (the closing
+observation of the release-boundary lifecycle, which ran 03:14Z – 16:20Z)
 
 ## Summary
 
@@ -26,8 +27,11 @@ Compose project, port, and data directory.
 | 5 | Rollback | **PASS** — target is released `v0.2`; backup-restore is the authoritative path |
 | 6 | Multi-source Garak / adversarial coverage | **NOT IMPLEMENTED / NOT RUN** |
 
-Scenarios 2, 4 and 5 share one isolated Compose project but are assessed
-independently; a pass in one does not imply a pass in another.
+Scenarios 2 and 4 share one isolated Compose project. Scenario 1 and Scenario 5
+were later re-run together as a single release-boundary lifecycle in a **separate**
+isolated project (`tw-v02-upgrade-evidence`) with per-phase data and EVE
+directories. Every scenario is assessed independently; a pass in one does not
+imply a pass in another.
 
 ## Gold-set gate (calibrated)
 
@@ -283,10 +287,20 @@ alert was ingested.
 
 ## Scenario 5 — Rollback (PASS)
 
-Performed entirely against a **copy** of a verified backup in an isolated
-project. The live database was never downgraded, restored over, or written to.
+Nothing here touched production: the live database was never downgraded,
+restored over, or written to.
 
-### Backup artifact
+**Two distinct pieces of evidence, deliberately not conflated:**
+
+| Artifact | What it proves | What it does *not* prove |
+| --- | --- | --- |
+| The **18.5 GB verified production backup** | that the documented backup mechanism works at production scale, and that the resulting artifact is complete and verifiable (`integrity_check: "ok"`, recomputed hash equals the manifest hash) | anything about crossing a release boundary — the versions either side of it are runtime-equivalent |
+| The **small v0.2-origin lifecycle snapshot** | that rollback works across the real version boundary: released `v0.2` runs against v0.3-migrated data, and the pre-upgrade v0.2 set restores and starts | anything about production-scale restore timing or volume |
+
+The production-scale artifact is described first; the version-boundary rollback
+that follows it used the v0.2-origin snapshot, **not** the 18.5 GB backup.
+
+### Backup artifact (production-scale mechanism and integrity)
 
 | Field | Value |
 | --- | --- |
@@ -364,11 +378,33 @@ remains in /var/log/suricata
 Reproduced twice (once on a restored upgrade copy, once on a restored return
 copy): `migrate` exits 0, dashboard and `wazuh-ingest` run, but Suricata
 `ingest` exits 1 and `restart: unless-stopped` restart-loops. **This is correct
-by design** — v0.3 refuses to skip possibly-unread alerts — but it is
-operationally significant: **restoring a database/checkpoint backup next to a
-copied `eve.json` requires an operator decision before v0.3 Suricata ingest will
-resume.** v0.2 is lenient where v0.3 fails closed. When file identity is
-preserved (same-host code switch), v0.3 resumes with 0 restarts and no rewind.
+by design** — v0.3 refuses to skip possibly-unread alerts.
+
+What this does and does not mean:
+
+- **Direct, same-host version switching works.** When `eve.json` keeps its
+  identity — rolling the code back and forward on the same host, touching only
+  the checkout — v0.3 resumes with **0 restarts and no rewind**. That is the path
+  the v0.3 → v0.2 → v0.3 rollback above actually exercised, and it is unaffected
+  by this finding.
+- **Restoring copied files makes v0.3 fail closed.** `position.json` records an
+  inode, and copying `eve.json` necessarily allocates a new one. **Restoring both
+  files together does not make them checkpoint-compatible** — the pair is still
+  inconsistent by construction, because the identity the checkpoint names no
+  longer exists anywhere.
+- **Recovery therefore needs one of two deliberate acts:** an explicit operator
+  reconciliation of the checkpoint against the restored file (accepting and
+  recording any resulting gap), or **starting released `v0.2` first**, which
+  adopts the restored file's inode while preserving the offset, after which v0.3
+  can be started against a checkpoint that names a file that exists. The v0.2
+  adoption behaviour is the one observed in section B above; note that v0.2's
+  protection against re-reading came from `is_duplicate`, not from the
+  checkpoint.
+
+This is an **operational restore limitation**, not a defect in the rollback that
+was tested, and not something a restore procedure can fix merely by copying both
+files. It should be tracked as work for a proper recovery runbook or a
+checkpoint-reconciliation tool.
 
 #### C. Return to v0.3 after rollback
 
@@ -537,9 +573,14 @@ Outstanding non-blocking observations:
   checkpoint resumed without rewind, but the maintenance-window guidance needs
   to account for verification cost explicitly (see Scenario 5).
 - **Restoring a backup changes `eve.json`'s file identity, and v0.3 fails closed
-  on that.** Restore procedures should state explicitly that the Suricata
-  checkpoint and the `eve.json` it refers to must be restored as a matching pair,
-  or that an operator must record the gap before ingest will resume. v0.2 was
-  lenient here; v0.3 is not (see Scenario 5, cross-version finding).
+  on that.** Copying `position.json` and `eve.json` together does **not** make
+  them checkpoint-compatible: the checkpoint names an inode that no longer
+  exists. Recovery requires an explicit operator reconciliation, or starting
+  released `v0.2` first so it adopts the restored file's inode before v0.3 is
+  started. Direct same-host version switching, where file identity is intact, is
+  unaffected — that is the path the tested rollback used. This is an operational
+  restore limitation to be closed by a recovery runbook or a
+  checkpoint-reconciliation tool, **not** a defect in the rollback evidence
+  (see Scenario 5, cross-version finding).
 - Two of the four rows in the lifecycle database carry no source provenance
   (written by v0.2). v0.3 serves them correctly and does not backfill them.
