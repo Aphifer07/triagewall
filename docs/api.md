@@ -106,7 +106,11 @@ curl -sS -H 'Host: localhost' http://127.0.0.1:8084/api/v1/health
 ### `GET /api/v1/stats`
 
 Summary counters for the rolling 24h window plus lifetime total. Includes
-canonical `real` and deprecated `real_`.
+canonical `real` and deprecated `real_`. The model-only queue fields
+`model_real_count`, `model_fp_count`, `model_uncertain_count`, and
+`unreviewed_model_count` exclude deterministic prefilter decisions so the
+operator queue can display source-of-truth totals rather than counts from only
+the currently loaded page.
 
 ```bash
 curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
@@ -121,11 +125,13 @@ Verdict rows only (no stats).
 |-------|------|-------|
 | `verdict` | enum | `real` \| `false_positive` \| `uncertain` |
 | `model` | enum | `llm` \| `prefilter` |
+| `source` | enum | `suricata` \| `wazuh` |
+| `review` | enum | `unreviewed` \| `agreed` \| `corrected` |
 | `signature` | string | ≤ 200 characters (substring match) |
 | `limit` | integer | 1–500, default 100 |
 | `cursor` | opaque string | ≤ 512 characters |
 
-Filter values are typed: an unrecognized `verdict` or `model` returns **422**
+Filter values are typed: an unrecognized `verdict`, `model`, `source`, or `review` returns **422**
 rather than silently behaving like no filter. Values over a documented bound
 also return 422.
 
@@ -135,6 +141,19 @@ as `cursor` for the next page. Cursor is opaque over `(processed_at, id)`.
 ```bash
 curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
   'http://127.0.0.1:8084/api/v1/verdicts?limit=50&model=llm'
+```
+
+### `GET /api/v1/verdicts/{event_id}`
+
+One complete decision for the routed alert-detail view. Response:
+`{generated_at, mode, verdict}`. Unlike the bounded list endpoint, the detail
+row includes the stored `raw_alert` sensor record when local-mode disclosure
+policy permits it. Demo mode and API IP-redaction mode continue to omit that
+field.
+
+```bash
+curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
+  http://127.0.0.1:8084/api/v1/verdicts/1
 ```
 
 ### `POST /api/v1/feedback/{event_id}`

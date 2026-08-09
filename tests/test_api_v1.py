@@ -163,11 +163,24 @@ class ApiV1Tests(unittest.TestCase):
         self.assertIn("verdicts", verdicts)
         self.assertIn("next_cursor", verdicts)
 
+    def test_verdict_detail_includes_original_sensor_record(self):
+        response = self.client.get("/api/v1/verdicts/1", headers=self.host)
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["mode"], "local")
+        self.assertEqual(payload["verdict"]["id"], 1)
+        self.assertEqual(payload["verdict"]["raw_alert"], "{}")
+
+    def test_verdict_detail_returns_404_for_unknown_event(self):
+        response = self.client.get("/api/v1/verdicts/99999", headers=self.host)
+        self.assertEqual(response.status_code, 404)
+
     def test_legacy_verdicts_still_combined(self):
         payload = self.client.get("/api/verdicts", headers=self.host).json()
         self.assertIn("stats", payload)
         self.assertIn("verdicts", payload)
         self.assertEqual(payload["stats"]["real"], payload["stats"]["real_"])
+        self.assertNotIn("model_real_count", payload["stats"])
 
     def test_feedback_requires_credential(self):
         response = self.client.post(
@@ -248,6 +261,52 @@ class ApiV1Tests(unittest.TestCase):
         self.assertEqual(payload["verdicts"], [])
         self.assertIsNone(payload["next_cursor"])
 
+    def test_verdicts_source_filter_includes_legacy_suricata_rows(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO sensor_event_context (
+                    triage_event_id, source_type, source_instance,
+                    source_event_id, agent_id, agent_name
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (3, "wazuh", "manager", "event-3", "003", "host-3"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        wazuh = self.client.get(
+            "/api/v1/verdicts?source=wazuh", headers=self.host
+        ).json()["verdicts"]
+        suricata = self.client.get(
+            "/api/v1/verdicts?source=suricata", headers=self.host
+        ).json()["verdicts"]
+        self.assertEqual([row["id"] for row in wazuh], [3])
+        self.assertEqual({row["id"] for row in suricata}, {1, 2})
+
+    def test_verdicts_review_state_filters(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE triage_events SET human_verdict = verdict, agreed = 1 WHERE id = 1"
+            )
+            conn.execute(
+                "UPDATE triage_events SET human_verdict = 'real', agreed = 0 WHERE id = 2"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        expected = {"agreed": [1], "corrected": [2], "unreviewed": [3]}
+        for review, event_ids in expected.items():
+            with self.subTest(review=review):
+                rows = self.client.get(
+                    f"/api/v1/verdicts?review={review}", headers=self.host
+                ).json()["verdicts"]
+                self.assertEqual([row["id"] for row in rows], event_ids)
+
     def test_timeline_parameters_and_validation(self):
         ok = self.client.get(
             "/api/v1/timeline?hours=24&interval=1h",
@@ -314,6 +373,7 @@ class ApiV1Tests(unittest.TestCase):
             headers=self.host,
         ).json()["verdicts"][0]
         self.assertTrue(verdict["src_ip"].startswith("ip_"))
+        self.assertIsNone(verdict["raw_alert"])
         anomaly = self.client.get(
             "/api/v1/spc-anomalies",
             headers=self.host,
@@ -484,6 +544,8 @@ class ApiV1Tests(unittest.TestCase):
             "verdict=REAL",
             "model=everything",
             "model=Prefilter",
+            "source=zeek",
+            "review=reviewed",
         ):
             with self.subTest(query=query):
                 response = self.client.get(
@@ -498,6 +560,11 @@ class ApiV1Tests(unittest.TestCase):
             "verdict=uncertain",
             "model=llm",
             "model=prefilter",
+            "source=suricata",
+            "source=wazuh",
+            "review=unreviewed",
+            "review=agreed",
+            "review=corrected",
         ):
             with self.subTest(query=query):
                 response = self.client.get(

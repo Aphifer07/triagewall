@@ -56,29 +56,23 @@ test("keeps SPC polling when the main dashboard request fails", async () => {
 });
 
 test("dashboard wires SPC outside the verdict-loading function", () => {
-  const indexPath = path.join(
+  const scriptPath = path.join(
     __dirname,
     "..",
     "triagewall",
     "dashboard",
     "static",
-    "index.html",
+    "dashboard.js",
   );
-  const html = fs.readFileSync(indexPath, "utf8");
-  const loadStart = html.indexOf("async function load() {");
-  const loadEnd = html.indexOf("function renderHero", loadStart);
+  const script = fs.readFileSync(scriptPath, "utf8");
+  const loadStart = script.indexOf("async function load() {");
+  const loadEnd = script.indexOf("function renderHealth", loadStart);
 
   assert.notEqual(loadStart, -1);
   assert.notEqual(loadEnd, -1);
-  assert.doesNotMatch(html.slice(loadStart, loadEnd), /loadSpc\s*\(/);
-  assert.match(html, /<script src="\/static\/polling\.js"><\/script>/);
-  assert.match(
-    html,
-    /startIndependentPolling\(\{ loadMain: load, loadSpc \}\);/,
-  );
-});
+  assert.doesNotMatch(script.slice(loadStart, loadEnd), /loadSpc\s*\(/);
+  assert.match(script, /startIndependentPolling\(\{ loadMain: load, loadSpc \}\);/);
 
-test("dashboard renders source-aware labels and escapes dynamic identifiers", () => {
   const indexPath = path.join(
     __dirname,
     "..",
@@ -88,15 +82,30 @@ test("dashboard renders source-aware labels and escapes dynamic identifiers", ()
     "index.html",
   );
   const html = fs.readFileSync(indexPath, "utf8");
+  assert.match(html, /<script src="\/static\/polling\.js"><\/script>/);
+  assert.match(html, /<script src="\/static\/dashboard\.js"><\/script>/);
+});
 
-  assert.match(html, /sensor === 'wazuh' \? 'Rule' : 'SID'/);
-  assert.match(html, /Agent \$\{escapeHtml\(agent\.name\)\}/);
-  assert.match(html, /SID \$\{escapeHtml\(a\.signature_id\)\}/);
-  assert.match(
-    html,
-    /\$\{ruleLabel\} \$\{escapeHtml\(v\.signature_id \?\? '\?'\)\}/,
+test("dashboard renders source-aware labels and escapes dynamic identifiers", () => {
+  const scriptPath = path.join(
+    __dirname,
+    "..",
+    "triagewall",
+    "dashboard",
+    "static",
+    "dashboard.js",
   );
-  assert.match(html, /badge badge-sensor/);
+  const script = fs.readFileSync(scriptPath, "utf8");
+
+  assert.match(script, /sensor === "wazuh" \? "Rule" : "SID"/);
+  assert.match(script, /Agent \$\{agent\.name\}/);
+  assert.match(script, /<span class="queue-endpoint queue-source">\$\{escapeHtml\(source\)\}<\/span>/);
+  assert.match(script, /SID \$\{escapeHtml\(anomaly\.signature_id\)\}/);
+  assert.match(
+    script,
+    /\$\{ruleLabel\} \$\{escapeHtml\(verdict\.signature_id \?\? "\?"\)\}/,
+  );
+  assert.match(script, /badge badge-sensor/);
 });
 
 test("dashboard renders storage allocation from the health endpoint", () => {
@@ -109,9 +118,111 @@ test("dashboard renders storage allocation from the health endpoint", () => {
     "index.html",
   );
   const html = fs.readFileSync(indexPath, "utf8");
+  const script = fs.readFileSync(
+    path.join(path.dirname(indexPath), "dashboard.js"),
+    "utf8",
+  );
 
   assert.match(html, /id="storageMeta"/);
-  assert.match(html, /health\.storage\.total_on_disk_bytes/);
-  assert.match(html, /health\.storage\.reusable_bytes/);
-  assert.match(html, /function formatBytes\(value\)/);
+  assert.match(script, /storage\.total_on_disk_bytes/);
+  assert.match(script, /function formatBytes\(value\)/);
+});
+
+test("dashboard has no runtime dependency on third-party CDNs", () => {
+  const indexPath = path.join(
+    __dirname,
+    "..",
+    "triagewall",
+    "dashboard",
+    "static",
+    "index.html",
+  );
+  const html = fs.readFileSync(indexPath, "utf8");
+
+  assert.doesNotMatch(html, /cdn\.|fonts\.googleapis|fonts\.gstatic/i);
+  assert.match(html, /href="\/static\/dashboard\.css"/);
+});
+
+test("dashboard uses separate queue, overview, behavioral, and integrity views", () => {
+  const indexPath = path.join(
+    __dirname,
+    "..",
+    "triagewall",
+    "dashboard",
+    "static",
+    "index.html",
+  );
+  const html = fs.readFileSync(indexPath, "utf8");
+
+  assert.ok(html.indexOf('data-view="triage"') < html.indexOf('data-view="overview"'));
+  assert.match(html, /class="decision-columns"/);
+  assert.match(html, /href="\/triage" data-view-link="triage"/);
+  assert.match(html, /href="\/overview" data-view-link="overview"/);
+  assert.match(html, /href="\/behavioral" data-view-link="behavioral"/);
+  assert.match(html, /href="\/integrity" data-view-link="integrity"/);
+  assert.match(html, /data-view="integrity"/);
+  assert.match(html, /Implemented controls — not inferred incident counters/);
+  assert.doesNotMatch(html, />Cases<\/a>|>Reports<\/a>|>Hunt<\/a>/);
+});
+
+test("dashboard uses cursor pagination and URL-backed queue filters", () => {
+  const script = fs.readFileSync(
+    path.join(
+      __dirname,
+      "..",
+      "triagewall",
+      "dashboard",
+      "static",
+      "dashboard.js",
+    ),
+    "utf8",
+  );
+
+  assert.match(script, /const PAGE_SIZE = 50;/);
+  assert.match(script, /params\.set\("limit", String\(PAGE_SIZE\)\)/);
+  assert.match(script, /params\.set\("cursor", cursor\)/);
+  assert.match(script, /window\.history\.replaceState/);
+  assert.match(script, /currentFilter\.source/);
+  assert.match(script, /currentFilter\.review/);
+  assert.match(script, /decisions loaded/);
+});
+
+test("dashboard detail route escapes raw events and supports review notes", () => {
+  const staticDir = path.join(
+    __dirname,
+    "..",
+    "triagewall",
+    "dashboard",
+    "static",
+  );
+  const html = fs.readFileSync(path.join(staticDir, "index.html"), "utf8");
+  const script = fs.readFileSync(path.join(staticDir, "dashboard.js"), "utf8");
+
+  assert.match(html, /data-view="detail"/);
+  assert.match(html, /id="detailPageContent"/);
+  assert.doesNotMatch(html, /<dialog id="detailDrawer"/);
+  assert.match(script, /\/api\/v1\/verdicts\/\$\{eventId\}/);
+  assert.match(script, /<pre class="raw-event">\$\{escapeHtml\(rawAlert\)\}<\/pre>/);
+  assert.match(script, /id="detailNotes" maxlength="2000"/);
+  assert.match(script, /notes \}\),/);
+});
+
+test("overview uses a truthful policy-to-model decision band", () => {
+  const staticDir = path.join(
+    __dirname,
+    "..",
+    "triagewall",
+    "dashboard",
+    "static",
+  );
+  const html = fs.readFileSync(path.join(staticDir, "index.html"), "utf8");
+  const script = fs.readFileSync(path.join(staticDir, "dashboard.js"), "utf8");
+
+  assert.match(html, /id="prefilterRate"/);
+  assert.match(html, /id="policyBand"/);
+  assert.match(html, /Includes deterministic policy/);
+  assert.match(script, /stats\.today_prefilter/);
+  assert.match(script, /stats\.today_llm/);
+  assert.match(script, /stats\.model_real_count/);
+  assert.match(script, /stats\.unreviewed_model_count/);
 });

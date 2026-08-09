@@ -18,7 +18,15 @@ SELECT
     COALESCE(SUM(agreed = 1), 0) AS window_agreed,
     COALESCE(SUM(agreed = 0), 0) AS window_disagreed,
     COALESCE(SUM(model_used = 'prefilter'), 0) AS window_prefilter,
-    COALESCE(SUM(model_used != 'prefilter'), 0) AS window_llm
+    COALESCE(SUM(model_used != 'prefilter'), 0) AS window_llm,
+    COALESCE(SUM(model_used != 'prefilter' AND verdict = 'real'), 0)
+        AS window_model_real,
+    COALESCE(SUM(model_used != 'prefilter' AND verdict = 'false_positive'), 0)
+        AS window_model_fp,
+    COALESCE(SUM(model_used != 'prefilter' AND verdict = 'uncertain'), 0)
+        AS window_model_uncertain,
+    COALESCE(SUM(model_used != 'prefilter' AND human_verdict IS NULL), 0)
+        AS window_model_unreviewed
 FROM triage_events
 WHERE processed_at >= ?
 """
@@ -62,4 +70,8 @@ def get_dashboard_stats(conn: sqlite3.Connection) -> dict[str, int]:
         "today_total": int(window["window_total"] or 0),
         "today_prefilter": int(window["window_prefilter"] or 0),
         "today_llm": int(window["window_llm"] or 0),
+        "model_real_count": int(window["window_model_real"] or 0),
+        "model_fp_count": int(window["window_model_fp"] or 0),
+        "model_uncertain_count": int(window["window_model_uncertain"] or 0),
+        "unreviewed_model_count": int(window["window_model_unreviewed"] or 0),
     }

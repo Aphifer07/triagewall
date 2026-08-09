@@ -262,6 +262,9 @@ def row_to_dict(row):
     elif API_REDACT_IPS:
         d["src_ip"] = services.hash_ip(d.get("src_ip"), API_IP_HASH_SECRET)
         d["dest_ip"] = services.hash_ip(d.get("dest_ip"), API_IP_HASH_SECRET)
+        # raw_alert may contain the original addresses and other unprojected
+        # identifiers, so it cannot be returned alongside redacted fields.
+        d["raw_alert"] = None
     return d
 
 
@@ -341,7 +344,17 @@ app.openapi = custom_openapi
 
 @app.get("/")
 @app.head("/")
-def index():
+@app.get("/triage", include_in_schema=False)
+@app.head("/triage", include_in_schema=False)
+@app.get("/triage/{event_id}", include_in_schema=False)
+@app.head("/triage/{event_id}", include_in_schema=False)
+@app.get("/overview", include_in_schema=False)
+@app.head("/overview", include_in_schema=False)
+@app.get("/behavioral", include_in_schema=False)
+@app.head("/behavioral", include_in_schema=False)
+@app.get("/integrity", include_in_schema=False)
+@app.head("/integrity", include_in_schema=False)
+def index(event_id: int | None = None):
     response = FileResponse(STATIC_DIR / "index.html")
     # Same-origin CSRF resistance for the built-in UI, not a user login. See
     # docs/api.md: remote access still needs a VPN or an authenticated proxy.

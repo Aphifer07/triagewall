@@ -13,6 +13,8 @@ from triagewall.dashboard.api.services import MAX_FEEDBACK_NOTES_LENGTH
 # rather than a filter that silently does nothing.
 VerdictFilter = Literal["real", "false_positive", "uncertain"]
 ModelFilter = Literal["llm", "prefilter"]
+SourceFilter = Literal["suricata", "wazuh"]
+ReviewFilter = Literal["unreviewed", "agreed", "corrected"]
 TimelineInterval = Literal["1h"]
 
 
@@ -36,6 +38,10 @@ class StatsModel(BaseModel):
     today_total: int
     today_prefilter: int
     today_llm: int
+    model_real_count: int
+    model_fp_count: int
+    model_uncertain_count: int
+    unreviewed_model_count: int
 
 
 class StatsResponse(BaseModel):
@@ -44,6 +50,28 @@ class StatsResponse(BaseModel):
     generated_at: str
     mode: Literal["local", "demo"]
     stats: StatsModel
+
+
+class LegacyStatsModel(BaseModel):
+    """Frozen counter shape used by the deprecated combined endpoint."""
+
+    # New internal/v1 counters are intentionally ignored so this deprecated
+    # response remains byte-shape compatible until its removal date.
+    model_config = ConfigDict(extra="ignore")
+
+    total: int
+    real: int
+    real_: int
+    fp: int
+    unc: int
+    reviewed: int
+    agreed: int
+    disagreed: int
+    prefilter_count: int
+    llm_count: int
+    today_total: int
+    today_prefilter: int
+    today_llm: int
 
 
 class AgentContext(BaseModel):
@@ -114,6 +142,14 @@ class VerdictsResponse(BaseModel):
     mode: Literal["local", "demo"]
     verdicts: list[VerdictRow]
     next_cursor: str | None = None
+
+
+class VerdictDetailResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    mode: Literal["local", "demo"]
+    verdict: VerdictRow
 
 
 class TimelineBucket(BaseModel):
@@ -194,5 +230,5 @@ class LegacyVerdictsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal["local", "demo"]
-    stats: StatsModel
+    stats: LegacyStatsModel
     verdicts: list[VerdictRow]

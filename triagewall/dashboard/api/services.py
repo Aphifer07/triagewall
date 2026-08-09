@@ -94,6 +94,8 @@ def build_verdict_filters(
     verdict: str | None,
     signature: str | None,
     model: str | None,
+    source: str | None = None,
+    review: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     where: list[str] = []
     params: list[Any] = []
@@ -107,6 +109,18 @@ def build_verdict_filters(
         where.append("events.model_used != 'prefilter'")
     elif model == "prefilter":
         where.append("events.model_used = 'prefilter'")
+    if source == "suricata":
+        # Rows created before source provenance was introduced are Suricata
+        # rows: Wazuh support and sensor_event_context shipped together.
+        where.append("(sensor.source_type = 'suricata' OR sensor.source_type IS NULL)")
+    elif source == "wazuh":
+        where.append("sensor.source_type = 'wazuh'")
+    if review == "unreviewed":
+        where.append("events.human_verdict IS NULL")
+    elif review == "agreed":
+        where.append("events.human_verdict IS NOT NULL AND events.agreed = 1")
+    elif review == "corrected":
+        where.append("events.human_verdict IS NOT NULL AND events.agreed = 0")
     return where, params
 
 
@@ -134,6 +148,11 @@ LEFT JOIN sensor_event_context AS sensor
   ON sensor.triage_event_id = events.id
 """
 
+_VERDICT_DETAIL_SELECT = _VERDICT_SELECT.replace(
+    "events.reasoning, events.model_used, events.processed_at,",
+    "events.reasoning, events.raw_alert, events.model_used, events.processed_at,",
+)
+
 
 def fetch_verdicts(
     conn: sqlite3.Connection,
@@ -141,6 +160,8 @@ def fetch_verdicts(
     verdict: str | None = None,
     signature: str | None = None,
     model: str | None = None,
+    source: str | None = None,
+    review: str | None = None,
     limit: int = DEFAULT_VERDICT_LIMIT,
     cursor: str | None = None,
 ) -> tuple[list[sqlite3.Row], str | None]:
@@ -150,7 +171,13 @@ def fetch_verdicts(
             status_code=422,
             detail=f"limit must be between 1 and {MAX_VERDICT_LIMIT}",
         )
-    where, params = build_verdict_filters(verdict, signature, model)
+    where, params = build_verdict_filters(
+        verdict,
+        signature,
+        model,
+        source,
+        review,
+    )
     if cursor:
         processed_at, event_id = decode_cursor(cursor)
         where.append(
@@ -197,6 +224,15 @@ def fetch_verdicts(
         # Exact page with no more rows.
         next_cursor = None
     return list(rows), next_cursor
+
+
+def fetch_verdict(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+    """Return one complete decision, including its original sensor record."""
+    return conn.execute(
+        f"""{_VERDICT_DETAIL_SELECT}
+            WHERE events.id = ?""",
+        (event_id,),
+    ).fetchone()
 
 
 def get_cached_stats(

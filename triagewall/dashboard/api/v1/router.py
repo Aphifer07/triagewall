@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from triagewall.dashboard.api.auth import AuthContext, AuthState
@@ -16,12 +16,15 @@ from triagewall.dashboard.api.v1.models import (
     FeedbackResponse,
     HealthResponse,
     ModelFilter,
+    ReviewFilter,
+    SourceFilter,
     SpcAnomaliesResponse,
     StatsModel,
     StatsResponse,
     TimelineInterval,
     TimelineResponse,
     VerdictFilter,
+    VerdictDetailResponse,
     VerdictsResponse,
 )
 from triagewall.time_utils import utc_now_iso
@@ -91,6 +94,8 @@ def create_v1_router(
             max_length=services.MAX_SIGNATURE_SEARCH_LENGTH,
         ),
         model: ModelFilter | None = None,
+        source: SourceFilter | None = None,
+        review: ReviewFilter | None = None,
         limit: int = Query(
             default=services.DEFAULT_VERDICT_LIMIT,
             ge=1,
@@ -108,6 +113,8 @@ def create_v1_router(
                 verdict=verdict,
                 signature=signature,
                 model=model,
+                source=source,
+                review=review,
                 limit=limit,
                 cursor=cursor,
             )
@@ -121,6 +128,28 @@ def create_v1_router(
             request,
             payload,
             model=VerdictsResponse,
+            max_age=5,
+        )
+
+    @router.get("/verdicts/{event_id}", response_model=VerdictDetailResponse)
+    def get_verdict(
+        request: Request,
+        event_id: int,
+        _auth: AuthContext = Depends(require_read),
+    ):
+        with db_factory(readonly=True) as conn:
+            row = services.fetch_verdict(conn, event_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="event not found")
+        payload = {
+            "generated_at": utc_now_iso(),
+            "mode": get_mode(),
+            "verdict": row_to_dict(row),
+        }
+        return validated_json_response(
+            request,
+            payload,
+            model=VerdictDetailResponse,
             max_age=5,
         )
 
