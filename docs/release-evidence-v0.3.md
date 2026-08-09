@@ -24,7 +24,7 @@ observation of the release-boundary lifecycle, which ran 03:14Z – 16:20Z)
 | 2 | Core-only operation | **PASS** (functional) |
 | 3 | Core + Wazuh operation | **PASS** |
 | 4 | Fresh installation | **PASS** |
-| 5 | Rollback | **PASS** — target is released `v0.2`; backup-restore is the authoritative path |
+| 5 | Rollback | **PASS** for version-boundary rollback (released `v0.2`) and database restore. Suricata source/checkpoint recovery after a copied restore is **NOT VALIDATED** |
 | 6 | Multi-source Garak / adversarial coverage | **NOT IMPLEMENTED / NOT RUN** |
 
 Scenarios 2 and 4 share one isolated Compose project. Scenario 1 and Scenario 5
@@ -294,8 +294,8 @@ restored over, or written to.
 
 | Artifact | What it proves | What it does *not* prove |
 | --- | --- | --- |
-| The **18.5 GB verified production backup** | that the documented backup mechanism works at production scale, and that the resulting artifact is complete and verifiable (`integrity_check: "ok"`, recomputed hash equals the manifest hash) | anything about crossing a release boundary — the versions either side of it are runtime-equivalent |
-| The **small v0.2-origin lifecycle snapshot** | that rollback works across the real version boundary: released `v0.2` runs against v0.3-migrated data, and the pre-upgrade v0.2 set restores and starts | anything about production-scale restore timing or volume |
+| The **18.5 GB verified production backup** | **database** backup and integrity at production scale: the documented mechanism runs, and the artifact is complete and verifiable (`integrity_check: "ok"`, recomputed hash equals the manifest hash) | anything about crossing a release boundary, and **nothing about Suricata source/checkpoint disaster recovery** — it is a database artifact only |
+| The **small v0.2-origin lifecycle snapshot** | that rollback works across the real version boundary: released `v0.2` runs against v0.3-migrated data, and the pre-upgrade v0.2 database restores and starts | production-scale restore timing or volume, and **not** validated `eve.json`/checkpoint recovery |
 
 The production-scale artifact is described first; the version-boundary rollback
 that follows it used the v0.2-origin snapshot, **not** the 18.5 GB backup.
@@ -344,25 +344,44 @@ so the Wazuh-origin alert is listed as an ordinary alert, indistinguishable from
 a Suricata one. v0.2 is not required to understand Wazuh provenance; it ignored
 the provenance table safely rather than failing.
 
-#### B. Backup-restore rollback — the authoritative safe path (**PASS**)
+#### B. Backup-restore rollback — database restore PASS, source/checkpoint recovery **NOT VALIDATED**
 
-Restored the exact pre-upgrade v0.2 set (database **+ checkpoint + matching
-`eve.json`**) from its immutable snapshot and ran the released `v0.2` tag:
+Restored the pre-upgrade v0.2 database, checkpoint and `eve.json` from the
+immutable snapshot and ran the released `v0.2` tag.
+
+**What passed — the database restore:**
 
 | Check | Result |
 | --- | --- |
 | Restored contents | 1 row; tables `sqlite_sequence`, `triage_events` only |
 | Integrity | `ok` |
 | v0.2 services | started, **0 restarts** |
-| Data after start | still 1 row — **no duplication** |
 | Health | 503 `stale`, well-formed (restored data ≈10.6 h old — correct behaviour) |
 
-**Checkpoint recovery detail:** a restore necessarily produces a **new inode**
-for `eve.json` (57805483 → 57805538). v0.2 adopted the new inode, kept
-`offset=302`, and logged `Read 1 new lines, triaged 0 alerts` — it re-read the
-file but `is_duplicate` suppressed the row. The protection here came from
-duplicate detection, **not** from the checkpoint; with later events in the file
-those would have been replayed.
+**What did NOT pass — Suricata source/checkpoint recovery.** A restore copies
+`eve.json`, which necessarily allocates a **new inode** (57805483 → 57805538).
+What v0.2 then did, read precisely from the captured log:
+
+- the restored `eve.json` is 302 bytes containing exactly **one** line;
+- the restored checkpoint said `offset=302`;
+- v0.2 logged `Read 1 new lines, triaged 0 alerts (offset now 302)`.
+
+Had v0.2 resumed *at* offset 302 it would have read **zero** lines. It read one.
+**v0.2 therefore reset to byte zero and re-read the entire file**, then wrote
+`inode=57805538, offset=302`. No duplicate row appeared **only because this
+particular fixture happened to be caught by `is_duplicate`** (matching
+`flow_id` + `signature_id` + `timestamp`).
+
+That is not recovery, and it must not be read as one:
+
+- duplicate detection is a **dedup heuristic, not a replay guarantee** — Suricata
+  alerts without a `flow_id` are not covered by it at all;
+- on a real `eve.json` the same behaviour replays **every** record in the file,
+  re-triaging them and re-persisting anything dedup does not catch.
+
+So the backup-restore path is recorded as **database restore PASS / Suricata
+source-and-checkpoint recovery NOT VALIDATED**. Validating it requires bounded
+replay or recorded-gap handling, which does not exist yet.
 
 #### Cross-version finding: restore changes file identity
 
@@ -382,29 +401,32 @@ by design** — v0.3 refuses to skip possibly-unread alerts.
 
 What this does and does not mean:
 
-- **Direct, same-host version switching works.** When `eve.json` keeps its
-  identity — rolling the code back and forward on the same host, touching only
-  the checkout — v0.3 resumes with **0 restarts and no rewind**. That is the path
-  the v0.3 → v0.2 → v0.3 rollback above actually exercised, and it is unaffected
-  by this finding.
-- **Restoring copied files makes v0.3 fail closed.** `position.json` records an
-  inode, and copying `eve.json` necessarily allocates a new one. **Restoring both
-  files together does not make them checkpoint-compatible** — the pair is still
-  inconsistent by construction, because the identity the checkpoint names no
-  longer exists anywhere.
-- **Recovery therefore needs one of two deliberate acts:** an explicit operator
-  reconciliation of the checkpoint against the restored file (accepting and
-  recording any resulting gap), or **starting released `v0.2` first**, which
-  adopts the restored file's inode while preserving the offset, after which v0.3
-  can be started against a checkpoint that names a file that exists. The v0.2
-  adoption behaviour is the one observed in section B above; note that v0.2's
-  protection against re-reading came from `is_duplicate`, not from the
-  checkpoint.
+- **Direct, same-host version switching works — this is the tested rollback.**
+  When `eve.json` keeps its identity, rolling the code back and forward on the
+  same host while touching only the checkout, v0.2 runs correctly against the
+  v0.3-migrated database and v0.3 resumes with **0 restarts and no rewind**. That
+  is the path section A exercised, and this finding does **not** weaken it.
+- **A copied `position.json` plus a copied `eve.json` is not a usable pair.**
+  The checkpoint records an inode; copying `eve.json` always allocates a new one.
+  Restoring both files together therefore still leaves the checkpoint naming an
+  identity that exists nowhere. Copying both is **not** sufficient.
+- **After a copied restore, an explicit operator checkpoint reconciliation is
+  required before starting ingest.** The operator must decide what the checkpoint
+  should say relative to the restored file and record any resulting alert gap.
+  There is currently **no tested tool or runbook** for this.
 
-This is an **operational restore limitation**, not a defect in the rollback that
-was tested, and not something a restore procedure can fix merely by copying both
-files. It should be tracked as work for a proper recovery runbook or a
-checkpoint-reconciliation tool.
+**No version-ordering trick is a substitute for that reconciliation.** In
+particular, starting an older release first to make it "adopt" the restored inode
+is **not** a safe recovery step and is not recommended anywhere in this document:
+as section B shows, v0.2 reaches that state by resetting to byte zero and
+re-reading the whole file, which on a real `eve.json` means replaying every
+record in it.
+
+This is an **operational restore limitation**. It does not invalidate the
+version-boundary rollback that was tested, and it cannot be fixed by a restore
+procedure that merely copies both files. It is tracked as roadmap work for a
+tested reconciliation tool or runbook with bounded replay or recorded-gap
+handling.
 
 #### C. Return to v0.3 after rollback
 
@@ -425,9 +447,23 @@ v0.3-migrated snapshot was retained untouched for comparison.
 v0.3 therefore serves rows written by the older release without error and without
 inventing provenance for them.
 
-Demonstrated overall: a verified backup exists and is readable; the procedure is
-recoverable; the **released prior version** starts against restored data; and
-returning to the v0.3 candidate succeeds.
+**Scenario 5 overall — what is and is not demonstrated.**
+
+Demonstrated:
+
+- a verified backup exists, is readable, and its integrity is confirmed;
+- **version-boundary rollback works**: released `v0.2` runs against the
+  v0.3-migrated database, reads v0.3-origin rows, and its writes succeed;
+- returning to the v0.3 candidate succeeds with rows preserved and no duplicates;
+- the pre-upgrade v0.2 **database** restores cleanly and v0.2 starts on it.
+
+Not demonstrated:
+
+- **Suricata source/checkpoint disaster recovery.** A copied restore leaves the
+  checkpoint pointing at an inode that no longer exists. v0.3 fails closed, and
+  v0.2 only appears to cope because it silently restarts the file from byte zero.
+  Neither is validated recovery, and no bounded-replay or recorded-gap mechanism
+  exists yet.
 
 ### Deviation: writer-stop overran and was converted mid-run
 
@@ -572,15 +608,15 @@ Outstanding non-blocking observations:
   verification, stopping live ingest for 53 m 08 s. No data was lost and the
   checkpoint resumed without rewind, but the maintenance-window guidance needs
   to account for verification cost explicitly (see Scenario 5).
-- **Restoring a backup changes `eve.json`'s file identity, and v0.3 fails closed
-  on that.** Copying `position.json` and `eve.json` together does **not** make
-  them checkpoint-compatible: the checkpoint names an inode that no longer
-  exists. Recovery requires an explicit operator reconciliation, or starting
-  released `v0.2` first so it adopts the restored file's inode before v0.3 is
-  started. Direct same-host version switching, where file identity is intact, is
-  unaffected — that is the path the tested rollback used. This is an operational
-  restore limitation to be closed by a recovery runbook or a
-  checkpoint-reconciliation tool, **not** a defect in the rollback evidence
-  (see Scenario 5, cross-version finding).
+- **Suricata source/checkpoint recovery after a copied restore is not
+  validated.** Copying `position.json` and `eve.json` together does **not** make
+  them checkpoint-compatible: copying changes the inode, so the checkpoint names
+  an identity that no longer exists. v0.3 fails closed; v0.2 only appears to cope
+  because it restarts the file from byte zero, which on a real `eve.json` replays
+  every record. **An explicit operator checkpoint reconciliation is required
+  before starting ingest after a copied restore**, and no tested tool or runbook
+  exists for it. Direct same-host version switching, where file identity is
+  intact, is unaffected and is the path the tested rollback used. Tracked as
+  roadmap work (see Scenario 5, cross-version finding).
 - Two of the four rows in the lifecycle database carry no source provenance
   (written by v0.2). v0.3 serves them correctly and does not backfill them.

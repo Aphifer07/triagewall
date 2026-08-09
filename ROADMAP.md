@@ -172,14 +172,23 @@ fail for different reasons and need different review.
   projection path. Deterministic regression coverage, **not** Garak; currently
   Suricata-only.
 
-- [ ] **Restore recovery runbook and checkpoint reconciliation.** Restoring a
-  backup gives `eve.json` a new inode, so a restored `position.json` names an
-  identity that no longer exists and v0.3 ingest fails closed by design. Copying
-  both files together does not resolve this. Document — and preferably tool — the
-  supported recovery: explicit operator reconciliation of the checkpoint against
-  the restored file with any gap recorded, or starting the prior release first so
-  it adopts the restored inode. Direct same-host version switching, where file
-  identity is intact, already works and is evidenced in
+- [ ] **Tested checkpoint-reconciliation tool and restore runbook.** Suricata
+  source/checkpoint disaster recovery is currently **unvalidated**. Restoring a
+  backup copies `eve.json`, which allocates a new inode, so a restored
+  `position.json` names an identity that no longer exists; copying both files
+  together does **not** resolve this. v0.3 fails closed by design. The prior
+  release only appears to cope because it restarts the file from byte zero,
+  replaying every record — that is not a recovery mechanism and must not be
+  documented as one. Deliver:
+  - a supported reconciliation step an operator runs **before** starting ingest
+    after a restore, with the resulting alert gap explicitly recorded;
+  - **bounded replay** or recorded-gap handling, so recovery never means
+    re-triaging an entire `eve.json` and never relies on duplicate detection as
+    a replay guarantee (flow-less alerts are not covered by it);
+  - tests covering restore-then-resume for both sources.
+
+  Direct same-host version switching, where file identity is intact, already
+  works and is evidenced in
   [docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md).
 
 #### Operational usability and provenance
