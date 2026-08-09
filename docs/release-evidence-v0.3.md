@@ -10,10 +10,10 @@ inventory contents, addresses, or host identifiers.
 
 **Commit under test:** `9b95bf007440ab2297d0dae272c57a9d6f02e4ba`
 **Previous deployed commit:** `89e24fb048517bafda6cce8c362b88773fc22842`
-**Environment:** single maintainer host ("omv1"), Docker Compose, Core + optional
-Wazuh profile. Live project runs Core+Wazuh; isolated checks run under a separate
+**Environment:** single maintainer host, Docker Compose, Core + optional Wazuh
+profile. Live project runs Core+Wazuh; isolated checks run under a separate
 Compose project, port, and data directory.
-**Evidence collected:** 2026-08-08T20:20Z – 2026-08-09T00:45Z
+**Evidence collected:** 2026-08-08T20:20Z – 2026-08-09T01:57Z
 
 ## Summary
 
@@ -134,6 +134,31 @@ The live deployment runs both sources, so it is the direct evidence.
 Log review over the window found no crashes, restart loops, migration errors,
 database errors, invalid model output, or unexpected exceptions.
 
+### Follow-up observation: Wazuh archive-day rollover
+
+Wazuh names its daily `ossec-alerts-DD` archives by the manager's local calendar
+day, so a day boundary is a checkpoint transition rather than a simple offset
+advance. `TZ` is not set in the deployment environment, so the ingest container
+runs **UTC** (the Compose default) and its archive day equals the UTC day.
+
+| Observation (UTC) | Wazuh checkpoint |
+| --- | --- |
+| 2026-08-08T22:22:54Z (end of window above) | day `2026-08-08`, offset 2,562,034 |
+| 2026-08-09T01:46:24Z | day `2026-08-09`, offset 202,991 |
+| 2026-08-09T01:57:25Z | day `2026-08-09`, offset 223,204 |
+
+The checkpoint followed the archive rotation onto the new day and continued
+advancing within it (+20,213 bytes across the final ~11 minutes). Health stayed
+200 `ok` and restart counts stayed at 0 throughout; no fail-closed rotation error
+was raised.
+
+**Precision about what was observed:** the rollover *result* was observed, not
+the transition instant. The transition falls somewhere in the
+22:22:54Z–01:46:24Z gap, which is consistent with the UTC day boundary at
+2026-08-09T00:00:00Z. This is single-deployment evidence that the day-rotation
+path works in a UTC deployment; it is **not** evidence for a non-UTC manager
+timezone, where the boundary shifts and `TZ` must match the Wazuh manager.
+
 **Log-noise caution for future reviewers:** a case-insensitive `error` grep over
 ingest logs returns thousands of matches that are *not* errors — the Suricata
 signature `ET DNS Standard query response, Name Error` appears in ordinary
@@ -195,14 +220,52 @@ Demonstrated: a backup exists and is readable; its integrity is verified; the
 procedure is recoverable; the prior version starts against restored data; and
 returning to current `main` succeeds.
 
+### Deviation: writer-stop overran and was converted mid-run
+
+The backup was **intended** to run as a full freeze — writers stopped for the
+copy *and* the integrity verification — so the retained artifact would be
+produced without competing live I/O. That is not what happened, and the actual
+sequence is recorded here in full:
+
+| Event | Time (UTC) |
+| --- | --- |
+| Writers stopped (ingest, wazuh-ingest, dashboard) | 2026-08-08T20:22:04Z |
+| Backup copy completed, exit 0, 0 backup restarts (~17 min) | 20:39:43Z |
+| Integrity verification started, **writers still stopped** | 20:39:43Z |
+| Writers restarted — **verification still running** | 21:15:12Z |
+| Verification completed, exit 0, `integrity_check: "ok"` | 22:19:41Z |
+
+**Total writer-stop: 53 m 08 s.** The copy finished after roughly 17 minutes;
+verification then continued inside the freeze for a further ~35 minutes and was
+still running when the freeze was ended deliberately to stop extending a live
+monitoring outage. Verification completed later, with writers live.
+
+This was therefore a **full-freeze attempt converted mid-run to split
+verification** — it was *not* the planned minimal-freeze workflow, and it should
+not be read as one. The estimate that preceded it (3–10 minutes) was wrong by
+roughly an order of magnitude because it accounted for the copy only.
+
+Consequences, stated plainly:
+
+- Suricata and Wazuh ingest were stopped for the full 53 m 08 s, so triage of
+  live alerts was delayed by that interval.
+- No data was lost. `eve.json` grows in place and no rotation occurred during
+  the window, so nothing aged out from under the checkpoint.
+- On restart, ingest resumed from its durable checkpoint with **no rewind** and
+  caught up: the Suricata offset advanced from 162,004,527 (pre-freeze) to
+  167,080,750 shortly after restart and continued advancing thereafter.
+- The resulting backup is valid and verified; the artifact hashes above were
+  recomputed afterwards and match the manifest.
+
 ### Operational finding: verification cost at production scale
 
-`verify-backup` on this 18.5 GB database took roughly **100 minutes**
+`verify-backup` on this 18.5 GB database took roughly **100 minutes** end to end
 (SHA-256 pass ~7 minutes, `PRAGMA integrity_check` the remainder), versus ~17
-minutes for the copy itself. Operators planning a maintenance window should size
-it for the copy **plus** verification, or follow the documented split workflow
-and restart writers before verification. This is worth stating explicitly in the
-retention runbook.
+minutes for the copy. A maintenance window sized for the copy alone will
+overrun. Operators should either size the window for copy **plus** verification,
+or deliberately follow the documented split workflow — restart writers after the
+copy and verify with writers live — and record that choice up front rather than
+discovering it mid-freeze.
 
 ## Scenario 6 — Multi-source Garak / adversarial coverage (NOT IMPLEMENTED / NOT RUN)
 
@@ -280,7 +343,9 @@ recording five of six scenarios complete rather than a release recommendation.
 
 Outstanding non-blocking observations:
 
-- Backup verification at production scale is slow enough to need explicit
-  window planning (see Scenario 5).
+- The backup writer-stop overran its estimate and was converted mid-run to split
+  verification, stopping live ingest for 53 m 08 s. No data was lost and the
+  checkpoint resumed without rewind, but the maintenance-window guidance needs
+  to account for verification cost explicitly (see Scenario 5).
 - The upgrade evidence covers the deployment mechanism only, because this commit
   range carries no migration content (see Scenario 1).
