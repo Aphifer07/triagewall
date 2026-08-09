@@ -22,7 +22,7 @@ observation of the release-boundary lifecycle, which ran 03:14Z – 16:20Z)
 | --- | --- | --- |
 | 1 | Upgrade deployment | **PASS** — released `v0.2` → v0.3 candidate |
 | 2 | Core-only operation | **PASS** (functional) |
-| 3 | Core + Wazuh operation | **PASS** |
+| 3 | Core + Wazuh operation | **PASS** — persisted verdicts from **both** sources in the same window |
 | 4 | Fresh installation | **PASS** |
 | 5 | Rollback | **PASS** for version-boundary rollback (released `v0.2`) and database restore. Suricata source/checkpoint recovery after a copied restore is **NOT VALIDATED** |
 | 6 | Multi-source Garak / adversarial coverage | **NOT IMPLEMENTED / NOT RUN** |
@@ -183,46 +183,76 @@ The live deployment runs both sources, so it is the direct evidence.
 | Observation window | 2026-08-08T21:52:37Z → 22:22:54Z (**30 m 17 s**) |
 | Suricata checkpoint | offset 171012213 → 174346439 (**+3,334,226 bytes**), inode stable |
 | Wazuh checkpoint | offset 2496174 → 2562034 (**+65,860 bytes**), same archive day |
+| Suricata persisted verdicts | **3,862** rows (see below) |
+| Wazuh persisted verdicts | **3** rows (see below) |
 | Health | both endpoints 200 throughout, `status: ok`, `last_alert_age_seconds: 0` |
 | Restarts | 0 across all three services |
 
 Log review over the window found no crashes, restart loops, migration errors,
 database errors, invalid model output, or unexpected exceptions.
 
-### Source-specific Wazuh evidence (required — checkpoints alone are insufficient)
+### Source-specific evidence for both sources (checkpoints alone are insufficient)
 
-Checkpoint movement on its own does **not** show that any Wazuh alert was
-triaged. `process_wazuh_record()` checkpoints every below-threshold event
-without triaging it, and the health endpoint derives staleness from
-`MAX(processed_at)` across **all** sources — so an active Suricata stream plus
-nothing but filtered Wazuh records would produce advancing checkpoints and a
-green status even if the Wazuh verdict path were broken.
+Checkpoint movement on its own does **not** show that either source produced a
+verdict, and the argument is symmetrical:
 
-A read-only aggregate query was therefore run against the live database, joining
-`triage_events` to `sensor_event_context` on
-`sensor_event_context.triage_event_id = triage_events.id` and filtering
-`source_type = 'wazuh'`. Counts and timestamps only; no alert fields were
+- **Suricata.** `process_line()` returns `CHECKPOINT_LINE`
+  (`LineResult(processed=False, checkpoint=True)`) on eight distinct non-verdict
+  paths — blank line, invalid JSON, non-object top level, `event_type != alert`,
+  non-object alert metadata, invalid timestamp, invalid alert data, and duplicate
+  — quarantining where appropriate. The checkpoint therefore advances correctly
+  over records that were **never triaged**.
+- **Wazuh.** `process_wazuh_record()` likewise checkpoints every below-threshold
+  event without triaging it.
+
+The health endpoint compounds this: staleness comes from `MAX(processed_at)`
+across **all** sources, so one healthy stream can mask a broken sibling. Advancing
+checkpoints plus a green status could therefore occur with either verdict path
+broken.
+
+A read-only aggregate query was therefore run against the live database
+(`mode=ro`), joining `triage_events` to `sensor_event_context` on
+`sensor_event_context.triage_event_id = triage_events.id`, grouped by
+`source_type`. **Both sources were measured by one query, so the semantics and
+time boundaries are identical.** Counts and timestamps only; no alert fields were
 selected.
 
-| Period (UTC) | Persisted Wazuh rows | First `processed_at` | Last `processed_at` |
+**Observation window 2026-08-08T21:52:37Z – 22:22:54Z** (the live Core+Wazuh
+topology, both ingesters running against the same database):
+
+| `source_type` | Persisted rows | First `processed_at` | Last `processed_at` |
 | --- | --- | --- | --- |
-| Observation window 21:52:37Z – 22:22:54Z | **3** | 2026-08-08T22:10:44.128847Z | 2026-08-08T22:20:34.509099Z |
-| Full post-deploy 2026-08-08T21:41:52Z – 2026-08-09T01:57:25Z | **6** | 2026-08-08T22:10:44.128847Z | 2026-08-09T01:05:15.467981Z |
+| `suricata` | **3,862** | 2026-08-08T21:52:38.823514Z | 2026-08-08T22:22:54.918463Z |
+| `wazuh` | **3** | 2026-08-08T22:10:44.128847Z | 2026-08-08T22:20:34.509099Z |
 
-All six carry `verdict = false_positive` and `model_used` = the configured
-production model — **not** `prefilter` — so these records were normalized,
-admitted by the level threshold, sent through the model, and persisted with
-`source_type = 'wazuh'` provenance.
+Verdict/model breakdown within that same window: Suricata 3,861 `prefilter`
+plus 1 via the configured production model; Wazuh 3 via the production model —
+all `verdict = false_positive`. So the Suricata path exercised both its
+deterministic prefilter route and a real model call, and the Wazuh rows were
+normalized, admitted by the level threshold, sent through the model, and
+persisted with `source_type = 'wazuh'` provenance.
 
-The two signals prove different things and are both required:
+**What this establishes:** persisted source-specific rows show that **both the
+Suricata and the Wazuh verdict paths operated, concurrently, while the live
+Core-plus-Wazuh topology was running** — not merely that one stream was
+consumed.
 
-- **Persisted source-specific rows** prove the Wazuh normalization, triage,
-  verdict and persistence path executed end to end during the window.
-- **Checkpoint movement** separately proves stream consumption and rotation
-  continuity, including records the level threshold correctly filtered out and
-  checkpointed without triage.
+Two further boundaries are deliberately preserved:
 
-Lifetime Wazuh-attributed rows in this deployment: 436.
+- **Verdict persistence ≠ checkpoint continuity.** Persisted rows prove the
+  normalization → triage → verdict → persistence path executed. Checkpoint
+  movement separately proves stream consumption and rotation continuity. Neither
+  substitutes for the other, for either source.
+- **Not every checkpointed record was triaged, and none of this claims it was.**
+  Persisted verdicts are a subset of checkpointed records; the remainder are
+  records legitimately checkpointed without a verdict (non-alert events,
+  duplicates, quarantined input, below-threshold Wazuh events). That is exactly
+  why the counts above are required and the checkpoint offsets are not enough.
+
+Wider context, same query semantics — full post-deploy interval
+2026-08-08T21:41:52Z – 2026-08-09T01:57:25Z: **6** Wazuh rows
+(22:10:44.128847Z → 2026-08-09T01:05:15.467981Z). Lifetime Wazuh-attributed rows
+in this deployment: 436.
 
 ### Follow-up observation: Wazuh archive-day rollover
 
