@@ -70,9 +70,9 @@ Prompt-injection and operational hardening.
 
 Hardening work retained from the original roadmap.
 
-- [ ] **Garak injection gate.** Exercise the full isolated Triagewall pipeline
-  periodically and before releases. A regression is blocked and reported for
-  human review.
+- Moved: **Garak injection gate** — see
+  [Adversarial probing (post-v0.3)](#adversarial-probing-post-v03). It is **not**
+  a prerequisite for v0.3, which makes no Garak or adversarial-probe claim.
 - [ ] Improve the URL-injection verdict from a conservative `uncertain` result
   to an explicit `real` verdict with the injection attempt identified.
 - [ ] Refresh the architecture diagram for Foundation-Sec, scoped prefiltering,
@@ -81,8 +81,13 @@ Hardening work retained from the original roadmap.
 ### v0.3 — July–August 2026
 
 Multi-sensor Core is implemented and deployed in the maintainer environment.
-The release remains in closeout until its operational and release gates are
-complete.
+The operational and release gates below are complete: the gold-set baseline is
+calibrated and the calibrated gate passes, and all five required release-evidence
+scenarios are recorded in
+[docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md). v0.3 is **not yet
+tagged** — what remains is review, merge, and release mechanics. Adversarial
+probing is explicitly out of v0.3 scope; see
+[Adversarial probing (post-v0.3)](#adversarial-probing-post-v03).
 
 #### Implemented
 
@@ -125,13 +130,30 @@ complete.
   evaluation as the v0.3 baseline, with fail-closed inventory identity checks,
   zero invalid output, and `0.05` maximum decreases for Cohen's kappa and
   true-positive recall in both metric scopes.
-#### Post-v0.3 — does not block tagging v0.3
 
-- [ ] **Extend Garak coverage across the multi-source pipeline.** Not
-  implemented: the repository contains no Garak runner, configuration, or probe
-  set, so there is no Garak result to report. Tracked separately from the
-  deterministic gold-set gate, which is a behaviour and performance gate and
-  makes no adversarial claim. Delivering this requires:
+#### Adversarial probing (post-v0.3)
+
+**Maintainer scope decision.** Garak does not block v0.3. Both the initial
+full-pipeline Garak gate and its multi-source extension are post-v0.3 work, and
+**v0.3 makes no Garak or adversarial-probe claim** — the release-evidence
+document records that scenario as `NOT IMPLEMENTED / NOT RUN`. This is a
+deliberate scope decision, not a waiver of a check that was attempted.
+
+Nothing here is implemented today: the repository contains no Garak runner,
+configuration, or probe set, so there is no Garak result to report. This work is
+tracked separately from the deterministic gold-set gate, which is a behaviour
+and performance gate over human labels and makes no adversarial claim. The two
+fail for different reasons and need different review.
+
+- [ ] **Garak injection gate (full isolated pipeline).** Exercise the complete
+  isolated Triagewall pipeline rather than the bare model. A regression is
+  blocked and reported for human review. Once implemented it should run
+  periodically **and before applicable future releases** — especially any
+  release that changes the model, the prompts, field isolation, or the source
+  projections.
+- [ ] **Extend Garak coverage across the multi-source pipeline.**
+
+  Delivering the two items above requires:
   - a pinned Garak runner and configuration with recorded versions;
   - a harness driving the **full isolated pipeline**, not the bare model;
   - probe coverage of **both** projection surfaces, Suricata and Wazuh, which
@@ -142,9 +164,6 @@ complete.
     triage;
   - CI and release integration, including how a model-dependent suite runs when
     required CI has no GPU or Ollama.
-
-  Related: the **Garak injection gate** under v0.2.1 remains the prerequisite
-  full-pipeline gate.
 
 - [ ] Extend the existing canary and prompt-boundary regressions to the Wazuh
   projection path. Deterministic regression coverage, **not** Garak; currently

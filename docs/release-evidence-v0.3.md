@@ -134,12 +134,57 @@ The live deployment runs both sources, so it is the direct evidence.
 Log review over the window found no crashes, restart loops, migration errors,
 database errors, invalid model output, or unexpected exceptions.
 
+### Source-specific Wazuh evidence (required — checkpoints alone are insufficient)
+
+Checkpoint movement on its own does **not** show that any Wazuh alert was
+triaged. `process_wazuh_record()` checkpoints every below-threshold event
+without triaging it, and the health endpoint derives staleness from
+`MAX(processed_at)` across **all** sources — so an active Suricata stream plus
+nothing but filtered Wazuh records would produce advancing checkpoints and a
+green status even if the Wazuh verdict path were broken.
+
+A read-only aggregate query was therefore run against the live database, joining
+`triage_events` to `sensor_event_context` on
+`sensor_event_context.triage_event_id = triage_events.id` and filtering
+`source_type = 'wazuh'`. Counts and timestamps only; no alert fields were
+selected.
+
+| Period (UTC) | Persisted Wazuh rows | First `processed_at` | Last `processed_at` |
+| --- | --- | --- | --- |
+| Observation window 21:52:37Z – 22:22:54Z | **3** | 2026-08-08T22:10:44.128847Z | 2026-08-08T22:20:34.509099Z |
+| Full post-deploy 2026-08-08T21:41:52Z – 2026-08-09T01:57:25Z | **6** | 2026-08-08T22:10:44.128847Z | 2026-08-09T01:05:15.467981Z |
+
+All six carry `verdict = false_positive` and `model_used` = the configured
+production model — **not** `prefilter` — so these records were normalized,
+admitted by the level threshold, sent through the model, and persisted with
+`source_type = 'wazuh'` provenance.
+
+The two signals prove different things and are both required:
+
+- **Persisted source-specific rows** prove the Wazuh normalization, triage,
+  verdict and persistence path executed end to end during the window.
+- **Checkpoint movement** separately proves stream consumption and rotation
+  continuity, including records the level threshold correctly filtered out and
+  checkpointed without triage.
+
+Lifetime Wazuh-attributed rows in this deployment: 436.
+
 ### Follow-up observation: Wazuh archive-day rollover
 
 Wazuh names its daily `ossec-alerts-DD` archives by the manager's local calendar
 day, so a day boundary is a checkpoint transition rather than a simple offset
-advance. `TZ` is not set in the deployment environment, so the ingest container
-runs **UTC** (the Compose default) and its archive day equals the UTC day.
+advance.
+
+The ingest container's timezone was checked directly during evidence collection
+rather than inferred:
+
+```
+$ date '+%Z %z'      # inside the running wazuh-ingest container
+UTC +0000
+```
+
+The container **reported UTC +0000**, so its archive day equals the UTC day for
+this deployment. This is an observed value, not a deduction from an unset `TZ`.
 
 | Observation (UTC) | Wazuh checkpoint |
 | --- | --- |
@@ -155,9 +200,10 @@ was raised.
 **Precision about what was observed:** the rollover *result* was observed, not
 the transition instant. The transition falls somewhere in the
 22:22:54Z–01:46:24Z gap, which is consistent with the UTC day boundary at
-2026-08-09T00:00:00Z. This is single-deployment evidence that the day-rotation
-path works in a UTC deployment; it is **not** evidence for a non-UTC manager
-timezone, where the boundary shifts and `TZ` must match the Wazuh manager.
+2026-08-09T00:00:00Z given the container's reported timezone. This is
+single-deployment evidence that the day-rotation path works in a UTC
+deployment; it is **not** evidence for a non-UTC manager timezone, where the
+boundary shifts and `TZ` must be set to match the Wazuh manager.
 
 **Log-noise caution for future reviewers:** a case-insensitive `error` grep over
 ingest logs returns thousands of matches that are *not* errors — the Suricata
@@ -199,7 +245,7 @@ project. The live database was never downgraded, restored over, or written to.
 | Provenance sha256 | `5049fcbe1e9e84baf32b1071822584062e079d795836f84c2f3366318f86cdf4` |
 | Manifest sha256 | `8ae0c0434e632b83b5a84bcc30adeb58e7df878d866981875667a0d3146ed4f2` |
 | Manifest hash field | `sha256:8a1c55e13d008dd502613f6e1…` |
-| Integrity | `integrity_check: "ok"`, verified 2026-08-08T22:19:23Z, exit 0 |
+| Integrity | `integrity_check: "ok"`, exit 0; manifest `verified_at` 2026-08-08T22:19:23.467400Z |
 | Readability | opens read-only as valid SQLite; 11,043,136 `triage_events` rows |
 
 The recomputed file hash matches the manifest hash exactly.
@@ -233,7 +279,17 @@ sequence is recorded here in full:
 | Backup copy completed, exit 0, 0 backup restarts (~17 min) | 20:39:43Z |
 | Integrity verification started, **writers still stopped** | 20:39:43Z |
 | Writers restarted — **verification still running** | 21:15:12Z |
-| Verification completed, exit 0, `integrity_check: "ok"` | 22:19:41Z |
+| Verification completed, exit 0, `integrity_check: "ok"` (shell-observed exit) | 22:19:41Z |
+
+The two verification timestamps in this document measure different events and
+are both correct:
+
+- **22:19:23.467400Z** — the `verified_at` value **recorded by `verify-backup`
+  inside the manifest** when it wrote the integrity result.
+- **22:19:41Z** — the **shell-observed exit**, logged by the wrapper script
+  immediately after the `docker compose run` invocation returned.
+
+The ~18 s difference is the manifest write plus container exit and teardown.
 
 **Total writer-stop: 53 m 08 s.** The copy finished after roughly 17 minutes;
 verification then continued inside the freeze for a further ~35 minutes and was
@@ -326,20 +382,26 @@ rollback, Core-only, and Core-plus-Wazuh evidence. All five are **PASS** and
 recorded above, alongside a passing calibrated gold-set gate verified against the
 real private inventory.
 
-**Not required for v0.3:** multi-source Garak coverage. The current
-documentation places it as separate, tracked work — `docs/gold-set-gate.md`
-states the full-pipeline Garak injection gate "remains an open roadmap item and
-is tracked separately", the Garak injection gate itself sits under v0.2.1
-retained hardening, and the only "before tagging v0.3" language attaches to the
-release-evidence item, which does not include Garak.
+**Not required for v0.3: Garak — explicit maintainer scope decision.**
 
-**Maintainer decision required.** The bullet *"Extend Garak coverage across the
-multi-source pipeline"* is currently listed inside the v0.3 **Closeout** section,
-whose preamble says the release stays in closeout until its gates are complete.
-That placement contradicts the three signals above. This change relabels the item
-as explicitly post-v0.3 and non-blocking. If the maintainer instead intends Garak
-to gate v0.3, then **v0.3 is blocked** and this document should be read as
-recording five of six scenarios complete rather than a release recommendation.
+Garak does not block v0.3. **Both** the initial full-pipeline Garak injection
+gate and its multi-source extension are post-v0.3 work, and **v0.3 makes no
+Garak or adversarial-probe claim of any kind.** Scenario 6 above stands as
+`NOT IMPLEMENTED / NOT RUN`.
+
+This is a deliberate scope decision recorded by the maintainer, not an
+unresolved ambiguity and not an accidental waiver of a check that was attempted
+and skipped. It resolves a genuine conflict in the previous documentation: the
+full-pipeline Garak gate was listed under v0.2.1 as due "before releases", while
+`docs/gold-set-gate.md` described it as separately tracked roadmap work and the
+only "before tagging v0.3" language attached to the release-evidence item, which
+does not mention Garak. Both Garak items now sit in a single post-v0.3 section
+in the roadmap, and the v0.2.1 entry no longer asserts a v0.3 prerequisite.
+
+Once implemented, the gate should run periodically **and before applicable
+future releases** — especially any release changing the model, prompts, field
+isolation, or source projections. The concrete implementation requirements are
+retained in the roadmap.
 
 Outstanding non-blocking observations:
 
