@@ -19,11 +19,11 @@ Compose project, port, and data directory.
 
 | # | Scenario | Status |
 | --- | --- | --- |
-| 1 | Upgrade deployment | **PASS** (scope limited — see notes) |
+| 1 | Upgrade deployment | **PASS** — released `v0.2` → v0.3 candidate |
 | 2 | Core-only operation | **PASS** (functional) |
 | 3 | Core + Wazuh operation | **PASS** |
 | 4 | Fresh installation | **PASS** |
-| 5 | Rollback | **PASS** |
+| 5 | Rollback | **PASS** — target is released `v0.2`; backup-restore is the authoritative path |
 | 6 | Multi-source Garak / adversarial coverage | **NOT IMPLEMENTED / NOT RUN** |
 
 Scenarios 2, 4 and 5 share one isolated Compose project but are assessed
@@ -63,28 +63,79 @@ fingerprint `5275d437…`, inventory count 2 / `3dd46482…`, dataset revision
 prefilter-resolved, 0 invalid output, 0 transport or unexpected errors,
 pipeline κ 0.9317.
 
-## Scenario 1 — Upgrade deployment (PASS, scope limited)
+## Scenario 1 — Upgrade from the supported prior release (PASS)
+
+**Primary evidence: released `v0.2` → v0.3 candidate**, across the real release
+boundary, with a v0.2-origin database and v0.2-compatible configuration.
 
 | Field | Value |
 | --- | --- |
-| Setup | Live deployment, Core+Wazuh profile |
-| Commit | `89e24fb…` → `9b95bf00…` |
-| Start / End | 2026-08-08T21:41:52Z / 21:47:37Z |
-| Commands | `git fetch origin`; `git merge --ff-only origin/main`; `docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh up -d --build` |
-| Exit codes | merge 0, compose up 0 |
-| Migration | `migrate` **Exited (0)** |
-| Health | `/api/health` 200, `/api/v1/health` 200, `status: ok` |
-| Restarts | 0 across dashboard, ingest, wazuh-ingest |
-| Deployed SHA | verified equal to public `main` |
+| From | annotated tag `v0.2`, peeled `2ec506c9689b66de52141720ecec9f56131f55b0` |
+| To | `9b95bf007440ab2297d0dae272c57a9d6f02e4ba` |
+| Setup | Isolated Compose project, dedicated port, per-phase data and EVE dirs, generated test config |
+| Start / End | 2026-08-09T03:44:55Z / 03:48:42Z |
+| Migration | `migrate` **Exited (0)**, "completed in **0.7s**" |
+| Services | `migrate` 0, `ingest` running (**0 restarts**), `dashboard`, `wazuh-ingest` up |
+| Health | `/api/v1/health` **200 `ok`**, `/api/health` **200** |
 
-Untracked operator files in the deployment checkout were byte-for-byte preserved
-across the upgrade.
+**v0.2 starting state** (built and run from the authentic tag; v0.2 created the
+database itself from `schema.sql`):
 
-**Limitation:** this range contains no schema, migration, ingest, or dashboard
-code change. It therefore exercises the *deployment mechanism* — fast-forward,
-rebuild, serialized migration phase, service restart, health — and is **not**
-evidence that a schema-changing upgrade migrates correctly. A future release with
-migration content needs its own upgrade evidence.
+- schema before upgrade: tables `sqlite_sequence`, `triage_events` only;
+  `triage_events` = **25 columns**
+- one seeded alert via a globally prefiltered SID → 1 row,
+  `verdict=false_positive`, `model_used=prefilter` (**no model call**)
+- v0.2's own contract verified: `GET /api/health` → **200
+  `{"last_alert_age_seconds":35,"status":"ok"}`** (no `Host` header; v0.2 has no
+  TrustedHost middleware). v0.2's dashboard image built and served correctly
+  despite its unpinned dependencies.
+
+**Migration outcome — data preserved, schema advanced:**
+
+| Check | Result |
+| --- | --- |
+| v0.2-origin row preserved | yes (1 `model_used=prefilter` row) |
+| Row count | 1 → 3 (never decreased) |
+| `triage_events` columns | 25 → **27**; `src_asset_snapshot_id`, `dest_asset_snapshot_id` present |
+| New tables | `ingest_failures`, `asset_snapshots`, `sensor_event_context` present (+ SPC tables) |
+| New indexes | `idx_triage_src_asset_snapshot`, `idx_triage_dest_asset_snapshot` present |
+| `PRAGMA integrity_check` | `ok` |
+
+**Post-upgrade function:** a second Suricata fixture advanced the checkpoint
+302 → **604** (inode unchanged) and persisted; a qualifying Wazuh fixture
+(`rule.level = 8`) produced `Wazuh batch scanned=1 triaged=1` and a row with
+`sensor_event_context.source_type='wazuh'` (**one real model call**). Restart:
+checkpoint unchanged at 604, rows still 3, **0 restarts, no duplicate ingestion**.
+
+### Configuration migration required (names only)
+
+| Change | Names |
+| --- | --- |
+| Added | `HOST_ASSET_INVENTORY`, `HOST_BACKUP_DIR`, `TRUSTED_HOSTS` |
+| Added (Wazuh profile) | `WAZUH_LOGS_VOLUME`, `WAZUH_LOGS_GID`, `WAZUH_POSITION_PATH`, `WAZUH_SOURCE_ID`, `WAZUH_MIN_LEVEL`, `WAZUH_START_MODE`, `WAZUH_POLL_INTERVAL` |
+| Topology | new one-shot `migrate` service; new `maintenance` profile |
+| Default changed | `MODE` default `local` → empty |
+
+No v0.3 variable is mandatory — all carry Compose defaults.
+
+### Supplementary: maintainer-host redeployment (not the release boundary)
+
+The earlier live `89e24fb… → 9b95bf00…` run is retained **only** as supplementary
+evidence that the deployment/rebuild mechanism works on the maintainer host:
+2026-08-08T21:41:52Z → 21:47:37Z, merge 0, compose up 0, `migrate` Exited (0),
+both health endpoints 200, 0 restarts, untracked operator files preserved. That
+range changes only documentation, gold-set evidence and its validation script, so
+it is **not** a release-boundary upgrade and is not the Scenario 1 pass.
+
+### Limitations
+
+- Isolated environment, not the live deployment; sanitized public fixtures only.
+- v0.2 starting topology is Core-only, because Wazuh support is introduced by v0.3.
+- Wazuh input came from an isolated Docker volume selected through the shipped
+  `WAZUH_LOGS_VOLUME` variable — a **test-harness deviation** from the live
+  manager's volume. No Compose file was modified to achieve it.
+- v0.2's dashboard dependencies are unpinned, so its image resolves to current
+  FastAPI/uvicorn. It worked here; that is not a guarantee for future rebuilds.
 
 ## Scenario 2 — Core-only operation (PASS, functional)
 
@@ -250,21 +301,97 @@ project. The live database was never downgraded, restored over, or written to.
 
 The recomputed file hash matches the manifest hash exactly.
 
-### Rollback sequence (isolated, against the restored copy)
+### Rollback target: released `v0.2` (`2ec506c9…`)
 
-| Step | Commit | Start / End | migrate | Rows | Health |
-| --- | --- | --- | --- | --- | --- |
-| Current `main` on restored data | `9b95bf00…` | 23:24:50Z / 23:28:48Z | Exited (0) | 11,043,136 | 503 `stale` |
-| **Roll back to prior version** | `89e24fb…` | 00:33:04Z / 00:39:35Z | Exited (0) | 11,043,136 | 503 `stale` |
-| **Return to current `main`** | `9b95bf00…` | 00:41:07Z / 00:44:09Z | Exited (0) | 11,043,136 | 503 `stale` |
+Rollback is evidenced against the **supported prior release**, not a
+runtime-equivalent development commit. Two paths were tested on **separate
+database copies**, after immutable snapshots of both the pre-upgrade v0.2 state
+and the pristine v0.3-migrated state were taken and verified read-only.
 
-All three `docker compose up -d --build` invocations exited 0. Row counts were
-identical at every step. 503 `stale` is expected: the isolated stack has no live
-alert stream, and the newest restored alert predates the check.
+#### A. Direct downgrade — v0.2 on the v0.3-migrated database (**works**)
 
-Demonstrated: a backup exists and is readable; its integrity is verified; the
-procedure is recoverable; the prior version starts against restored data; and
-returning to current `main` succeeds.
+| Check | Result |
+| --- | --- |
+| v0.2 starts | yes — `ingest` + `dashboard` up, **0 restarts** |
+| v0.2 health (`/api/health`) | **200 `{"status":"ok"}`** |
+| Original v0.2 row readable | yes |
+| v0.3-origin rows readable | yes — v0.2's legacy `/api/verdicts` returned all 3 rows, including the Wazuh-origin row |
+| Schema/config incompatibility | none observed; v0.3's additions are additive |
+| `PRAGMA integrity_check` | `ok` |
+
+**v0.2 write test** (fixture #3 through the authentic v0.2 ingest path): the
+insert **succeeded** — checkpoint 604 → **906**, rows 3 → **4**.
+`sensor_event_context` stayed at 2, so the row v0.2 wrote has **no provenance
+entry**: v0.2 cannot populate a table it does not know about. Two of four rows
+therefore lack provenance (the v0.2 seed row and the v0.2-written row).
+
+**Ambiguous legacy display, recorded not resolved:** v0.2 has no source concept,
+so the Wazuh-origin alert is listed as an ordinary alert, indistinguishable from
+a Suricata one. v0.2 is not required to understand Wazuh provenance; it ignored
+the provenance table safely rather than failing.
+
+#### B. Backup-restore rollback — the authoritative safe path (**PASS**)
+
+Restored the exact pre-upgrade v0.2 set (database **+ checkpoint + matching
+`eve.json`**) from its immutable snapshot and ran the released `v0.2` tag:
+
+| Check | Result |
+| --- | --- |
+| Restored contents | 1 row; tables `sqlite_sequence`, `triage_events` only |
+| Integrity | `ok` |
+| v0.2 services | started, **0 restarts** |
+| Data after start | still 1 row — **no duplication** |
+| Health | 503 `stale`, well-formed (restored data ≈10.6 h old — correct behaviour) |
+
+**Checkpoint recovery detail:** a restore necessarily produces a **new inode**
+for `eve.json` (57805483 → 57805538). v0.2 adopted the new inode, kept
+`offset=302`, and logged `Read 1 new lines, triaged 0 alerts` — it re-read the
+file but `is_duplicate` suppressed the row. The protection here came from
+duplicate detection, **not** from the checkpoint; with later events in the file
+those would have been replayed.
+
+#### Cross-version finding: restore changes file identity
+
+v0.3's fail-closed rotation recovery treats that same inode change as
+unprovable continuity and **refuses to continue**:
+
+```
+Suricata ingest stopped to prevent an alert gap: the eve.json checkpoint
+points at inode 57805483 (offset 906) but no regular file with that inode
+remains in /var/log/suricata
+```
+
+Reproduced twice (once on a restored upgrade copy, once on a restored return
+copy): `migrate` exits 0, dashboard and `wazuh-ingest` run, but Suricata
+`ingest` exits 1 and `restart: unless-stopped` restart-loops. **This is correct
+by design** — v0.3 refuses to skip possibly-unread alerts — but it is
+operationally significant: **restoring a database/checkpoint backup next to a
+copied `eve.json` requires an operator decision before v0.3 Suricata ingest will
+resume.** v0.2 is lenient where v0.3 fails closed. When file identity is
+preserved (same-host code switch), v0.3 resumes with 0 restarts and no rewind.
+
+#### C. Return to v0.3 after rollback
+
+Run on a copy of the **write-tested** database (the one v0.2 had written to), so
+the return path is evaluated with an older-release row present. The pristine
+v0.3-migrated snapshot was retained untouched for comparison.
+
+| Check | Result |
+| --- | --- |
+| Migration | `migrate` **Exited (0)** ("completed in 0.0s" — already migrated) |
+| Services | all up; `ingest` **0 restarts** (file identity preserved) |
+| Rows | **4 preserved**; checkpoint 906 unchanged — no rewind, no duplicate |
+| Integrity | `ok` |
+| Context-less row written by v0.2 | **not backfilled** by v0.3, and **not repaired by hand** |
+| API | `/api/v1/verdicts` returned **all 4 rows**, including the 2 without provenance |
+| Health | 503 `stale` — correct; the isolated stack has no live alert stream |
+
+v0.3 therefore serves rows written by the older release without error and without
+inventing provenance for them.
+
+Demonstrated overall: a verified backup exists and is readable; the procedure is
+recoverable; the **released prior version** starts against restored data; and
+returning to the v0.3 candidate succeeds.
 
 ### Deviation: writer-stop overran and was converted mid-run
 
@@ -409,5 +536,10 @@ Outstanding non-blocking observations:
   verification, stopping live ingest for 53 m 08 s. No data was lost and the
   checkpoint resumed without rewind, but the maintenance-window guidance needs
   to account for verification cost explicitly (see Scenario 5).
-- The upgrade evidence covers the deployment mechanism only, because this commit
-  range carries no migration content (see Scenario 1).
+- **Restoring a backup changes `eve.json`'s file identity, and v0.3 fails closed
+  on that.** Restore procedures should state explicitly that the Suricata
+  checkpoint and the `eve.json` it refers to must be restored as a matching pair,
+  or that an operator must record the gap before ingest will resume. v0.2 was
+  lenient here; v0.3 is not (see Scenario 5, cross-version finding).
+- Two of the four rows in the lifecycle database carry no source provenance
+  (written by v0.2). v0.3 serves them correctly and does not backfill them.

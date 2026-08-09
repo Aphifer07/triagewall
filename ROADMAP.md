@@ -122,7 +122,10 @@ probing is explicitly out of v0.3 scope; see
   recorded in [docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md),
   collected on the maintainer host against commit `9b95bf00`, together with a
   passing calibrated gold-set gate verified against the real private asset
-  inventory.
+  inventory. Upgrade and rollback are evidenced across the real release
+  boundary — released `v0.2` (`2ec506c9`) → v0.3 candidate and back — using a
+  v0.2-origin database, not a transition between runtime-equivalent v0.3
+  development commits.
 - [x] **Gold-set change-validation implementation.** Fingerprint production
   behavior deterministically, evaluate the real pipeline against human labels,
   validate evidence integrity, and compare both pipeline and model-only metrics.

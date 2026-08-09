@@ -52,7 +52,9 @@ inventory.
 
 All five required release-evidence scenarios — fresh install, upgrade,
 rollback, Core-only, and Core-plus-Wazuh — are recorded in
-[docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md). Garak
+[docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md), with upgrade and
+rollback exercised across the real release boundary from the released `v0.2` tag
+and back. Garak
 adversarial probing remains **unimplemented** and is explicitly post-v0.3 work;
 v0.3 makes no Garak or adversarial-probe claim. What remains before tagging is
 ordinary review, merge, and release mechanics rather than additional runtime
