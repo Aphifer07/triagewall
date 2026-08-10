@@ -26,6 +26,7 @@ let timelineCache = { at: 0, data: [] };
 let toastTimer = null;
 let currentView = "triage";
 let activeDetail = null;
+let activeInvestigation = null;
 
 function formatHourLabel(isoHour) {
   const date = new Date(isoHour);
@@ -108,6 +109,24 @@ function initializeFilterState() {
   document.getElementById("sourceFilter").value = currentFilter.source;
   document.getElementById("reviewFilter").value = currentFilter.review;
   document.getElementById("unreviewedQuickFilter").classList.toggle("active", currentFilter.review === "unreviewed");
+}
+
+// The queue filters travel with the analyst. Detail URLs, previous/next and
+// the back link all carry them, so opening an alert and returning restores the
+// view instead of resetting the queue.
+function queueQueryString() {
+  const params = new URLSearchParams();
+  for (const key of FILTER_KEYS) {
+    if (currentFilter[key]) params.set(key, currentFilter[key]);
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function syncQueueLinks() {
+  document.querySelectorAll(".detail-back").forEach((link) => {
+    link.setAttribute("href", `/triage${queueQueryString()}`);
+  });
 }
 
 function syncUrlState(eventId = null) {
@@ -459,6 +478,174 @@ function prettyRawAlert(rawAlert) {
   }
 }
 
+function parseRawAlert(rawAlert) {
+  if (!rawAlert) return null;
+  try {
+    const parsed = JSON.parse(rawAlert);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+// Reads one scalar out of the stored sensor record. Objects and arrays are
+// rejected so a nested structure can never be stringified into a field that
+// claims to be a single recorded value.
+function readRawScalar(source, path) {
+  let value = source;
+  for (const key of path) {
+    if (value === null || typeof value !== "object") return null;
+    value = value[key];
+  }
+  if (value === null || value === undefined || typeof value === "object") return null;
+  return value;
+}
+
+function readRawList(source, path, maximum = 8) {
+  let value = source;
+  for (const key of path) {
+    if (value === null || typeof value !== "object") return null;
+    value = value[key];
+  }
+  if (!Array.isArray(value)) return null;
+  const items = value.filter((item) => item !== null && typeof item !== "object");
+  if (!items.length) return null;
+  const shown = items.slice(0, maximum).join(", ");
+  return items.length > maximum ? `${shown} (+${items.length - maximum} more)` : shown;
+}
+
+// Distinct from detailField: an absent derived value is stated as unrecorded
+// rather than shown as an em dash, so the page never implies a blank means the
+// sensor reported nothing.
+function derivedField(label, value) {
+  const missing = value === null || value === undefined || value === "";
+  return `<div><dt>${escapeHtml(label)}</dt><dd${missing ? ' class="derived-missing"' : ""}>${escapeHtml(missing ? "Not recorded" : value)}</dd></div>`;
+}
+
+// Wazuh manager/location/decoder/groups and the Suricata flow envelope are not
+// columns; they exist only inside the retained sensor record. They are read
+// from the record this response already returned, so demo mode and IP
+// redaction — which withhold raw_alert — degrade to "not available" instead of
+// disclosing anything the verdict row would not.
+function renderSourceContext(verdict, sensor) {
+  const title = sensor === "wazuh" ? "Wazuh rule context" : "Suricata flow context";
+  const raw = parseRawAlert(verdict.raw_alert);
+  if (!raw) {
+    return `
+      <section class="detail-section">
+        <h3>${escapeHtml(title)}</h3>
+        <p class="detail-empty">Not available. This response does not include the original sensor record, so these fields cannot be derived.</p>
+      </section>`;
+  }
+  const fields = sensor === "wazuh"
+    ? [
+      ["Rule ID", readRawScalar(raw, ["rule", "id"])],
+      ["Rule level", readRawScalar(raw, ["rule", "level"])],
+      ["Rule groups", readRawList(raw, ["rule", "groups"])],
+      ["Agent ID", verdict.sensor_context?.agent?.id ?? readRawScalar(raw, ["agent", "id"])],
+      ["Agent name", verdict.sensor_context?.agent?.name ?? readRawScalar(raw, ["agent", "name"])],
+      ["Manager", readRawScalar(raw, ["manager", "name"])],
+      ["Location", readRawScalar(raw, ["location"])],
+      ["Decoder", readRawScalar(raw, ["decoder", "name"])],
+      ["Parent decoder", readRawScalar(raw, ["decoder", "parent"])],
+    ]
+    : [
+      ["Flow ID", readRawScalar(raw, ["flow_id"])],
+      ["Interface", readRawScalar(raw, ["in_iface"])],
+      ["Packet source", readRawScalar(raw, ["pkt_src"])],
+      ["Application protocol", readRawScalar(raw, ["app_proto"])],
+      ["Rule action", readRawScalar(raw, ["alert", "action"])],
+      ["Rule revision", readRawScalar(raw, ["alert", "rev"])],
+      ["Rule GID", readRawScalar(raw, ["alert", "gid"])],
+    ];
+  return `
+    <section class="detail-section">
+      <h3>${escapeHtml(title)}</h3>
+      <dl class="detail-grid detail-facts">${fields.map(([label, value]) => derivedField(label, value)).join("")}</dl>
+    </section>`;
+}
+
+function relatedScopeNote(group, windowHours) {
+  if (group.exact) {
+    return `Exact match across the last ${windowHours}h.`;
+  }
+  const examined = formatCompact(group.candidates_examined ?? 0);
+  if (group.truncated) {
+    return `Partial: only the ${examined} newest events in the last ${windowHours}h were examined, so older matches in this window are not shown.`;
+  }
+  return `Matched across ${examined} events in the last ${windowHours}h.`;
+}
+
+function renderRelatedAlert(alert) {
+  const verdictLabel = String(alert.verdict ?? "unknown").replace("_", " ");
+  const endpoints = `${alert.src_ip ?? "—"} → ${alert.dest_ip ?? "—"}`;
+  return `
+    <a class="related-row" href="/triage/${Number(alert.id)}${queueQueryString()}" data-related-id="${Number(alert.id)}">
+      <span class="badge badge-${escapeHtml(alert.verdict)}">${escapeHtml(verdictLabel)}</span>
+      <span class="related-signature">${escapeHtml(alert.signature ?? "Unnamed alert")}</span>
+      <span class="related-endpoint">${escapeHtml(endpoints)}</span>
+      <time class="related-time">${escapeHtml(formatTimestamp(alert.processed_at))}</time>
+    </a>`;
+}
+
+function renderRecurrence(data) {
+  const host = document.getElementById("recurrencePanel");
+  if (!host) return;
+  const recurrence = data?.recurrence;
+  if (!recurrence?.available) {
+    host.innerHTML = `
+      <h3>Recurrence</h3>
+      <p class="detail-empty">Not recorded. This event carries no signature identifier, so it has no recurrence group.</p>`;
+    return;
+  }
+  const ruleLabel = recurrence.source_type === "wazuh" ? "rule" : "signature";
+  host.innerHTML = `
+    <h3>Recurrence</h3>
+    <p class="recurrence-headline"><strong>${escapeHtml(formatCompact(recurrence.occurrences))}</strong> in the last ${escapeHtml(data.window_hours)}h</p>
+    <p class="recurrence-basis">Grouped by source type and ${escapeHtml(ruleLabel)} ID (${escapeHtml(recurrence.source_type ?? "unknown")} · ${escapeHtml(recurrence.signature_id)}). Suricata and Wazuh identifiers are counted separately.</p>
+    <dl class="detail-grid recurrence-stats">
+      ${detailField("First in window", formatTimestamp(recurrence.first_seen))}
+      ${detailField("Latest in window", formatTimestamp(recurrence.last_seen))}
+      ${detailField("Real", formatCompact(recurrence.real_count))}
+      ${detailField("False positive", formatCompact(recurrence.false_positive_count))}
+      ${detailField("Uncertain", formatCompact(recurrence.uncertain_count))}
+      ${detailField("Unclassified", formatCompact(recurrence.unclassified_count))}
+    </dl>`;
+}
+
+function renderRelated(data) {
+  const host = document.getElementById("relatedPanel");
+  if (!host) return;
+  const groups = Array.isArray(data?.related) ? data.related : [];
+  host.innerHTML = `
+    <h3>Related activity</h3>
+    ${groups.map((group) => `
+      <div class="related-group">
+        <div class="related-group-head">
+          <strong>${escapeHtml(group.label)}</strong>
+          <span class="related-count">${escapeHtml(formatCompact(group.alerts?.length ?? 0))} shown</span>
+        </div>
+        <p class="related-reason">${escapeHtml(group.reason)}</p>
+        <p class="related-scope${group.truncated ? " related-scope-partial" : ""}">${escapeHtml(relatedScopeNote(group, data.window_hours))}</p>
+        ${group.alerts?.length
+          ? `<div class="related-list">${group.alerts.map(renderRelatedAlert).join("")}</div>`
+          : '<p class="detail-empty">No other alerts matched in this window.</p>'}
+      </div>`).join("")}`;
+}
+
+function renderInvestigation(data) {
+  renderRecurrence(data);
+  renderRelated(data);
+}
+
+function renderInvestigationUnavailable() {
+  const message = '<p class="detail-empty">Related activity is temporarily unavailable.</p>';
+  const recurrenceHost = document.getElementById("recurrencePanel");
+  const relatedHost = document.getElementById("relatedPanel");
+  if (recurrenceHost) recurrenceHost.innerHTML = `<h3>Recurrence</h3>${message}`;
+  if (relatedHost) relatedHost.innerHTML = `<h3>Related activity</h3>${message}`;
+}
+
 function renderDetail(verdict) {
   activeDetail = verdict;
   const sensor = verdict.sensor_context?.source ?? "suricata";
@@ -530,6 +717,13 @@ function renderDetail(verdict) {
           </dl>
         </section>
 
+        ${renderSourceContext(verdict, sensor)}
+
+        <section class="detail-section" id="relatedPanel">
+          <h3>Related activity</h3>
+          <p class="detail-empty">Loading related activity…</p>
+        </section>
+
         <section class="detail-section raw-section">
           <div class="raw-head">
             <div><h3>Original sensor record</h3><p>Stored source evidence. The exact protected model projection is not persisted.</p></div>
@@ -545,6 +739,11 @@ function renderDetail(verdict) {
           <div class="verdict-score"><strong class="verdict-color-${escapeHtml(verdict.verdict)}">${escapeHtml(String(verdict.verdict ?? "unknown").replace("_", " "))}</strong><span>confidence ${(confidence / 100).toFixed(2)}</span></div>
           <div class="confidence-track"><span style="width:${confidence}%"></span></div>
           <p class="model-meta">${escapeHtml(shortModelName(verdict.model_used))}</p>
+        </section>
+
+        <section class="analysis-section" id="recurrencePanel">
+          <h3>Recurrence</h3>
+          <p class="detail-empty">Loading recurrence…</p>
         </section>
 
         <section class="analysis-section">
@@ -563,23 +762,46 @@ function renderDetail(verdict) {
     </div>`;
 
   document.title = `${verdict.signature ?? "Alert detail"} — Triagewall`;
-  renderDetailNavigation(verdict.id);
+  renderDetailNavigation(null);
 }
 
-function renderDetailNavigation(eventId) {
-  const index = currentVerdicts.findIndex((item) => Number(item.id) === Number(eventId));
-  const previous = index > 0 ? currentVerdicts[index - 1] : null;
-  const next = index >= 0 && index < currentVerdicts.length - 1 ? currentVerdicts[index + 1] : null;
+// Neighbours come from the server against the active queue filters, so they
+// stay correct on a deep link or refresh, where no queue page has been loaded.
+function renderDetailNavigation(neighbors) {
+  const previous = neighbors?.previous ?? null;
+  const next = neighbors?.next ?? null;
   const previousButton = document.getElementById("previousAlertButton");
   const nextButton = document.getElementById("nextAlertButton");
   previousButton.disabled = !previous;
   nextButton.disabled = !next;
   previousButton.dataset.eventId = previous?.id ?? "";
   nextButton.dataset.eventId = next?.id ?? "";
+  previousButton.title = previous?.signature ? `Previous: ${previous.signature}` : "";
+  nextButton.title = next?.signature ? `Next: ${next.signature}` : "";
+}
+
+async function loadInvestigation(eventId) {
+  const params = new URLSearchParams();
+  for (const key of FILTER_KEYS) {
+    if (currentFilter[key]) params.set(key, currentFilter[key]);
+  }
+  try {
+    const response = await fetch(`${API}/api/v1/verdicts/${eventId}/investigation?${params}`);
+    if (!response.ok) throw new Error(`Investigation request failed (${response.status})`);
+    const data = await response.json();
+    activeInvestigation = data;
+    renderInvestigation(data);
+    renderDetailNavigation(data.neighbors);
+  } catch (_error) {
+    activeInvestigation = null;
+    renderInvestigationUnavailable();
+    renderDetailNavigation(null);
+  }
 }
 
 async function loadDetail(eventId) {
   if (!Number.isInteger(eventId) || eventId < 1) return;
+  syncQueueLinks();
   try {
     const response = await fetch(`${API}/api/v1/verdicts/${eventId}`);
     if (!response.ok) throw new Error(response.status === 404 ? "Alert not found." : `Alert request failed (${response.status})`);
@@ -588,21 +810,31 @@ async function loadDetail(eventId) {
     document.getElementById("demoBanner").classList.toggle("hidden", mode !== "demo");
     renderDetail(data.verdict);
   } catch (error) {
+    activeInvestigation = null;
     document.getElementById("detailPageContent").innerHTML = `<div class="empty-card"><div><strong>${escapeHtml(error.message)}</strong><span>Return to the queue and choose another alert.</span></div></div>`;
+    renderDetailNavigation(null);
+    return;
   }
+  await loadInvestigation(eventId);
+}
+
+function openDetailById(eventId) {
+  if (!Number.isInteger(eventId) || eventId < 1) return;
+  window.history.pushState({}, "", `/triage/${eventId}${queueQueryString()}`);
+  initializeView();
+  loadDetail(eventId);
+  window.scrollTo({ top: 0, behavior: "instant" });
 }
 
 function openDetail(verdict) {
   if (!verdict) return;
-  window.history.pushState({}, "", `/triage/${Number(verdict.id)}`);
-  initializeView();
-  loadDetail(Number(verdict.id));
-  window.scrollTo({ top: 0, behavior: "instant" });
+  openDetailById(Number(verdict.id));
 }
 
 function closeDetail() {
   activeDetail = null;
-  window.history.pushState({}, "", "/triage");
+  activeInvestigation = null;
+  window.history.pushState({}, "", `/triage${queueQueryString()}`);
   initializeView();
   load();
 }
@@ -665,6 +897,7 @@ async function returnToLive() {
 function applyFilters() {
   resetPagination();
   syncUrlState();
+  syncQueueLinks();
   load();
 }
 
@@ -765,6 +998,12 @@ document.getElementById("detailPageContent").addEventListener("click", async (ev
     await feedback(eventId, activeDetail?.verdict, feedbackButton.dataset.detailFeedback, notes);
     return;
   }
+  const relatedRow = event.target.closest("[data-related-id]");
+  if (relatedRow) {
+    event.preventDefault();
+    openDetailById(Number(relatedRow.dataset.relatedId));
+    return;
+  }
   if (event.target.closest("#copyRawButton")) {
     const rawAlert = prettyRawAlert(activeDetail?.raw_alert);
     if (!rawAlert) return;
@@ -777,11 +1016,9 @@ document.getElementById("detailPageContent").addEventListener("click", async (ev
   }
 });
 
-document.querySelectorAll(".detail-route-actions [data-event-id], #previousAlertButton, #nextAlertButton").forEach((button) => {
+document.querySelectorAll("#previousAlertButton, #nextAlertButton").forEach((button) => {
   button.addEventListener("click", () => {
-    const eventId = Number(button.dataset.eventId);
-    const verdict = currentVerdicts.find((item) => Number(item.id) === eventId);
-    if (verdict) openDetail(verdict);
+    openDetailById(Number(button.dataset.eventId));
   });
 });
 
@@ -849,6 +1086,7 @@ document.addEventListener("keydown", (event) => {
 
 initializeView();
 initializeFilterState();
+syncQueueLinks();
 setActive(".filter-btn", "verdict", currentFilter.verdict);
 setActive(".model-btn", "model", currentFilter.model);
 startIndependentPolling({ loadMain: load, loadSpc });

@@ -207,6 +207,96 @@ test("dashboard detail route escapes raw events and supports review notes", () =
   assert.match(script, /notes \}\),/);
 });
 
+function readDashboardScript() {
+  return fs.readFileSync(
+    path.join(
+      __dirname,
+      "..",
+      "triagewall",
+      "dashboard",
+      "static",
+      "dashboard.js",
+    ),
+    "utf8",
+  );
+}
+
+test("detail navigation preserves the queue query string", () => {
+  const script = readDashboardScript();
+
+  assert.match(script, /function queueQueryString\(\)/);
+  // Opening an alert, leaving it, and the back link all carry the filters.
+  assert.match(script, /`\/triage\/\$\{eventId\}\$\{queueQueryString\(\)\}`/);
+  assert.match(script, /`\/triage\$\{queueQueryString\(\)\}`/);
+  assert.match(script, /function syncQueueLinks\(\)/);
+  // The old behaviour pushed a bare path and dropped the analyst's view.
+  assert.doesNotMatch(script, /pushState\(\{\}, "", "\/triage"\)/);
+  assert.doesNotMatch(
+    script,
+    /pushState\(\{\}, "", `\/triage\/\$\{Number\(verdict\.id\)\}`\)/,
+  );
+});
+
+test("previous and next come from the server, not the loaded page", () => {
+  const script = readDashboardScript();
+
+  assert.match(
+    script,
+    /\/api\/v1\/verdicts\/\$\{eventId\}\/investigation\?\$\{params\}/,
+  );
+  assert.match(script, /function renderDetailNavigation\(neighbors\)/);
+  assert.match(script, /neighbors\?\.previous \?\? null/);
+  assert.match(script, /neighbors\?\.next \?\? null/);
+  // Deep links and refreshes have no loaded queue page to index into.
+  assert.doesNotMatch(script, /currentVerdicts\.findIndex/);
+});
+
+test("investigation panels escape sensor text and state their scope", () => {
+  const script = readDashboardScript();
+
+  assert.match(script, /function renderRecurrence\(data\)/);
+  assert.match(script, /function renderRelated\(data\)/);
+  assert.match(script, /id="relatedPanel"/);
+  assert.match(script, /id="recurrencePanel"/);
+  // Sensor-controlled strings are escaped everywhere they are rendered.
+  assert.match(
+    script,
+    /<span class="related-signature">\$\{escapeHtml\(alert\.signature \?\? "Unnamed alert"\)\}<\/span>/,
+  );
+  assert.match(script, /\$\{escapeHtml\(group\.reason\)\}/);
+  assert.match(
+    script,
+    /\$\{escapeHtml\(relatedScopeNote\(group, data\.window_hours\)\)\}/,
+  );
+  // Every group says why it is related, and a bounded scan admits it is partial.
+  assert.match(script, /function relatedScopeNote\(group, windowHours\)/);
+  assert.match(script, /related-scope-partial/);
+  assert.match(script, /so older matches in this window are not shown/);
+  // Recurrence is namespaced by source type, not by signature id alone.
+  assert.match(script, /Suricata and Wazuh identifiers are counted separately/);
+});
+
+test("source-specific context is derived only from the retained record", () => {
+  const script = readDashboardScript();
+
+  assert.match(script, /function renderSourceContext\(verdict, sensor\)/);
+  assert.match(
+    script,
+    /sensor === "wazuh" \? "Wazuh rule context" : "Suricata flow context"/,
+  );
+  // Wazuh-only fields never appear under Suricata labels and vice versa.
+  assert.match(script, /readRawScalar\(raw, \["manager", "name"\]\)/);
+  assert.match(script, /readRawScalar\(raw, \["location"\]\)/);
+  assert.match(script, /readRawScalar\(raw, \["decoder", "name"\]\)/);
+  assert.match(script, /readRawList\(raw, \["rule", "groups"\]\)/);
+  assert.match(script, /readRawScalar\(raw, \["in_iface"\]\)/);
+  assert.match(script, /readRawScalar\(raw, \["pkt_src"\]\)/);
+  // Absent values are stated, not blanked, and nested objects are rejected.
+  assert.match(script, /function derivedField\(label, value\)/);
+  assert.match(script, /"Not recorded"/);
+  assert.match(script, /typeof value === "object"\) return null;/);
+});
+
 test("overview uses a truthful policy-to-model decision band", () => {
   const staticDir = path.join(
     __dirname,

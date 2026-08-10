@@ -156,6 +156,69 @@ curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
   http://127.0.0.1:8084/api/v1/verdicts/1
 ```
 
+### `GET /api/v1/verdicts/{event_id}/investigation`
+
+Bounded recurrence, related activity, and queue-aware neighbours for one alert.
+Additive: it does not change `/api/v1/verdicts` or
+`/api/v1/verdicts/{event_id}`.
+
+| Param | Type | Bound |
+|-------|------|-------|
+| `hours` | integer | 1–24, default 24 |
+| `verdict` | enum | `real` \| `false_positive` \| `uncertain` |
+| `model` | enum | `llm` \| `prefilter` |
+| `source` | enum | `suricata` \| `wazuh` |
+| `review` | enum | `unreviewed` \| `agreed` \| `corrected` |
+| `signature` | string | ≤ 200 characters (substring match) |
+
+The filter parameters are the ones `/api/v1/verdicts` accepts, and they apply
+only to `neighbors`, so previous/next stay inside the queue the analyst was
+working from. An unknown event id returns **404**; unrecognized filter values
+and an out-of-bound `hours` return **422**.
+
+Response: `{generated_at, mode, event_id, window_hours, window_start,
+recurrence, related, neighbors}`.
+
+**`recurrence`** counts events sharing this alert's `(source type, signature
+id)` inside the window. The source qualifier is load-bearing: Suricata stores
+its SID in `signature_id` while Wazuh stores `rule.id` there, so an unqualified
+group would merge two unrelated rules that happen to share an integer. Rows
+predating source provenance are counted as Suricata. A row with no
+`signature_id` has no group and reports `available: false`.
+
+**`related`** is a list of groups, each carrying `relationship`, a human
+`label`, a `reason` explaining the link, and the honest scope of the query
+behind it:
+
+| Group | `exact` | Scope |
+|-------|---------|-------|
+| `same_rule` | `true` | Indexed equality on `(source type, signature id)` across the whole window. |
+| `same_source_ip` | `false` | Exact `src_ip` equality, matched inside a bounded candidate set. |
+| `same_destination_ip` | `false` | Exact `dest_ip` equality, matched inside a bounded candidate set. |
+
+`src_ip` and `dest_ip` are not indexed, so the address groups are **not**
+complete correlation across the window. They examine at most `candidate_limit`
+(2000) of the newest events in the window, selected through the `processed_at`
+index. `candidates_examined` reports how many were read, and `truncated` is
+`true` when that budget was reached, meaning older matches inside the window
+were never examined. Each group returns at most 10 alerts.
+
+An address match is a shared-addressing observation, not a causal finding.
+
+**`neighbors`** is `{previous, next, filters}` in the queue's own order
+(`processed_at DESC NULLS LAST, id DESC`). `previous` is the newer neighbour and
+`next` the older one; either is `null` at a queue edge or when the filters
+exclude every candidate. `filters` echoes what the neighbours were resolved
+against.
+
+Addresses inside `related` follow the same disclosure policy as verdict rows:
+demo mode masks them, and API IP-redaction mode pseudonymizes them.
+
+```bash
+curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
+  'http://127.0.0.1:8084/api/v1/verdicts/1/investigation?hours=24&model=llm'
+```
+
 ### `POST /api/v1/feedback/{event_id}`
 
 Body: `{"human_verdict":"real"|"false_positive"|"uncertain","notes":""}`.

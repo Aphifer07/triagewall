@@ -2250,6 +2250,147 @@ body {
   margin: 18px 24px 20px;
 }
 
+/* Investigation context: recurrence and related activity. */
+
+.derived-missing {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.recurrence-headline {
+  margin: 0 0 6px;
+  color: var(--text);
+  font-size: 0.86rem;
+}
+
+.recurrence-headline strong {
+  color: var(--text-strong);
+  font-family: var(--mono);
+  font-size: 1.25rem;
+  letter-spacing: -0.01em;
+}
+
+.recurrence-basis {
+  margin: 0 0 13px;
+  color: var(--faint);
+  font-size: 0.66rem;
+  line-height: 1.55;
+}
+
+.recurrence-stats {
+  gap: 9px 16px;
+}
+
+.related-group {
+  margin-top: 15px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
+
+.related-group:first-of-type {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.related-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.related-group-head strong {
+  color: var(--text-strong);
+  font-size: 0.78rem;
+}
+
+.related-count {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.related-reason,
+.related-scope {
+  margin: 5px 0 0;
+  color: var(--faint);
+  font-size: 0.65rem;
+  line-height: 1.55;
+}
+
+.related-scope {
+  font-family: var(--mono);
+  font-size: 0.6rem;
+}
+
+.related-scope-partial {
+  color: var(--amber);
+}
+
+.related-list {
+  display: grid;
+  gap: 1px;
+  margin-top: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--line);
+}
+
+.related-row {
+  display: grid;
+  align-items: center;
+  gap: 12px;
+  grid-template-columns: 92px minmax(0, 1fr) minmax(0, 15rem) auto;
+  padding: 9px 12px;
+  background: var(--surface);
+  color: inherit;
+  text-decoration: none;
+}
+
+.related-row:hover,
+.related-row:focus-visible {
+  background: var(--surface-raised);
+}
+
+.related-signature {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.related-endpoint,
+.related-time {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.related-time {
+  color: var(--faint);
+  text-align: right;
+}
+
+@media (max-width: 960px) {
+  .related-row {
+    grid-template-columns: 84px minmax(0, 1fr);
+  }
+
+  .related-endpoint,
+  .related-time {
+    grid-column: 2;
+    text-align: left;
+  }
+}
+
 @media (max-width: 1120px) {
   .app-shell {
     grid-template-columns: 196px minmax(0, 1fr);

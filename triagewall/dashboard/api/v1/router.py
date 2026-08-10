@@ -15,6 +15,7 @@ from triagewall.dashboard.api.v1.models import (
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
+    InvestigationResponse,
     ModelFilter,
     ReviewFilter,
     SourceFilter,
@@ -150,6 +151,58 @@ def create_v1_router(
             request,
             payload,
             model=VerdictDetailResponse,
+            max_age=5,
+        )
+
+    @router.get(
+        "/verdicts/{event_id}/investigation",
+        response_model=InvestigationResponse,
+    )
+    def get_investigation(
+        request: Request,
+        event_id: int,
+        hours: int = Query(
+            default=services.DEFAULT_INVESTIGATION_WINDOW_HOURS,
+            ge=1,
+            le=services.MAX_INVESTIGATION_WINDOW_HOURS,
+        ),
+        verdict: VerdictFilter | None = None,
+        signature: str | None = Query(
+            default=None,
+            max_length=services.MAX_SIGNATURE_SEARCH_LENGTH,
+        ),
+        model: ModelFilter | None = None,
+        source: SourceFilter | None = None,
+        review: ReviewFilter | None = None,
+        _auth: AuthContext = Depends(require_read),
+    ):
+        """Bounded recurrence, related activity and queue-aware neighbours.
+
+        The filter parameters are the ones /verdicts accepts, so previous and
+        next stay inside the queue the analyst was working from.
+        """
+        with db_factory(readonly=True) as conn:
+            payload = services.fetch_investigation(
+                conn,
+                event_id,
+                hours=hours,
+                mode=get_mode(),
+                mask_ip_fn=mask_ip_fn,
+                redact_ips=redact_ips(),
+                ip_secret=get_ip_secret(),
+                verdict=verdict,
+                signature=signature,
+                model=model,
+                source=source,
+                review=review,
+            )
+        if payload is None:
+            raise HTTPException(status_code=404, detail="event not found")
+        payload["mode"] = get_mode()
+        return validated_json_response(
+            request,
+            payload,
+            model=InvestigationResponse,
             max_age=5,
         )
 
