@@ -2250,6 +2250,14 @@ body {
   margin: 18px 24px 20px;
 }
 
+.queue-scope-note {
+  margin: 7px 0 0;
+  max-width: 68ch;
+  color: var(--faint);
+  font-size: 0.64rem;
+  line-height: 1.55;
+}
+
 /* Investigation context: recurrence and related activity. */
 
 .derived-missing {

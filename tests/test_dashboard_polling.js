@@ -66,11 +66,12 @@ function createElement(id) {
   return element;
 }
 
-function runDashboard({ pathname, verdicts = [] }) {
+function runDashboard({ pathname, verdicts = [], defer = () => false }) {
   const elements = new Map();
   const documentListeners = new Map();
   const intervals = [];
   const pushedUrls = [];
+  const deferred = [];
 
   const document = {
     title: "",
@@ -87,26 +88,31 @@ function runDashboard({ pathname, verdicts = [] }) {
     },
   };
 
-  const json = (body) =>
-    Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+  const response = (body) => ({
+    ok: true,
+    status: 200,
+    json: () => Promise.resolve(body),
+  });
 
-  const fetchCalls = [];
-  const fetchStub = (url, options) => {
-    const target = String(url);
-    fetchCalls.push({ url: target, options });
+  // Bodies are derived from the requested id so a response can be traced back
+  // to the navigation that asked for it.
+  function bodyFor(target) {
     if (target.includes("/api/health")) {
-      return json({ status: "ok", last_alert_age_seconds: 1, storage: {} });
+      return { status: "ok", last_alert_age_seconds: 1, storage: {} };
     }
-    if (target.includes("/api/v1/stats")) return json({ mode: "local", stats: {} });
+    if (target.includes("/api/v1/stats")) return { mode: "local", stats: {} };
     if (target.includes("/api/v1/spc-anomalies")) {
-      return json({ available: false, anomalies: [] });
+      return { available: false, anomalies: [] };
     }
-    if (target.includes("/investigation")) {
-      return json({
+    if (target.includes("/api/v1/feedback/")) return { ok: true, agreed: true };
+    const investigation = target.match(/\/api\/v1\/verdicts\/(\d+)\/investigation/);
+    if (investigation) {
+      const id = Number(investigation[1]);
+      return {
         window_hours: 24,
         recurrence: {
           available: true,
-          signature_id: 1,
+          signature_id: id,
           source_type: "suricata",
           occurrences: 1,
           first_seen: null,
@@ -116,38 +122,91 @@ function runDashboard({ pathname, verdicts = [] }) {
           uncertain_count: 0,
           unclassified_count: 0,
         },
-        related: [],
-        neighbors: { previous: null, next: null },
-      });
+        related: [
+          {
+            relationship: "same_rule",
+            label: "Same rule",
+            reason: "same rule",
+            exact: true,
+            truncated: false,
+            candidate_limit: null,
+            candidates_examined: null,
+            alerts: [
+              {
+                id: id * 10,
+                timestamp: null,
+                processed_at: null,
+                signature_id: id,
+                signature: `related-of-${id}`,
+                verdict: "real",
+                confidence: 0.5,
+                src_ip: null,
+                dest_ip: null,
+                source_type: "suricata",
+                relationship: "same_rule",
+              },
+            ],
+          },
+        ],
+        neighbors: {
+          previous: { id: 1000 + id, signature: `previous-of-${id}` },
+          next: { id: 2000 + id, signature: `next-of-${id}` },
+        },
+      };
     }
-    if (/\/api\/v1\/verdicts\/\d+$/.test(target)) {
-      return json({
+    const detail = target.match(/\/api\/v1\/verdicts\/(\d+)$/);
+    if (detail) {
+      const id = Number(detail[1]);
+      return {
         mode: "local",
         verdict: {
-          id: 7,
+          id,
           verdict: "real",
-          signature: "sig",
+          signature: `signature-${id}`,
           confidence: 0.9,
           sensor_context: { source: "suricata" },
         },
+      };
+    }
+    return { mode: "local", verdicts, next_cursor: null };
+  }
+
+  const fetchCalls = [];
+  const fetchStub = (url, options) => {
+    const target = String(url);
+    fetchCalls.push({ url: target, options });
+    const body = bodyFor(target);
+    if (defer(target)) {
+      return new Promise((resolve) => {
+        deferred.push({ url: target, release: () => resolve(response(body)) });
       });
     }
-    return json({ mode: "local", verdicts, next_cursor: null });
+    return Promise.resolve(response(body));
+  };
+
+  // A real location object: pushState moves it, so the script's own
+  // "am I still on this alert?" checks are exercised rather than stubbed out.
+  const location = { pathname, search: "", href: `http://localhost${pathname}` };
+  const navigate = (url) => {
+    const [nextPath, query = ""] = String(url).split("?");
+    location.pathname = nextPath;
+    location.search = query ? `?${query}` : "";
+    location.href = `http://localhost${url}`;
   };
 
   const sandbox = {
     document,
+    AbortController,
     window: {
-      location: {
-        pathname,
-        search: "",
-        href: `http://localhost${pathname}`,
-      },
+      location,
       history: {
         pushState(_state, _title, url) {
           pushedUrls.push(url);
+          navigate(url);
         },
-        replaceState() {},
+        replaceState(_state, _title, url) {
+          if (url) navigate(url);
+        },
       },
       addEventListener() {},
       scrollTo() {},
@@ -169,8 +228,16 @@ function runDashboard({ pathname, verdicts = [] }) {
   };
   sandbox.globalThis = sandbox;
 
+  // Appended in the same lexical scope so the probe can read the script's
+  // top-level `let` bindings, which vm does not expose on the sandbox object.
+  const probe = `
+;globalThis.__probe = {
+  open: (id, options) => openDetailById(id, options),
+  state: () => ({ currentView, activeDetail, activeInvestigation }),
+};`;
+
   vm.runInNewContext(
-    fs.readFileSync(path.join(STATIC_DIR, "dashboard.js"), "utf8"),
+    fs.readFileSync(path.join(STATIC_DIR, "dashboard.js"), "utf8") + probe,
     sandbox,
     { filename: "dashboard.js" },
   );
@@ -179,6 +246,13 @@ function runDashboard({ pathname, verdicts = [] }) {
     document,
     fetchCalls,
     pushedUrls,
+    location,
+    api: sandbox.__probe,
+    deferred,
+    releaseDeferred: () => {
+      const queued = deferred.splice(0, deferred.length);
+      queued.forEach(({ release }) => release());
+    },
     tick: () => intervals.forEach((handler) => handler()),
     dispatchKey: (key, target = { tagName: "DIV" }) =>
       (documentListeners.get("keydown") ?? []).forEach((handler) =>
@@ -566,6 +640,126 @@ test("D opens the focused alert with the review note focused", async () => {
 
   assert.ok(harness.pushedUrls.some((url) => String(url).startsWith("/triage/11")));
   assert.equal(harness.document.getElementById("detailNotes").focused, true);
+});
+
+test("a superseded detail navigation cannot overwrite the current alert", async () => {
+  // Alert 7's detail and investigation responses are held open; alert 8's
+  // resolve immediately.
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [{ id: 7, verdict: "real", signature: "seven", confidence: 0.5 }],
+    defer: (url) => /\/api\/v1\/verdicts\/7(\/investigation)?(\?|$)/.test(url),
+  });
+  await harness.settle();
+
+  harness.api.open(7);
+  await harness.settle();
+  assert.ok(harness.deferred.length > 0, "alert 7 should still be in flight");
+
+  harness.api.open(8);
+  await harness.settle();
+
+  // Alert 7 answers only now, after the operator has moved to alert 8.
+  harness.releaseDeferred();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(harness.location.pathname, "/triage/8");
+  assert.equal(state.currentView, "detail");
+  assert.equal(state.activeDetail.id, 8);
+  assert.equal(state.activeInvestigation.recurrence.signature_id, 8);
+
+  const detail = harness.document.getElementById("detailPageContent").innerHTML;
+  assert.match(detail, /signature-8/);
+  assert.doesNotMatch(detail, /signature-7/);
+
+  const related = harness.document.getElementById("relatedPanel").innerHTML;
+  assert.match(related, /related-of-8/);
+  assert.doesNotMatch(related, /related-of-7/);
+  assert.doesNotMatch(related, /temporarily unavailable/);
+
+  const recurrence = harness.document.getElementById("recurrencePanel").innerHTML;
+  assert.doesNotMatch(recurrence, /temporarily unavailable/);
+
+  assert.equal(
+    harness.document.getElementById("previousAlertButton").dataset.eventId,
+    1008,
+  );
+  assert.equal(
+    harness.document.getElementById("nextAlertButton").dataset.eventId,
+    2008,
+  );
+
+  // Feedback raised from the detail page must target the alert on screen.
+  harness.document.getElementById("detailPageContent").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-detail-feedback]"
+          ? { dataset: { detailFeedback: "real" } }
+          : null,
+    },
+  });
+  await harness.settle();
+  const posted = harness.fetchCalls.filter(({ url }) => url.includes("/api/v1/feedback/"));
+  assert.equal(posted.length, 1);
+  assert.match(posted[0].url, /\/api\/v1\/feedback\/8$/);
+});
+
+test("leaving the detail view retires an in-flight request", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => /\/api\/v1\/verdicts\/7(\/investigation)?(\?|$)/.test(url),
+  });
+  await harness.settle();
+
+  harness.api.open(7);
+  await harness.settle();
+
+  harness.dispatchKey("Escape");
+  await harness.settle();
+  const writesAfterClose =
+    harness.document.getElementById("detailPageContent").innerHTMLWrites;
+
+  harness.releaseDeferred();
+  await harness.settle();
+
+  assert.equal(harness.location.pathname, "/triage");
+  assert.equal(harness.api.state().activeDetail, null);
+  assert.equal(
+    harness.document.getElementById("detailPageContent").innerHTMLWrites,
+    writesAfterClose,
+    "a retired request rendered into the detail view after navigating away",
+  );
+});
+
+test("queue badge counts declare their global 24h scope", () => {
+  const html = fs.readFileSync(path.join(STATIC_DIR, "index.html"), "utf8");
+  const script = readDashboardScript();
+
+  // The badges come from /api/v1/stats, which is a global 24h rollup, so the
+  // page must not let them read as counts of the filtered or paged rows.
+  assert.match(html, /aria-describedby="queueScopeNote"/);
+  assert.match(html, /id="queueScopeNote"/);
+  const note = html.match(
+    /id="queueScopeNote"[^>]*>([\s\S]*?)<\/p>/,
+  )?.[1];
+  assert.ok(note, "queue scope note is missing");
+  assert.match(note, /global totals/i);
+  assert.match(note, /last 24 hours/i);
+  // Must stay true when a Policy, source, or review filter is selected.
+  assert.match(note, /Policy, source, and review filters/i);
+  assert.match(note, /never change them/i);
+
+  // The sidebar badge carries the same scope for assistive technology.
+  assert.match(
+    html,
+    /id="sidebarQueueCount"[^>]*title="Unreviewed model decisions in the last 24 hours, across all filters"/,
+  );
+  assert.match(html, /<span class="sr-only">unreviewed model decisions in the last 24 hours, across all filters<\/span>/);
+
+  // The queue meta line separates the page count from the global count.
+  assert.match(script, /decisions loaded on this page/);
+  assert.match(script, /unreviewed in the last 24h, all filters/);
 });
 
 test("the queue search advertises only what it actually searches", () => {

@@ -27,6 +27,14 @@ let toastTimer = null;
 let currentView = "triage";
 let activeDetail = null;
 let activeInvestigation = null;
+// Detail and investigation are two awaits deep and race each other across
+// navigations. Every navigation takes the next generation and aborts the
+// previous one; a response may only touch the page if it still owns the
+// current generation AND the URL still points at its event. Disabling the
+// navigation buttons is not enough -- related-alert links, popstate, keyboard
+// shortcuts and a slow network all produce the same overlap.
+let detailGeneration = 0;
+let detailAbort = null;
 
 function formatHourLabel(isoHour) {
   const date = new Date(isoHour);
@@ -121,6 +129,30 @@ function queueQueryString() {
   }
   const query = params.toString();
   return query ? `?${query}` : "";
+}
+
+function detailPathEventId() {
+  const match = window.location.pathname.match(/^\/triage\/(\d+)$/);
+  return match ? Number(match[1]) : null;
+}
+
+function beginDetailNavigation() {
+  detailGeneration += 1;
+  if (detailAbort) detailAbort.abort();
+  detailAbort = typeof AbortController === "function" ? new AbortController() : null;
+  return { generation: detailGeneration, signal: detailAbort?.signal };
+}
+
+// Invalidate outstanding detail work without starting any: used when leaving
+// the detail view entirely.
+function invalidateDetailNavigation() {
+  detailGeneration += 1;
+  if (detailAbort) detailAbort.abort();
+  detailAbort = null;
+}
+
+function detailRequestIsCurrent(generation, eventId) {
+  return generation === detailGeneration && detailPathEventId() === Number(eventId);
 }
 
 function syncQueueLinks() {
@@ -398,8 +430,11 @@ function renderSpc(data) {
 
 function renderPagination() {
   const pathLabel = currentFilter.model === "llm" ? "model-reviewed" : currentFilter.model === "prefilter" ? "policy-resolved" : "matching";
-  const reviewLabel = unreviewedModelCount === 1 ? "1 needs review" : `${formatCompact(unreviewedModelCount)} need review`;
-  document.getElementById("queueMeta").textContent = `${currentVerdicts.length} ${pathLabel} decisions loaded · ${reviewLabel}`;
+  // The loaded count describes this page; the unreviewed count is a global 24h
+  // total from /stats, so it is labelled as such and never reads as a count of
+  // what is currently filtered or paged in.
+  const reviewLabel = `${formatCompact(unreviewedModelCount)} unreviewed in the last 24h, all filters`;
+  document.getElementById("queueMeta").textContent = `${currentVerdicts.length} ${pathLabel} decisions loaded on this page · ${reviewLabel}`;
   document.getElementById("paginationMeta").textContent = browsingHistory
     ? `${currentVerdicts.length} loaded · live queue refresh paused while browsing history`
     : `${currentVerdicts.length} loaded · newest first`;
@@ -785,7 +820,8 @@ function renderDetailNavigation(neighbors) {
   nextButton.title = next?.signature ? `Next: ${next.signature}` : "";
 }
 
-async function loadInvestigation(eventId) {
+async function loadInvestigation(eventId, navigation) {
+  const { generation, signal } = navigation;
   const params = new URLSearchParams();
   for (const key of FILTER_KEYS) {
     if (currentFilter[key]) params.set(key, currentFilter[key]);
@@ -793,49 +829,66 @@ async function loadInvestigation(eventId) {
   try {
     const response = await fetch(
       `${API}/api/v1/verdicts/${eventId}/investigation?${params}`,
-      { cache: "no-store" },
+      { cache: "no-store", signal },
     );
+    if (!detailRequestIsCurrent(generation, eventId)) return;
     if (!response.ok) throw new Error(`Investigation request failed (${response.status})`);
     const data = await response.json();
+    if (!detailRequestIsCurrent(generation, eventId)) return;
     activeInvestigation = data;
     renderInvestigation(data);
     renderDetailNavigation(data.neighbors);
   } catch (_error) {
+    // A superseded or aborted request stays silent: it must not blank the
+    // panels or clear the neighbour targets belonging to the alert now shown.
+    if (!detailRequestIsCurrent(generation, eventId)) return;
     activeInvestigation = null;
     renderInvestigationUnavailable();
     renderDetailNavigation(null);
   }
 }
 
-async function loadDetail(eventId) {
+async function loadDetail(eventId, navigation = beginDetailNavigation()) {
   if (!Number.isInteger(eventId) || eventId < 1) return;
+  const { generation, signal } = navigation;
   syncQueueLinks();
   try {
     // no-store: a reload after saving feedback must never be answered from a
     // cached pre-feedback response.
-    const response = await fetch(`${API}/api/v1/verdicts/${eventId}`, { cache: "no-store" });
+    const response = await fetch(`${API}/api/v1/verdicts/${eventId}`, {
+      cache: "no-store",
+      signal,
+    });
+    if (!detailRequestIsCurrent(generation, eventId)) return;
     if (!response.ok) throw new Error(response.status === 404 ? "Alert not found." : `Alert request failed (${response.status})`);
     const data = await response.json();
+    if (!detailRequestIsCurrent(generation, eventId)) return;
     mode = data.mode;
     document.getElementById("demoBanner").classList.toggle("hidden", mode !== "demo");
     renderDetail(data.verdict);
   } catch (error) {
+    if (!detailRequestIsCurrent(generation, eventId)) return;
     activeInvestigation = null;
     document.getElementById("detailPageContent").innerHTML = `<div class="empty-card"><div><strong>${escapeHtml(error.message)}</strong><span>Return to the queue and choose another alert.</span></div></div>`;
     renderDetailNavigation(null);
     return;
   }
-  await loadInvestigation(eventId);
+  await loadInvestigation(eventId, navigation);
 }
 
 async function openDetailById(eventId, { focusNotes = false } = {}) {
   if (!Number.isInteger(eventId) || eventId < 1) return;
+  // Push first so the generation check below compares against the new URL.
   window.history.pushState({}, "", `/triage/${eventId}${queueQueryString()}`);
   initializeView();
   window.scrollTo({ top: 0, behavior: "instant" });
-  await loadDetail(eventId);
-  // The review controls only exist once the detail body has rendered.
-  if (focusNotes) document.getElementById("detailNotes")?.focus();
+  const navigation = beginDetailNavigation();
+  await loadDetail(eventId, navigation);
+  // The review controls only exist once the detail body has rendered, and only
+  // if this navigation is still the one on screen.
+  if (focusNotes && detailRequestIsCurrent(navigation.generation, eventId)) {
+    document.getElementById("detailNotes")?.focus();
+  }
 }
 
 function openDetail(verdict) {
@@ -844,6 +897,7 @@ function openDetail(verdict) {
 }
 
 function closeDetail() {
+  invalidateDetailNavigation();
   activeDetail = null;
   activeInvestigation = null;
   window.history.pushState({}, "", `/triage${queueQueryString()}`);
@@ -867,20 +921,28 @@ function toggleCorrection(eventId, trigger) {
 
 async function feedback(id, agentVerdict, customVerdict = null, notes = "") {
   const humanVerdict = customVerdict || agentVerdict;
+  const eventId = Number(id);
+  const fromDetail = currentView === "detail";
   try {
-    const response = await fetch(`${API}/api/v1/feedback/${id}`, {
+    // The write is never aborted: a save that reached the server must not be
+    // cancelled because the operator moved on.
+    const response = await fetch(`${API}/api/v1/feedback/${eventId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ human_verdict: humanVerdict, notes }),
     });
     if (!response.ok) throw new Error(`Feedback was not saved (${response.status})`);
     showToast("Operator feedback saved.");
-    if (currentView === "detail") {
-      await loadDetail(Number(id));
-    } else {
-      resetPagination();
-      await load();
+    if (fromDetail) {
+      // Only refresh if the operator is still on that same alert. Otherwise a
+      // slow POST would drag them back to the alert they just left.
+      if (currentView === "detail" && detailPathEventId() === eventId) {
+        await loadDetail(eventId, beginDetailNavigation());
+      }
+      return;
     }
+    resetPagination();
+    await load();
   } catch (error) {
     showToast(error.message, true);
   }
@@ -1036,8 +1098,15 @@ document.querySelectorAll("#previousAlertButton, #nextAlertButton").forEach((but
 
 window.addEventListener("popstate", () => {
   const detailId = initializeView();
-  if (detailId) loadDetail(detailId);
-  else load();
+  if (detailId) {
+    loadDetail(detailId, beginDetailNavigation());
+  } else {
+    // Leaving the detail view must retire any request still in flight.
+    invalidateDetailNavigation();
+    activeDetail = null;
+    activeInvestigation = null;
+    load();
+  }
 });
 
 // Tab moves DOM focus without going through focusAlert, so keep focusedIndex

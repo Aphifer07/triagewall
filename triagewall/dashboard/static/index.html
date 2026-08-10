@@ -22,7 +22,8 @@
         </a>
         <a href="/triage" data-view-link="triage">
           Triage queue
-          <span id="sidebarQueueCount" class="nav-count">—</span>
+          <span id="sidebarQueueCount" class="nav-count" title="Unreviewed model decisions in the last 24 hours, across all filters">—</span>
+          <span class="sr-only">unreviewed model decisions in the last 24 hours, across all filters</span>
         </a>
         <a href="/behavioral" data-view-link="behavioral">
           Behavioral signals
@@ -79,7 +80,7 @@
         </header>
 
         <div class="queue-sticky">
-        <div class="queue-summary" aria-label="Queue summary and verdict filters">
+        <div class="queue-summary" aria-label="Queue summary and verdict filters" aria-describedby="queueScopeNote">
           <button class="filter-btn queue-tag active" data-verdict="" type="button">All model <span id="queueAllCount">—</span></button>
           <button class="filter-btn queue-tag" data-verdict="real" type="button">Real <span id="queueRealCount">—</span></button>
           <button class="filter-btn queue-tag" data-verdict="uncertain" type="button">Uncertain <span id="queueUncertainCount">—</span></button>
@@ -87,6 +88,11 @@
           <button id="unreviewedQuickFilter" class="queue-tag" type="button">Unreviewed <span id="queueUnreviewedCount">—</span></button>
           <span class="queue-sort">sorted by newest ↓</span>
         </div>
+        <p id="queueScopeNote" class="queue-scope-note">
+          These counts are global totals of model decisions from the last 24 hours.
+          They stay the same whichever filters, path, or page you select below —
+          including Policy, source, and review filters, which never change them.
+        </p>
 
         <div id="advancedFilters" class="filter-bar hidden" aria-label="Additional decision filters">
           <div class="filter-group">
