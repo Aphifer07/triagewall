@@ -125,11 +125,16 @@ def create_v1_router(
             "verdicts": [row_to_dict(r) for r in rows],
             "next_cursor": next_cursor,
         }
+        # Rows carry review state that an operator can change at any moment, so
+        # the queue is as mutable as the detail view and gets the same policy.
+        # A cached list would let a stale row present a reviewed alert as
+        # unreviewed and invite a second, note-less feedback write.
         return validated_json_response(
             request,
             payload,
             model=VerdictsResponse,
-            max_age=5,
+            max_age=0,
+            no_store=True,
         )
 
     @router.get("/verdicts/{event_id}", response_model=VerdictDetailResponse)

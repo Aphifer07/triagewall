@@ -66,12 +66,14 @@ function createElement(id) {
   return element;
 }
 
-function runDashboard({ pathname, verdicts = [], defer = () => false }) {
+function runDashboard({ pathname, search = "", verdicts = [], defer = () => false }) {
   const elements = new Map();
   const documentListeners = new Map();
   const intervals = [];
   const pushedUrls = [];
   const deferred = [];
+  const windowListeners = new Map();
+  const saved = new Map();
 
   const document = {
     title: "",
@@ -80,7 +82,14 @@ function runDashboard({ pathname, verdicts = [], defer = () => false }) {
       if (!elements.has(id)) elements.set(id, createElement(id));
       return elements.get(id);
     },
-    querySelectorAll: () => [],
+    // Only id selectors resolve. That is enough for the listeners the script
+    // attaches by id, and anything else yields an empty list rather than a
+    // fake element that would make a test pass for the wrong reason.
+    querySelectorAll(selector) {
+      const parts = String(selector).split(",").map((part) => part.trim());
+      if (!parts.every((part) => /^#[\w-]+$/.test(part))) return [];
+      return parts.map((part) => this.getElementById(part.slice(1)));
+    },
     querySelector: () => null,
     addEventListener(type, handler) {
       if (!documentListeners.has(type)) documentListeners.set(type, []);
@@ -104,7 +113,8 @@ function runDashboard({ pathname, verdicts = [], defer = () => false }) {
     if (target.includes("/api/v1/spc-anomalies")) {
       return { available: false, anomalies: [] };
     }
-    if (target.includes("/api/v1/feedback/")) return { ok: true, agreed: true };
+    const feedback = target.match(/\/api\/v1\/feedback\/(\d+)$/);
+    if (feedback) return { ok: true, agreed: true };
     const investigation = target.match(/\/api\/v1\/verdicts\/(\d+)\/investigation/);
     if (investigation) {
       const id = Number(investigation[1]);
@@ -168,6 +178,34 @@ function runDashboard({ pathname, verdicts = [], defer = () => false }) {
         },
       };
     }
+    const list = target.match(/\/api\/v1\/verdicts\?(.*)$/);
+    if (list) {
+      const params = new URLSearchParams(list[1]);
+      const tag = params.get("model") || "any";
+      const cursor = params.get("cursor");
+      // Rows are tagged with the filter that asked for them, so a response can
+      // be traced back to the request that produced it.
+      const rows = verdicts.length
+        ? verdicts
+        : [
+            {
+              id: cursor ? 900 : 100,
+              verdict: "real",
+              signature: `row-${tag}${cursor ? "-older" : ""}`,
+              confidence: 0.5,
+              human_verdict: null,
+            },
+          ];
+      // The server is the source of truth for review state: once feedback has
+      // been saved, every later read reflects it. That is what no-store buys.
+      return {
+        mode: "local",
+        verdicts: rows.map((row) =>
+          saved.has(row.id) ? { ...row, ...saved.get(row.id) } : row,
+        ),
+        next_cursor: cursor ? null : `cursor-${tag}`,
+      };
+    }
     return { mode: "local", verdicts, next_cursor: null };
   }
 
@@ -175,6 +213,15 @@ function runDashboard({ pathname, verdicts = [], defer = () => false }) {
   const fetchStub = (url, options) => {
     const target = String(url);
     fetchCalls.push({ url: target, options });
+    const posted = target.match(/\/api\/v1\/feedback\/(\d+)$/);
+    if (posted && options?.method === "POST") {
+      const payload = JSON.parse(options.body);
+      saved.set(Number(posted[1]), {
+        human_verdict: payload.human_verdict,
+        human_notes: payload.notes,
+        agreed: 1,
+      });
+    }
     const body = bodyFor(target);
     if (defer(target)) {
       return new Promise((resolve) => {
@@ -186,7 +233,7 @@ function runDashboard({ pathname, verdicts = [], defer = () => false }) {
 
   // A real location object: pushState moves it, so the script's own
   // "am I still on this alert?" checks are exercised rather than stubbed out.
-  const location = { pathname, search: "", href: `http://localhost${pathname}` };
+  const location = { pathname, search, href: `http://localhost${pathname}${search}` };
   const navigate = (url) => {
     const [nextPath, query = ""] = String(url).split("?");
     location.pathname = nextPath;
@@ -208,7 +255,10 @@ function runDashboard({ pathname, verdicts = [], defer = () => false }) {
           if (url) navigate(url);
         },
       },
-      addEventListener() {},
+      addEventListener(type, handler) {
+        if (!windowListeners.has(type)) windowListeners.set(type, []);
+        windowListeners.get(type).push(handler);
+      },
       scrollTo() {},
     },
     fetch: fetchStub,
@@ -233,7 +283,17 @@ function runDashboard({ pathname, verdicts = [], defer = () => false }) {
   const probe = `
 ;globalThis.__probe = {
   open: (id, options) => openDetailById(id, options),
-  state: () => ({ currentView, activeDetail, activeInvestigation }),
+  setFilter: (key, value) => { currentFilter[key] = value; },
+  applyFilters: () => applyFilters(),
+  loadOlder: () => loadOlder(),
+  state: () => ({
+    currentView,
+    activeDetail,
+    activeInvestigation,
+    currentFilter: { ...currentFilter },
+    currentVerdicts: currentVerdicts.map((row) => ({ ...row })),
+    nextCursor,
+  }),
 };`;
 
   vm.runInNewContext(
@@ -254,6 +314,12 @@ function runDashboard({ pathname, verdicts = [], defer = () => false }) {
       queued.forEach(({ release }) => release());
     },
     tick: () => intervals.forEach((handler) => handler()),
+    // Simulates the browser restoring a history entry: move the URL, then
+    // deliver popstate, exactly as a back/forward press would.
+    goBackTo(url) {
+      navigate(url);
+      (windowListeners.get("popstate") ?? []).forEach((handler) => handler({}));
+    },
     dispatchKey: (key, target = { tagName: "DIV" }) =>
       (documentListeners.get("keydown") ?? []).forEach((handler) =>
         handler({ key, target, preventDefault() {} }),
@@ -730,6 +796,204 @@ test("leaving the detail view retires an in-flight request", async () => {
     writesAfterClose,
     "a retired request rendered into the detail view after navigating away",
   );
+});
+
+test("the queue list is fetched with no-store", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  const listCalls = harness.fetchCalls.filter(({ url }) =>
+    /\/api\/v1\/verdicts\?/.test(url),
+  );
+  assert.ok(listCalls.length > 0);
+  for (const call of listCalls) {
+    assert.equal(call.options?.cache, "no-store", `missing no-store for ${call.url}`);
+  }
+});
+
+test("a saved review is visible on return to the queue and blocks a second write", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [
+      { id: 11, verdict: "real", signature: "one", confidence: 0.5, human_verdict: null },
+    ],
+  });
+  await harness.settle();
+  assert.equal(harness.api.state().currentVerdicts[0].human_verdict, null);
+
+  harness.api.open(11);
+  await harness.settle();
+  harness.document.getElementById("detailNotes").value = "owner confirmed the host";
+  harness.document.getElementById("detailPageContent").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-detail-feedback]"
+          ? { dataset: { detailFeedback: "real" } }
+          : null,
+    },
+  });
+  await harness.settle();
+
+  const firstPost = harness.fetchCalls.filter(({ url }) =>
+    url.includes("/api/v1/feedback/"),
+  );
+  assert.equal(firstPost.length, 1);
+  assert.equal(JSON.parse(firstPost[0].options.body).notes, "owner confirmed the host");
+
+  // Back to the queue: the refetched row must carry the saved review.
+  harness.dispatchKey("Escape");
+  await harness.settle();
+  const row = harness.api.state().currentVerdicts[0];
+  assert.equal(row.human_verdict, "real");
+  assert.equal(row.human_notes, "owner confirmed the host");
+
+  // The one-key agree action is guarded on human_verdict, so a stale row would
+  // let it fire again and overwrite the saved note with an empty one.
+  harness.document.getElementById("verdicts").dispatch("focusin", {
+    target: { closest: () => ({ dataset: { idx: "0" } }) },
+  });
+  harness.dispatchKey("a");
+  await harness.settle();
+
+  const allPosts = harness.fetchCalls.filter(({ url }) =>
+    url.includes("/api/v1/feedback/"),
+  );
+  assert.equal(allPosts.length, 1, "a second feedback POST was submitted");
+});
+
+test("an old filter's response cannot replace the newer filter's rows", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => /\/api\/v1\/verdicts\?.*model=llm/.test(url),
+  });
+  await harness.settle();
+  assert.ok(harness.deferred.length > 0, "the llm query should still be in flight");
+
+  harness.api.setFilter("model", "prefilter");
+  harness.api.applyFilters();
+  await harness.settle();
+  assert.equal(harness.api.state().currentVerdicts[0].signature, "row-prefilter");
+
+  // The superseded llm query answers only now.
+  harness.releaseDeferred();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(state.currentFilter.model, "prefilter");
+  assert.equal(state.currentVerdicts.length, 1);
+  assert.equal(state.currentVerdicts[0].signature, "row-prefilter");
+  assert.match(harness.document.getElementById("verdicts").innerHTML, /row-prefilter/);
+  assert.doesNotMatch(harness.document.getElementById("verdicts").innerHTML, /row-llm/);
+  // Retirement is silent: it is not a failure the operator needs to see.
+  assert.equal(harness.document.getElementById("toast").textContent, "");
+  assert.doesNotMatch(
+    harness.document.getElementById("freshness").textContent,
+    /unavailable/,
+  );
+});
+
+test("a filter change invalidates an in-flight Load Older page", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => url.includes("cursor="),
+  });
+  await harness.settle();
+  assert.equal(harness.api.state().currentVerdicts[0].signature, "row-llm");
+  assert.equal(harness.api.state().nextCursor, "cursor-llm");
+
+  harness.api.loadOlder();
+  await harness.settle();
+  assert.ok(harness.deferred.length > 0, "the older page should still be in flight");
+
+  harness.api.setFilter("model", "prefilter");
+  harness.api.applyFilters();
+  await harness.settle();
+
+  // The old-filter page answers after the filters changed.
+  harness.releaseDeferred();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(state.currentVerdicts.length, 1, "old-filter rows were appended");
+  assert.equal(state.currentVerdicts[0].signature, "row-prefilter");
+  assert.doesNotMatch(
+    harness.document.getElementById("verdicts").innerHTML,
+    /row-llm-older/,
+  );
+  assert.equal(harness.document.getElementById("toast").textContent, "");
+});
+
+test("history restores each entry's own filters", async () => {
+  const harness = runDashboard({ pathname: "/triage", search: "?model=llm" });
+  await harness.settle();
+  assert.equal(harness.api.state().currentFilter.model, "llm");
+
+  // Back to an entry recorded with the policy path selected.
+  harness.goBackTo("/triage?model=prefilter");
+  await harness.settle();
+  let state = harness.api.state();
+  assert.equal(state.currentFilter.model, "prefilter");
+  assert.equal(state.currentVerdicts[0].signature, "row-prefilter");
+  assert.match(harness.fetchCalls.at(-1).url, /model=prefilter/);
+
+  // Forward again to the model entry.
+  harness.goBackTo("/triage?model=llm");
+  await harness.settle();
+  state = harness.api.state();
+  assert.equal(state.currentFilter.model, "llm");
+  assert.equal(state.currentVerdicts[0].signature, "row-llm");
+});
+
+test("history restore clears filters the restored entry does not carry", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&verdict=real&source=wazuh&review=unreviewed&signature=scan",
+  });
+  await harness.settle();
+  assert.equal(harness.api.state().currentFilter.verdict, "real");
+  assert.equal(harness.api.state().currentFilter.signature, "scan");
+
+  harness.goBackTo("/triage");
+  await harness.settle();
+
+  const state = harness.api.state();
+  // Re-spread into this realm: the sandbox object has a different prototype.
+  assert.deepEqual({ ...state.currentFilter }, {
+    verdict: "",
+    signature: "",
+    model: "",
+    source: "",
+    review: "",
+  });
+  // The visible controls follow the restored state, not the newer memory.
+  assert.equal(harness.document.getElementById("sigFilter").value, "");
+  assert.equal(harness.document.getElementById("sourceFilter").value, "");
+  assert.equal(harness.document.getElementById("reviewFilter").value, "");
+  const requested = harness.fetchCalls.at(-1).url;
+  assert.doesNotMatch(requested, /verdict=|source=|review=|signature=|model=/);
+});
+
+test("a restored detail entry investigates with that entry's filters", async () => {
+  const harness = runDashboard({ pathname: "/triage", search: "?model=llm" });
+  await harness.settle();
+
+  harness.goBackTo("/triage/5?model=prefilter&review=unreviewed");
+  await harness.settle();
+
+  assert.equal(harness.api.state().currentFilter.model, "prefilter");
+  assert.equal(harness.api.state().activeDetail.id, 5);
+  const investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts/5/investigation"))
+    .at(-1);
+  assert.match(investigation, /model=prefilter/);
+  assert.match(investigation, /review=unreviewed/);
+
+  // Previous/next inherit the restored filters too.
+  harness.document.getElementById("nextAlertButton").dispatch("click", {});
+  await harness.settle();
+  assert.match(String(harness.pushedUrls.at(-1)), /^\/triage\/2005\?/);
+  assert.match(String(harness.pushedUrls.at(-1)), /model=prefilter/);
 });
 
 test("queue badge counts declare their global 24h scope", () => {

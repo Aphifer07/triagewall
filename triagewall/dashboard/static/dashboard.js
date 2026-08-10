@@ -35,6 +35,12 @@ let activeInvestigation = null;
 // shortcuts and a slow network all produce the same overlap.
 let detailGeneration = 0;
 let detailAbort = null;
+// The queue races the same way but on its own axis: a filter change, a live
+// refresh and a Load Older page can all be in flight together. Kept separate
+// from the detail generation so opening an alert never cancels a queue read
+// and vice versa.
+let queueGeneration = 0;
+let queueAbort = null;
 
 function formatHourLabel(isoHour) {
   const date = new Date(isoHour);
@@ -105,18 +111,42 @@ function initializeView() {
   return detailMatch ? Number(detailMatch[1]) : null;
 }
 
-function initializeFilterState() {
-  const params = new URLSearchParams(window.location.search);
-  for (const key of FILTER_KEYS) {
-    const value = params.get(key);
-    if (value == null) continue;
-    if (key === "signature") currentFilter.signature = value.slice(0, 200);
-    else if (VALID_FILTERS[key]?.has(value)) currentFilter[key] = value;
-  }
+// Push every filter back onto the controls that display it.
+function syncFilterControls() {
   document.getElementById("sigFilter").value = currentFilter.signature;
   document.getElementById("sourceFilter").value = currentFilter.source;
   document.getElementById("reviewFilter").value = currentFilter.review;
   document.getElementById("unreviewedQuickFilter").classList.toggle("active", currentFilter.review === "unreviewed");
+  setActive(".filter-btn", "verdict", currentFilter.verdict);
+  setActive(".model-btn", "model", currentFilter.model);
+}
+
+function readFilterParam(params, key) {
+  const value = params.get(key);
+  if (value == null) return null;
+  if (key === "signature") return value.slice(0, 200);
+  return VALID_FILTERS[key]?.has(value) ? value : null;
+}
+
+// First paint: an absent parameter leaves the built-in default in place.
+function initializeFilterState() {
+  const params = new URLSearchParams(window.location.search);
+  for (const key of FILTER_KEYS) {
+    const value = readFilterParam(params, key);
+    if (value != null) currentFilter[key] = value;
+  }
+  syncFilterControls();
+}
+
+// History restore: the URL is the whole truth. A key the restored entry does
+// not carry is cleared, so a filter chosen after that entry was recorded
+// cannot survive into it and quietly narrow the restored queue.
+function hydrateFilterStateFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  for (const key of FILTER_KEYS) {
+    currentFilter[key] = readFilterParam(params, key) ?? "";
+  }
+  syncFilterControls();
 }
 
 // The queue filters travel with the analyst. Detail URLs, previous/next and
@@ -153,6 +183,31 @@ function invalidateDetailNavigation() {
 
 function detailRequestIsCurrent(generation, eventId) {
   return generation === detailGeneration && detailPathEventId() === Number(eventId);
+}
+
+function beginQueueRequest() {
+  queueGeneration += 1;
+  if (queueAbort) queueAbort.abort();
+  queueAbort = typeof AbortController === "function" ? new AbortController() : null;
+  // The filter snapshot is part of the ticket: a response answers the filters
+  // that were active when it was sent, not whatever they are when it lands.
+  return {
+    generation: queueGeneration,
+    signal: queueAbort?.signal,
+    filter: { ...currentFilter },
+  };
+}
+
+function invalidateQueueRequests() {
+  queueGeneration += 1;
+  if (queueAbort) queueAbort.abort();
+  queueAbort = null;
+}
+
+function queueRequestIsCurrent(request) {
+  if (request.generation !== queueGeneration) return false;
+  if (currentView !== "triage") return false;
+  return FILTER_KEYS.every((key) => currentFilter[key] === request.filter[key]);
 }
 
 function syncQueueLinks() {
@@ -266,16 +321,25 @@ function renderTimeline(points) {
     </svg>`;
 }
 
-async function loadVerdictPage(cursor = null, append = false) {
-  const response = await fetch(`${API}/api/v1/verdicts?${buildVerdictParams(cursor)}`);
+// Returns true when the response was applied, false when it was superseded.
+async function loadVerdictPage(cursor = null, append = false, request = beginQueueRequest()) {
+  // no-store: a cached row could present an already-reviewed alert as
+  // unreviewed, which is exactly what the one-key agree action keys off.
+  const response = await fetch(`${API}/api/v1/verdicts?${buildVerdictParams(cursor)}`, {
+    cache: "no-store",
+    signal: request.signal,
+  });
+  if (!queueRequestIsCurrent(request)) return false;
   if (!response.ok) throw new Error(`Decision request failed (${response.status})`);
   const data = await response.json();
+  if (!queueRequestIsCurrent(request)) return false;
   mode = data.mode;
   nextCursor = data.next_cursor;
   currentVerdicts = append ? [...currentVerdicts, ...data.verdicts] : data.verdicts;
   document.getElementById("demoBanner").classList.toggle("hidden", mode !== "demo");
   renderVerdicts(currentVerdicts);
   renderPagination();
+  return true;
 }
 
 // refreshDetail is false on scheduled polling ticks. Health and stats still
@@ -319,10 +383,14 @@ async function load({ refreshDetail = true } = {}) {
     const detailId = Number(window.location.pathname.split("/").at(-1));
     await loadDetail(detailId);
   } else if (currentView === "triage" && !browsingHistory) {
+    const request = beginQueueRequest();
     try {
-      await loadVerdictPage();
+      const applied = await loadVerdictPage(null, false, request);
+      if (!applied) return;
       document.getElementById("freshness").textContent = `Live · ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
     } catch (error) {
+      // A superseded or aborted queue read is not a failure to report.
+      if (!queueRequestIsCurrent(request)) return;
       document.getElementById("freshness").textContent = "Decision feed unavailable";
       showToast(error.message, true);
     }
@@ -950,16 +1018,20 @@ async function feedback(id, agentVerdict, customVerdict = null, notes = "") {
 
 async function loadOlder() {
   if (!nextCursor || pageLoading) return;
+  const cursor = nextCursor;
+  const request = beginQueueRequest();
   pageLoading = true;
   browsingHistory = true;
   renderPagination();
   try {
-    await loadVerdictPage(nextCursor, true);
+    await loadVerdictPage(cursor, true, request);
   } catch (error) {
-    showToast(error.message, true);
+    if (queueRequestIsCurrent(request)) showToast(error.message, true);
   } finally {
     pageLoading = false;
-    renderPagination();
+    // If the filters moved on, the newer request owns the rendering; appending
+    // this page or repainting from it would splice old-filter rows into it.
+    if (queueRequestIsCurrent(request)) renderPagination();
   }
 }
 
@@ -969,6 +1041,9 @@ async function returnToLive() {
 }
 
 function applyFilters() {
+  // Retire any queue read already in flight, including a Load Older page whose
+  // rows belong to the filters being replaced.
+  invalidateQueueRequests();
   resetPagination();
   syncUrlState();
   syncQueueLinks();
@@ -1097,14 +1172,21 @@ document.querySelectorAll("#previousAlertButton, #nextAlertButton").forEach((but
 });
 
 window.addEventListener("popstate", () => {
+  // Rebuild the filters from the restored URL before anything reads them, so
+  // the restored route, its investigation request, previous/next and the back
+  // link all use that entry's filters rather than the newer in-memory ones.
+  hydrateFilterStateFromUrl();
+  syncQueueLinks();
   const detailId = initializeView();
   if (detailId) {
     loadDetail(detailId, beginDetailNavigation());
   } else {
     // Leaving the detail view must retire any request still in flight.
     invalidateDetailNavigation();
+    invalidateQueueRequests();
     activeDetail = null;
     activeInvestigation = null;
+    resetPagination();
     load();
   }
 });
@@ -1180,8 +1262,6 @@ document.addEventListener("keydown", (event) => {
 initializeView();
 initializeFilterState();
 syncQueueLinks();
-setActive(".filter-btn", "verdict", currentFilter.verdict);
-setActive(".model-btn", "model", currentFilter.model);
 // The first call is the page's initial load and must render the detail view.
 // Every later call is a scheduled tick and must leave it untouched.
 let initialLoadComplete = false;

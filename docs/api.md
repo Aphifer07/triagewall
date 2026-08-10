@@ -282,12 +282,14 @@ so it always matches the bytes actually served. Send `If-None-Match` to receive
 HTTP 304 when unchanged. Stats/timeline/SPC results also use short in-process
 TTL caches. Payloads include `generated_at` (UTC).
 
-The per-event endpoints `GET /api/v1/verdicts/{event_id}` and
-`GET /api/v1/verdicts/{event_id}/investigation` are the exception: they emit
+The verdict endpoints are the exception. `GET /api/v1/verdicts`,
+`GET /api/v1/verdicts/{event_id}` and
+`GET /api/v1/verdicts/{event_id}/investigation` emit
 `Cache-Control: private, no-store` and **no** `ETag`, and never answer 304.
 Saving operator feedback rewrites the underlying row, so a stored or
-revalidated copy would show a pre-feedback verdict. List, stats, timeline, SPC
-and health responses keep their existing caching unchanged.
+revalidated copy would report a reviewed alert as unreviewed. Stats, timeline,
+SPC and health keep their existing caching, as does the deprecated
+`GET /api/verdicts` alias, whose shape and headers are frozen until removal.
 
 ## Deprecated aliases
 

@@ -427,13 +427,14 @@ class ApiV1Tests(unittest.TestCase):
         """
         original = cache_headers.validated_json_response
 
-        def inject(request, payload, *, model, max_age, status_code=200):
+        def inject(request, payload, *, model, max_age, status_code=200, no_store=False):
             return original(
                 request,
                 mutate(payload),
                 model=model,
                 max_age=max_age,
                 status_code=status_code,
+                no_store=no_store,
             )
 
         return patch.object(
@@ -501,8 +502,9 @@ class ApiV1Tests(unittest.TestCase):
 
     def test_etag_is_derived_from_the_validated_representation(self):
         """The ETag must hash exactly the bytes that were served."""
+        # /verdicts and the per-event routes are no-store and carry no
+        # validator, so only the pollable aggregates appear here.
         for path in (
-            "/api/v1/verdicts?limit=1",
             "/api/v1/stats",
             "/api/v1/timeline",
             "/api/v1/spc-anomalies",
@@ -1394,8 +1396,8 @@ class InvestigationTests(unittest.TestCase):
         recurrence = investigation.json()["recurrence"]
         self.assertEqual(recurrence["uncertain_count"], 1)
 
-    def test_list_and_stats_keep_their_existing_caching(self):
-        for path in ("/api/v1/verdicts?limit=1", "/api/v1/stats"):
+    def test_aggregates_keep_their_existing_caching(self):
+        for path in ("/api/v1/stats", "/api/v1/timeline", "/api/v1/spc-anomalies"):
             with self.subTest(path=path):
                 response = self.client.get(path, headers=self.host)
                 self.assertEqual(response.status_code, 200)
@@ -1404,6 +1406,48 @@ class InvestigationTests(unittest.TestCase):
                     response.headers["ETag"],
                     weak_etag_for_payload(response.json()),
                 )
+
+    def test_the_verdict_list_is_mutable_and_not_stored(self):
+        response = self.client.get("/api/v1/verdicts?limit=5", headers=self.host)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+        self.assertNotIn("ETag", response.headers)
+
+    def test_a_saved_review_is_visible_on_the_next_queue_read(self):
+        """A stale queue row would invite a second, note-erasing write.
+
+        The dashboard blocks the one-key agree action on rows that already
+        carry a human verdict, so if the list could be served from cache the
+        row would still look unreviewed and that guard would not fire.
+        """
+        before = self.client.get("/api/v1/verdicts?limit=50", headers=self.host)
+        row = next(r for r in before.json()["verdicts"] if r["id"] == 2)
+        self.assertIsNone(row["human_verdict"])
+
+        self.client.cookies.set(
+            DASHBOARD_WRITE_COOKIE,
+            issue_dashboard_write_cookie(self.write_secret),
+        )
+        saved = self.client.post(
+            "/api/v1/feedback/2",
+            json={"human_verdict": "real", "notes": "confirmed by the host owner"},
+            headers=self.host,
+        )
+        self.assertEqual(saved.status_code, 200)
+
+        after = self.client.get("/api/v1/verdicts?limit=50", headers=self.host)
+        self.assertEqual(after.status_code, 200)
+        self.assertEqual(after.headers["Cache-Control"], "private, no-store")
+        reviewed = next(r for r in after.json()["verdicts"] if r["id"] == 2)
+        self.assertEqual(reviewed["human_verdict"], "real")
+        self.assertEqual(reviewed["human_notes"], "confirmed by the host owner")
+        self.assertIsNotNone(reviewed["reviewed_at"])
+
+    def test_the_deprecated_list_alias_keeps_its_frozen_caching(self):
+        response = self.client.get("/api/verdicts", headers=self.host)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("max-age", response.headers["Cache-Control"])
+        self.assertIn("ETag", response.headers)
 
     # --- backward compatibility --------------------------------------------
 
