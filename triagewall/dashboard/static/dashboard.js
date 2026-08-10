@@ -246,7 +246,11 @@ async function loadVerdictPage(cursor = null, append = false) {
   renderPagination();
 }
 
-async function load() {
+// refreshDetail is false on scheduled polling ticks. Health and stats still
+// refresh, but the detail DOM is left alone: replacing it would discard an
+// unsaved operator note in #detailNotes. Explicit navigation, deep links and
+// the post-feedback reload all pass through loadDetail directly.
+async function load({ refreshDetail = true } = {}) {
   try {
     const healthResponse = await fetch(`${API}/api/health`);
     const health = await healthResponse.json();
@@ -279,6 +283,7 @@ async function load() {
   }
 
   if (currentView === "detail") {
+    if (!refreshDetail) return;
     const detailId = Number(window.location.pathname.split("/").at(-1));
     await loadDetail(detailId);
   } else if (currentView === "triage" && !browsingHistory) {
@@ -786,7 +791,10 @@ async function loadInvestigation(eventId) {
     if (currentFilter[key]) params.set(key, currentFilter[key]);
   }
   try {
-    const response = await fetch(`${API}/api/v1/verdicts/${eventId}/investigation?${params}`);
+    const response = await fetch(
+      `${API}/api/v1/verdicts/${eventId}/investigation?${params}`,
+      { cache: "no-store" },
+    );
     if (!response.ok) throw new Error(`Investigation request failed (${response.status})`);
     const data = await response.json();
     activeInvestigation = data;
@@ -803,7 +811,9 @@ async function loadDetail(eventId) {
   if (!Number.isInteger(eventId) || eventId < 1) return;
   syncQueueLinks();
   try {
-    const response = await fetch(`${API}/api/v1/verdicts/${eventId}`);
+    // no-store: a reload after saving feedback must never be answered from a
+    // cached pre-feedback response.
+    const response = await fetch(`${API}/api/v1/verdicts/${eventId}`, { cache: "no-store" });
     if (!response.ok) throw new Error(response.status === 404 ? "Alert not found." : `Alert request failed (${response.status})`);
     const data = await response.json();
     mode = data.mode;
@@ -818,12 +828,14 @@ async function loadDetail(eventId) {
   await loadInvestigation(eventId);
 }
 
-function openDetailById(eventId) {
+async function openDetailById(eventId, { focusNotes = false } = {}) {
   if (!Number.isInteger(eventId) || eventId < 1) return;
   window.history.pushState({}, "", `/triage/${eventId}${queueQueryString()}`);
   initializeView();
-  loadDetail(eventId);
   window.scrollTo({ top: 0, behavior: "instant" });
+  await loadDetail(eventId);
+  // The review controls only exist once the detail body has rendered.
+  if (focusNotes) document.getElementById("detailNotes")?.focus();
 }
 
 function openDetail(verdict) {
@@ -1028,6 +1040,14 @@ window.addEventListener("popstate", () => {
   else load();
 });
 
+// Tab moves DOM focus without going through focusAlert, so keep focusedIndex
+// in step: otherwise Enter would open whichever card the arrow keys last
+// touched rather than the one the operator is actually on.
+document.getElementById("verdicts").addEventListener("focusin", (event) => {
+  const card = event.target.closest("[data-idx]");
+  if (card) focusAlert(Number(card.dataset.idx));
+});
+
 document.getElementById("verdicts").addEventListener("click", (event) => {
   const feedbackButton = event.target.closest("[data-feedback]");
   if (feedbackButton) {
@@ -1072,8 +1092,12 @@ document.addEventListener("keydown", (event) => {
     const verdict = currentVerdicts[focusedIndex];
     if (verdict && !verdict.human_verdict && mode !== "demo") feedback(verdict.id, verdict.verdict);
   } else if (key === "d") {
+    // Open the alert and land the caret in the review note. The queue cards
+    // carry no inline correction panel, so review happens on the detail page.
     const verdict = currentVerdicts[focusedIndex];
-    if (verdict && !verdict.human_verdict && mode !== "demo") toggleCorrection(verdict.id);
+    if (verdict && !verdict.human_verdict && mode !== "demo") {
+      openDetailById(Number(verdict.id), { focusNotes: true });
+    }
   } else if (key === "u") {
     const verdict = currentVerdicts[focusedIndex];
     if (verdict && !verdict.human_verdict && mode !== "demo") feedback(verdict.id, null, "uncertain");
@@ -1089,4 +1113,14 @@ initializeFilterState();
 syncQueueLinks();
 setActive(".filter-btn", "verdict", currentFilter.verdict);
 setActive(".model-btn", "model", currentFilter.model);
-startIndependentPolling({ loadMain: load, loadSpc });
+// The first call is the page's initial load and must render the detail view.
+// Every later call is a scheduled tick and must leave it untouched.
+let initialLoadComplete = false;
+startIndependentPolling({
+  loadMain: () => {
+    const refreshDetail = !initialLoadComplete;
+    initialLoadComplete = true;
+    return load({ refreshDetail });
+  },
+  loadSpc,
+});

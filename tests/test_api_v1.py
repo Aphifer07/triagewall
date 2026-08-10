@@ -29,6 +29,7 @@ from triagewall.dashboard.api.auth import (
     SCOPE_FEEDBACK_WRITE,
     SCOPE_READ,
     hash_api_key,
+    issue_dashboard_write_cookie,
     lookup_api_key,
     parse_api_keys,
 )
@@ -1016,10 +1017,13 @@ class InvestigationTests(unittest.TestCase):
         self.old_redact = dashboard.API_REDACT_IPS
         self.old_ip_secret = dashboard.API_IP_HASH_SECRET
         self.old_allow = dashboard.auth_state.allow_unauthenticated_reads
+        self.old_write_secret = dashboard.auth_state.dashboard_write_secret
+        self.write_secret = "test-dashboard-secret"
         dashboard.DB_PATH = self.db_path
         dashboard.MODE = "local"
         dashboard.API_REDACT_IPS = False
         dashboard.auth_state.allow_unauthenticated_reads = True
+        dashboard.auth_state.dashboard_write_secret = self.write_secret
         services.reset_caches()
         self.client = TestClient(dashboard.app)
         self.host = {"host": "localhost"}
@@ -1030,6 +1034,7 @@ class InvestigationTests(unittest.TestCase):
         dashboard.API_REDACT_IPS = self.old_redact
         dashboard.API_IP_HASH_SECRET = self.old_ip_secret
         dashboard.auth_state.allow_unauthenticated_reads = self.old_allow
+        dashboard.auth_state.dashboard_write_secret = self.old_write_secret
         services.reset_caches()
         self.temp_dir.cleanup()
 
@@ -1334,6 +1339,71 @@ class InvestigationTests(unittest.TestCase):
         ):
             with self.subTest(model=model.__name__):
                 self.assertEqual(model.model_config.get("extra"), "forbid")
+
+    # --- freshness ---------------------------------------------------------
+
+    def test_per_event_responses_are_not_stored_and_carry_no_validator(self):
+        for path in (
+            "/api/v1/verdicts/1",
+            "/api/v1/verdicts/1/investigation",
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path, headers=self.host)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.headers["Cache-Control"], "private, no-store"
+                )
+                # No validator, so a revalidating cache cannot be handed a 304
+                # that resurrects the pre-feedback body.
+                self.assertNotIn("ETag", response.headers)
+
+    def test_saved_feedback_appears_immediately_and_cannot_be_revalidated_away(self):
+        before = self.client.get("/api/v1/verdicts/3", headers=self.host)
+        self.assertIsNone(before.json()["verdict"]["human_verdict"])
+        stale_etag = weak_etag_for_payload(before.json())
+
+        self.client.cookies.set(
+            DASHBOARD_WRITE_COOKIE,
+            issue_dashboard_write_cookie(self.write_secret),
+        )
+        saved = self.client.post(
+            "/api/v1/feedback/3",
+            json={"human_verdict": "real", "notes": "escalated to the owner"},
+            headers=self.host,
+        )
+        self.assertEqual(saved.status_code, 200)
+
+        # Even a client replaying the pre-feedback validator must be served the
+        # saved review, not a 304.
+        after = self.client.get(
+            "/api/v1/verdicts/3",
+            headers={**self.host, "If-None-Match": stale_etag},
+        )
+        self.assertEqual(after.status_code, 200)
+        verdict = after.json()["verdict"]
+        self.assertEqual(verdict["human_verdict"], "real")
+        self.assertEqual(verdict["human_notes"], "escalated to the owner")
+        self.assertIsNotNone(verdict["reviewed_at"])
+
+        # The investigation view moves with it: event 3 was the uncertain row.
+        investigation = self.client.get(
+            "/api/v1/verdicts/3/investigation",
+            headers={**self.host, "If-None-Match": stale_etag},
+        )
+        self.assertEqual(investigation.status_code, 200)
+        recurrence = investigation.json()["recurrence"]
+        self.assertEqual(recurrence["uncertain_count"], 1)
+
+    def test_list_and_stats_keep_their_existing_caching(self):
+        for path in ("/api/v1/verdicts?limit=1", "/api/v1/stats"):
+            with self.subTest(path=path):
+                response = self.client.get(path, headers=self.host)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("max-age", response.headers["Cache-Control"])
+                self.assertEqual(
+                    response.headers["ETag"],
+                    weak_etag_for_payload(response.json()),
+                )
 
     # --- backward compatibility --------------------------------------------
 

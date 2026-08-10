@@ -147,11 +147,14 @@ def create_v1_router(
             "mode": get_mode(),
             "verdict": row_to_dict(row),
         }
+        # Operator feedback rewrites this row, so the detail view must never be
+        # answered from a cache holding the pre-feedback body.
         return validated_json_response(
             request,
             payload,
             model=VerdictDetailResponse,
-            max_age=5,
+            max_age=0,
+            no_store=True,
         )
 
     @router.get(
@@ -199,11 +202,14 @@ def create_v1_router(
         if payload is None:
             raise HTTPException(status_code=404, detail="event not found")
         payload["mode"] = get_mode()
+        # Recurrence and verdict distribution move as soon as feedback lands,
+        # so this shares the detail view's no-store policy.
         return validated_json_response(
             request,
             payload,
             model=InvestigationResponse,
-            max_age=5,
+            max_age=0,
+            no_store=True,
         )
 
     @router.post(

@@ -2,10 +2,195 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
 
 const {
   startIndependentPolling,
 } = require("../triagewall/dashboard/static/polling.js");
+
+const STATIC_DIR = path.join(
+  __dirname,
+  "..",
+  "triagewall",
+  "dashboard",
+  "static",
+);
+
+// A DOM stub small enough to read, but real enough to run dashboard.js end to
+// end. It exists so the draft-preservation and focus-tracking guarantees are
+// proven by executing the shipped script rather than by matching its text.
+function createElement(id) {
+  const listeners = new Map();
+  let innerHTML = "";
+  const element = {
+    id,
+    value: "",
+    textContent: "",
+    disabled: false,
+    hidden: false,
+    title: "",
+    focused: false,
+    innerHTMLWrites: 0,
+    dataset: {},
+    style: {},
+    classList: {
+      add() {},
+      remove() {},
+      toggle() {},
+      contains: () => false,
+    },
+    setAttribute() {},
+    removeAttribute() {},
+    getAttribute: () => null,
+    scrollIntoView() {},
+    querySelectorAll: () => [],
+    closest: () => null,
+    focus() {
+      this.focused = true;
+    },
+    addEventListener(type, handler) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(handler);
+    },
+    dispatch(type, event) {
+      (listeners.get(type) ?? []).forEach((handler) => handler(event));
+    },
+  };
+  Object.defineProperty(element, "innerHTML", {
+    get: () => innerHTML,
+    set(value) {
+      innerHTML = value;
+      element.innerHTMLWrites += 1;
+    },
+  });
+  return element;
+}
+
+function runDashboard({ pathname, verdicts = [] }) {
+  const elements = new Map();
+  const documentListeners = new Map();
+  const intervals = [];
+  const pushedUrls = [];
+
+  const document = {
+    title: "",
+    body: { classList: { add() {}, remove() {}, toggle() {} } },
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, createElement(id));
+      return elements.get(id);
+    },
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    addEventListener(type, handler) {
+      if (!documentListeners.has(type)) documentListeners.set(type, []);
+      documentListeners.get(type).push(handler);
+    },
+  };
+
+  const json = (body) =>
+    Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+
+  const fetchCalls = [];
+  const fetchStub = (url, options) => {
+    const target = String(url);
+    fetchCalls.push({ url: target, options });
+    if (target.includes("/api/health")) {
+      return json({ status: "ok", last_alert_age_seconds: 1, storage: {} });
+    }
+    if (target.includes("/api/v1/stats")) return json({ mode: "local", stats: {} });
+    if (target.includes("/api/v1/spc-anomalies")) {
+      return json({ available: false, anomalies: [] });
+    }
+    if (target.includes("/investigation")) {
+      return json({
+        window_hours: 24,
+        recurrence: {
+          available: true,
+          signature_id: 1,
+          source_type: "suricata",
+          occurrences: 1,
+          first_seen: null,
+          last_seen: null,
+          real_count: 1,
+          false_positive_count: 0,
+          uncertain_count: 0,
+          unclassified_count: 0,
+        },
+        related: [],
+        neighbors: { previous: null, next: null },
+      });
+    }
+    if (/\/api\/v1\/verdicts\/\d+$/.test(target)) {
+      return json({
+        mode: "local",
+        verdict: {
+          id: 7,
+          verdict: "real",
+          signature: "sig",
+          confidence: 0.9,
+          sensor_context: { source: "suricata" },
+        },
+      });
+    }
+    return json({ mode: "local", verdicts, next_cursor: null });
+  };
+
+  const sandbox = {
+    document,
+    window: {
+      location: {
+        pathname,
+        search: "",
+        href: `http://localhost${pathname}`,
+      },
+      history: {
+        pushState(_state, _title, url) {
+          pushedUrls.push(url);
+        },
+        replaceState() {},
+      },
+      addEventListener() {},
+      scrollTo() {},
+    },
+    fetch: fetchStub,
+    // The real polling module, with its scheduler captured so ticks are fired
+    // by the test rather than by a live 30s timer.
+    startIndependentPolling: (options) =>
+      startIndependentPolling({
+        ...options,
+        setTimer: (handler) => intervals.push(handler),
+      }),
+    URL,
+    URLSearchParams,
+    setTimeout,
+    clearTimeout,
+    console,
+    navigator: {},
+  };
+  sandbox.globalThis = sandbox;
+
+  vm.runInNewContext(
+    fs.readFileSync(path.join(STATIC_DIR, "dashboard.js"), "utf8"),
+    sandbox,
+    { filename: "dashboard.js" },
+  );
+
+  return {
+    document,
+    fetchCalls,
+    pushedUrls,
+    tick: () => intervals.forEach((handler) => handler()),
+    dispatchKey: (key, target = { tagName: "DIV" }) =>
+      (documentListeners.get("keydown") ?? []).forEach((handler) =>
+        handler({ key, target, preventDefault() {} }),
+      ),
+    async settle() {
+      for (let index = 0; index < 40; index += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    },
+  };
+}
 
 test("starts SPC without waiting for the main dashboard request", () => {
   const calls = [];
@@ -65,13 +250,14 @@ test("dashboard wires SPC outside the verdict-loading function", () => {
     "dashboard.js",
   );
   const script = fs.readFileSync(scriptPath, "utf8");
-  const loadStart = script.indexOf("async function load() {");
+  const loadStart = script.indexOf("async function load({");
   const loadEnd = script.indexOf("function renderHealth", loadStart);
 
   assert.notEqual(loadStart, -1);
   assert.notEqual(loadEnd, -1);
   assert.doesNotMatch(script.slice(loadStart, loadEnd), /loadSpc\s*\(/);
-  assert.match(script, /startIndependentPolling\(\{ loadMain: load, loadSpc \}\);/);
+  assert.match(script, /startIndependentPolling\(\{\s*\n\s*loadMain: \(\) => \{/);
+  assert.match(script, /\n\s*loadSpc,\n\}\);/);
 
   const indexPath = path.join(
     __dirname,
@@ -295,6 +481,103 @@ test("source-specific context is derived only from the retained record", () => {
   assert.match(script, /function derivedField\(label, value\)/);
   assert.match(script, /"Not recorded"/);
   assert.match(script, /typeof value === "object"\) return null;/);
+});
+
+test("a deep link still loads the detail view on the initial load", async () => {
+  const harness = runDashboard({ pathname: "/triage/7" });
+  await harness.settle();
+
+  const urls = harness.fetchCalls.map(({ url }) => url);
+  assert.ok(urls.some((url) => url.endsWith("/api/v1/verdicts/7")));
+  assert.ok(urls.some((url) => url.includes("/api/v1/verdicts/7/investigation")));
+  assert.ok(harness.document.getElementById("detailPageContent").innerHTMLWrites > 0);
+});
+
+test("detail and investigation are fetched with no-store", async () => {
+  const harness = runDashboard({ pathname: "/triage/7" });
+  await harness.settle();
+
+  const perEvent = harness.fetchCalls.filter(({ url }) =>
+    /\/api\/v1\/verdicts\/7(\/investigation)?(\?|$)/.test(url),
+  );
+  assert.equal(perEvent.length, 2);
+  for (const call of perEvent) {
+    assert.equal(call.options?.cache, "no-store", `missing no-store for ${call.url}`);
+  }
+});
+
+test("a scheduled polling tick preserves an unsaved review note", async () => {
+  const harness = runDashboard({ pathname: "/triage/7" });
+  await harness.settle();
+
+  const notes = harness.document.getElementById("detailNotes");
+  notes.value = "half-written justification";
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBeforeTick = detail.innerHTMLWrites;
+  const fetchesBeforeTick = harness.fetchCalls.length;
+
+  harness.tick();
+  await harness.settle();
+
+  assert.equal(notes.value, "half-written justification");
+  assert.equal(
+    detail.innerHTMLWrites,
+    writesBeforeTick,
+    "polling replaced the detail DOM and destroyed the draft",
+  );
+  // Health and stats must keep refreshing while the detail body is left alone.
+  const polled = harness.fetchCalls.slice(fetchesBeforeTick).map(({ url }) => url);
+  assert.ok(polled.some((url) => url.includes("/api/health")));
+  assert.ok(polled.some((url) => url.includes("/api/v1/stats")));
+  assert.ok(!polled.some((url) => /\/api\/v1\/verdicts\/7/.test(url)));
+});
+
+test("focusing a queue card syncs the index so Enter opens that card", async () => {
+  const verdicts = [
+    { id: 11, verdict: "real", signature: "one", confidence: 0.5 },
+    { id: 22, verdict: "real", signature: "two", confidence: 0.5 },
+    { id: 33, verdict: "real", signature: "three", confidence: 0.5 },
+  ];
+  const harness = runDashboard({ pathname: "/triage", verdicts });
+  await harness.settle();
+
+  // Tab moves DOM focus to the third card without touching the arrow keys.
+  harness.document.getElementById("verdicts").dispatch("focusin", {
+    target: { closest: () => ({ dataset: { idx: "2" } }) },
+  });
+  harness.dispatchKey("Enter");
+  await harness.settle();
+
+  assert.ok(
+    harness.pushedUrls.some((url) => String(url).startsWith("/triage/33")),
+    `expected the focused card to open, got ${JSON.stringify(harness.pushedUrls)}`,
+  );
+});
+
+test("D opens the focused alert with the review note focused", async () => {
+  const verdicts = [
+    { id: 11, verdict: "real", signature: "one", confidence: 0.5, human_verdict: null },
+  ];
+  const harness = runDashboard({ pathname: "/triage", verdicts });
+  await harness.settle();
+
+  harness.dispatchKey("d");
+  await harness.settle();
+
+  assert.ok(harness.pushedUrls.some((url) => String(url).startsWith("/triage/11")));
+  assert.equal(harness.document.getElementById("detailNotes").focused, true);
+});
+
+test("the queue search advertises only what it actually searches", () => {
+  const html = fs.readFileSync(path.join(STATIC_DIR, "index.html"), "utf8");
+
+  // The filter is a signature LIKE; it does not search IPs or rule ids.
+  assert.match(html, /id="sigFilter"[^>]*placeholder="signature text…"/);
+  assert.doesNotMatch(html, /placeholder="[^"]*\bIP\b/);
+  assert.doesNotMatch(html, /placeholder="[^"]*rule id/);
+  // The shortcut legend must describe what D now does.
+  assert.match(html, /<kbd>D<\/kbd> Review/);
+  assert.doesNotMatch(html, /<kbd>D<\/kbd> Correct/);
 });
 
 test("overview uses a truthful policy-to-model decision band", () => {
