@@ -71,6 +71,7 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
   const documentListeners = new Map();
   const intervals = [];
   const pushedUrls = [];
+  const replacedUrls = [];
   const deferred = [];
   const windowListeners = new Map();
   const saved = new Map();
@@ -252,7 +253,9 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
           navigate(url);
         },
         replaceState(_state, _title, url) {
-          if (url) navigate(url);
+          if (!url) return;
+          replacedUrls.push(url);
+          navigate(url);
         },
       },
       addEventListener(type, handler) {
@@ -306,6 +309,7 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
     document,
     fetchCalls,
     pushedUrls,
+    replacedUrls,
     location,
     api: sandbox.__probe,
     deferred,
@@ -958,10 +962,12 @@ test("history restore clears filters the restored entry does not carry", async (
 
   const state = harness.api.state();
   // Re-spread into this realm: the sandbox object has a different prototype.
+  // model is the documented exception: a bare URL means the product default,
+  // never All, which is only ever expressed as an explicit model=all.
   assert.deepEqual({ ...state.currentFilter }, {
     verdict: "",
     signature: "",
-    model: "",
+    model: "llm",
     source: "",
     review: "",
   });
@@ -970,7 +976,8 @@ test("history restore clears filters the restored entry does not carry", async (
   assert.equal(harness.document.getElementById("sourceFilter").value, "");
   assert.equal(harness.document.getElementById("reviewFilter").value, "");
   const requested = harness.fetchCalls.at(-1).url;
-  assert.doesNotMatch(requested, /verdict=|source=|review=|signature=|model=/);
+  assert.doesNotMatch(requested, /verdict=|source=|review=|signature=/);
+  assert.match(requested, /model=llm/);
 });
 
 test("a restored detail entry investigates with that entry's filters", async () => {
@@ -994,6 +1001,189 @@ test("a restored detail entry investigates with that entry's filters", async () 
   await harness.settle();
   assert.match(String(harness.pushedUrls.at(-1)), /^\/triage\/2005\?/);
   assert.match(String(harness.pushedUrls.at(-1)), /model=prefilter/);
+});
+
+test("a stale queue feedback completion cannot reload a newly opened alert", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [
+      { id: 11, verdict: "real", signature: "queue-row", confidence: 0.5, human_verdict: null },
+    ],
+    defer: (url) => url.includes("/api/v1/feedback/"),
+  });
+  await harness.settle();
+
+  // Agree from the queue. The POST is held open.
+  harness.document.getElementById("verdicts").dispatch("focusin", {
+    target: { closest: () => ({ dataset: { idx: "0" } }) },
+  });
+  harness.dispatchKey("a");
+  await harness.settle();
+  assert.equal(harness.deferred.length, 1, "the feedback POST should be in flight");
+
+  // The operator moves to another alert and starts writing.
+  harness.api.open(22);
+  await harness.settle();
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "sentinel draft that must survive";
+  notes.value = sentinel;
+
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBeforeRelease = detail.innerHTMLWrites;
+  const fetchesBeforeRelease = harness.fetchCalls.length;
+
+  // The queue-originated POST finally answers.
+  harness.releaseDeferred();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(harness.location.pathname, "/triage/22");
+  assert.equal(state.currentView, "detail");
+  assert.equal(state.activeDetail.id, 22);
+  assert.equal(notes.value, sentinel, "the stale completion destroyed the draft");
+  assert.equal(
+    detail.innerHTMLWrites,
+    writesBeforeRelease,
+    "the stale completion re-rendered the detail page",
+  );
+  // No queue reload and no detail reload were triggered by the completion.
+  const after = harness.fetchCalls.slice(fetchesBeforeRelease).map(({ url }) => url);
+  assert.deepEqual(after, [], `stale completion issued requests: ${after.join(", ")}`);
+});
+
+test("a bare triage URL is canonicalized to the Model default", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  assert.ok(
+    harness.replacedUrls.some((url) => String(url) === "/triage?model=llm"),
+    `expected canonicalization, got ${JSON.stringify(harness.replacedUrls)}`,
+  );
+  assert.equal(harness.location.search, "?model=llm");
+  assert.equal(harness.api.state().currentFilter.model, "llm");
+  assert.match(harness.fetchCalls.at(-1).url, /model=llm/);
+});
+
+test("opening an alert then going back keeps the queue on Model", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  harness.api.open(5);
+  await harness.settle();
+  assert.match(String(harness.pushedUrls.at(-1)), /^\/triage\/5\?.*model=llm/);
+
+  // Back to the entry the queue started on.
+  harness.goBackTo("/triage?model=llm");
+  await harness.settle();
+  assert.equal(harness.api.state().currentFilter.model, "llm");
+  assert.match(harness.fetchCalls.at(-1).url, /model=llm/);
+
+  // Even a bare entry reaching popstate resolves to Model, not All.
+  harness.goBackTo("/triage");
+  await harness.settle();
+  assert.equal(harness.api.state().currentFilter.model, "llm");
+});
+
+test("a bare detail URL canonicalizes and keeps Model neighbours across history", async () => {
+  const harness = runDashboard({ pathname: "/triage/5" });
+  await harness.settle();
+
+  assert.ok(
+    harness.replacedUrls.some((url) => String(url) === "/triage/5?model=llm"),
+    `expected canonicalization, got ${JSON.stringify(harness.replacedUrls)}`,
+  );
+  assert.equal(harness.location.pathname, "/triage/5");
+  assert.equal(harness.api.state().activeDetail.id, 5);
+  const investigated = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/investigation"));
+  assert.match(investigated.at(-1), /model=llm/);
+
+  harness.goBackTo("/triage/5?model=llm");
+  await harness.settle();
+  assert.equal(harness.api.state().currentFilter.model, "llm");
+  assert.match(
+    harness.fetchCalls.map(({ url }) => url).filter((url) => url.includes("/investigation")).at(-1),
+    /model=llm/,
+  );
+});
+
+test("selecting All writes model=all and omits the API model parameter", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  harness.api.setFilter("model", "");
+  harness.api.applyFilters();
+  await harness.settle();
+
+  assert.match(String(harness.replacedUrls.at(-1)), /model=all/);
+  assert.equal(harness.location.search, "?model=all");
+  // All is a URL encoding only; the API has no such filter value.
+  const listUrl = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => /\/api\/v1\/verdicts\?/.test(url))
+    .at(-1);
+  assert.doesNotMatch(listUrl, /model=/);
+});
+
+test("model=all survives a reload and history navigation", async () => {
+  const reloaded = runDashboard({ pathname: "/triage", search: "?model=all" });
+  await reloaded.settle();
+
+  assert.equal(reloaded.api.state().currentFilter.model, "");
+  // Already explicit, so canonicalization leaves it alone.
+  assert.ok(!reloaded.replacedUrls.some((url) => String(url).includes("model=llm")));
+  assert.equal(reloaded.location.search, "?model=all");
+  const listUrl = reloaded.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => /\/api\/v1\/verdicts\?/.test(url))
+    .at(-1);
+  assert.doesNotMatch(listUrl, /model=/);
+
+  reloaded.goBackTo("/triage?model=all");
+  await reloaded.settle();
+  assert.equal(reloaded.api.state().currentFilter.model, "");
+});
+
+test("other filters survive canonicalization and history navigation", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?verdict=real&source=wazuh&review=unreviewed&signature=scan",
+  });
+  await harness.settle();
+
+  const canonical = String(harness.replacedUrls.at(-1));
+  for (const expected of [
+    "model=llm",
+    "verdict=real",
+    "source=wazuh",
+    "review=unreviewed",
+    "signature=scan",
+  ]) {
+    assert.ok(canonical.includes(expected), `${expected} missing from ${canonical}`);
+  }
+
+  harness.goBackTo(canonical);
+  await harness.settle();
+  const state = harness.api.state();
+  assert.deepEqual({ ...state.currentFilter }, {
+    verdict: "real",
+    signature: "scan",
+    model: "llm",
+    source: "wazuh",
+    review: "unreviewed",
+  });
+  assert.equal(harness.document.getElementById("sigFilter").value, "scan");
+  assert.equal(harness.document.getElementById("sourceFilter").value, "wazuh");
+  assert.equal(harness.document.getElementById("reviewFilter").value, "unreviewed");
+});
+
+test("canonicalization leaves non-triage routes alone", async () => {
+  const harness = runDashboard({ pathname: "/overview" });
+  await harness.settle();
+
+  assert.deepEqual(harness.replacedUrls, []);
+  assert.equal(harness.location.search, "");
 });
 
 test("queue badge counts declare their global 24h scope", () => {

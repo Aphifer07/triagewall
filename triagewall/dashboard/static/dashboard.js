@@ -7,6 +7,16 @@ const VALID_FILTERS = {
   source: new Set(["", "suricata", "wazuh"]),
   review: new Set(["", "unreviewed", "agreed", "corrected"]),
 };
+// The model filter is the only one whose "no selection" is itself a product
+// choice, so it is always written to the URL explicitly. Encoding All as an
+// absent parameter made a bare URL ambiguous: a fresh /triage means Model (the
+// default) while a Back to a bare entry would have meant All, silently
+// changing the queue scope and the investigation neighbours. Internally All
+// stays the empty string, and the empty string is what the API sees -- the
+// model parameter is simply omitted from the request.
+const MODEL_ALL_PARAM = "all";
+const DEFAULT_MODEL_FILTER = "llm";
+const TRIAGE_QUEUE_PATHS = new Set(["/", "/triage"]);
 
 let currentFilter = {
   verdict: "",
@@ -125,39 +135,68 @@ function readFilterParam(params, key) {
   const value = params.get(key);
   if (value == null) return null;
   if (key === "signature") return value.slice(0, 200);
+  // An explicit All maps back onto the internal no-model-filter state.
+  if (key === "model" && value === MODEL_ALL_PARAM) return "";
   return VALID_FILTERS[key]?.has(value) ? value : null;
 }
 
-// First paint: an absent parameter leaves the built-in default in place.
-function initializeFilterState() {
+// The URL is the whole truth, at first paint and on every history restore. A
+// key the entry does not carry is cleared, so a filter chosen after that entry
+// was recorded cannot survive into it and quietly narrow the queue. The one
+// exception is `model`: a bare URL means the product default, Model, never
+// All, which must always be written out as model=all.
+function hydrateFilterStateFromUrl() {
   const params = new URLSearchParams(window.location.search);
   for (const key of FILTER_KEYS) {
     const value = readFilterParam(params, key);
-    if (value != null) currentFilter[key] = value;
+    if (value != null) {
+      currentFilter[key] = value;
+    } else {
+      currentFilter[key] = key === "model" ? DEFAULT_MODEL_FILTER : "";
+    }
   }
   syncFilterControls();
 }
 
-// History restore: the URL is the whole truth. A key the restored entry does
-// not carry is cleared, so a filter chosen after that entry was recorded
-// cannot survive into it and quietly narrow the restored queue.
-function hydrateFilterStateFromUrl() {
+function isTriageRoute() {
+  return TRIAGE_QUEUE_PATHS.has(window.location.pathname) || detailPathEventId() != null;
+}
+
+// Stamp the default onto a bare triage URL so history can never record an
+// entry whose model scope is only implied. replaceState, not pushState: this
+// corrects the current entry rather than adding one. Other recognized filters
+// and the event id in the pathname are preserved.
+function canonicalizeTriageUrl() {
+  if (!isTriageRoute()) return;
   const params = new URLSearchParams(window.location.search);
-  for (const key of FILTER_KEYS) {
-    currentFilter[key] = readFilterParam(params, key) ?? "";
-  }
-  syncFilterControls();
+  if (params.get("model") != null) return;
+  window.history.replaceState(
+    {},
+    "",
+    `${window.location.pathname}?${queueFilterParams().toString()}`,
+  );
 }
 
 // The queue filters travel with the analyst. Detail URLs, previous/next and
 // the back link all carry them, so opening an alert and returning restores the
 // view instead of resetting the queue.
-function queueQueryString() {
+// URL form of one filter. Only `model` differs from the internal value.
+function filterParamValue(key) {
+  if (key !== "model") return currentFilter[key];
+  return currentFilter.model === "" ? MODEL_ALL_PARAM : currentFilter.model;
+}
+
+function queueFilterParams() {
   const params = new URLSearchParams();
   for (const key of FILTER_KEYS) {
-    if (currentFilter[key]) params.set(key, currentFilter[key]);
+    const value = filterParamValue(key);
+    if (value) params.set(key, value);
   }
-  const query = params.toString();
+  return params;
+}
+
+function queueQueryString() {
+  const query = queueFilterParams().toString();
   return query ? `?${query}` : "";
 }
 
@@ -220,7 +259,8 @@ function syncUrlState(eventId = null) {
   if (window.location.pathname !== "/triage" && window.location.pathname !== "/") return;
   const url = new URL(window.location.href);
   for (const key of FILTER_KEYS) {
-    if (currentFilter[key]) url.searchParams.set(key, currentFilter[key]);
+    const value = filterParamValue(key);
+    if (value) url.searchParams.set(key, value);
     else url.searchParams.delete(key);
   }
   if (eventId == null) url.searchParams.delete("alert");
@@ -238,6 +278,8 @@ function buildVerdictParams(cursor = null) {
   const params = new URLSearchParams();
   if (currentFilter.verdict) params.set("verdict", currentFilter.verdict);
   if (currentFilter.signature) params.set("signature", currentFilter.signature);
+  // Internal values, not URL values: the API has no "all" model filter, so All
+  // is expressed by omitting the parameter. Never send MODEL_ALL_PARAM here.
   if (currentFilter.model) params.set("model", currentFilter.model);
   if (currentFilter.source) params.set("source", currentFilter.source);
   if (currentFilter.review) params.set("review", currentFilter.review);
@@ -892,6 +934,7 @@ async function loadInvestigation(eventId, navigation) {
   const { generation, signal } = navigation;
   const params = new URLSearchParams();
   for (const key of FILTER_KEYS) {
+    // Internal values: All omits the model parameter rather than sending it.
     if (currentFilter[key]) params.set(key, currentFilter[key]);
   }
   try {
@@ -987,10 +1030,22 @@ function toggleCorrection(eventId, trigger) {
   trigger?.setAttribute("aria-expanded", String(expanded));
 }
 
+// Where a feedback action was raised from. A slow POST outlives the route that
+// started it, so its completion is only allowed to refresh that same route.
+function feedbackOriginIsCurrent(origin) {
+  if (currentView !== origin.view) return false;
+  if (origin.view === "detail") return detailPathEventId() === origin.eventId;
+  return window.location.pathname === origin.pathname;
+}
+
 async function feedback(id, agentVerdict, customVerdict = null, notes = "") {
   const humanVerdict = customVerdict || agentVerdict;
   const eventId = Number(id);
-  const fromDetail = currentView === "detail";
+  const origin = {
+    view: currentView,
+    pathname: window.location.pathname,
+    eventId,
+  };
   try {
     // The write is never aborted: a save that reached the server must not be
     // cancelled because the operator moved on.
@@ -1000,18 +1055,19 @@ async function feedback(id, agentVerdict, customVerdict = null, notes = "") {
       body: JSON.stringify({ human_verdict: humanVerdict, notes }),
     });
     if (!response.ok) throw new Error(`Feedback was not saved (${response.status})`);
+    // The toast is a global status line and reports the write truthfully
+    // wherever the operator now is. Everything below it is route-specific and
+    // only runs when this completion still owns the route it came from.
     showToast("Operator feedback saved.");
-    if (fromDetail) {
-      // Only refresh if the operator is still on that same alert. Otherwise a
-      // slow POST would drag them back to the alert they just left.
-      if (currentView === "detail" && detailPathEventId() === eventId) {
-        await loadDetail(eventId, beginDetailNavigation());
-      }
+    if (!feedbackOriginIsCurrent(origin)) return;
+    if (origin.view === "detail") {
+      await loadDetail(eventId, beginDetailNavigation());
       return;
     }
     resetPagination();
     await load();
   } catch (error) {
+    if (!feedbackOriginIsCurrent(origin)) return;
     showToast(error.message, true);
   }
 }
@@ -1176,6 +1232,7 @@ window.addEventListener("popstate", () => {
   // the restored route, its investigation request, previous/next and the back
   // link all use that entry's filters rather than the newer in-memory ones.
   hydrateFilterStateFromUrl();
+  canonicalizeTriageUrl();
   syncQueueLinks();
   const detailId = initializeView();
   if (detailId) {
@@ -1260,7 +1317,8 @@ document.addEventListener("keydown", (event) => {
 });
 
 initializeView();
-initializeFilterState();
+hydrateFilterStateFromUrl();
+canonicalizeTriageUrl();
 syncQueueLinks();
 // The first call is the page's initial load and must render the detail view.
 // Every later call is a scheduled tick and must leave it untouched.
