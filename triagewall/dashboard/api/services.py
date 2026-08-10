@@ -612,13 +612,19 @@ def fetch_investigation(
     )
 
     # Address groups: bounded candidate set, matched in application code.
+    # Over-fetch by one row. A window holding exactly the budget has omitted
+    # nothing, so only a row *beyond* the budget proves the scan was partial.
+    candidate_limit = MAX_RELATED_CANDIDATE_ROWS
     candidates: list[sqlite3.Row] = []
+    candidates_truncated = False
     if anchor["src_ip"] or anchor["dest_ip"]:
         candidates = conn.execute(
             _RELATED_CANDIDATES_SQL,
-            (window_start, MAX_RELATED_CANDIDATE_ROWS),
+            (window_start, candidate_limit + 1),
         ).fetchall()
-    candidates_truncated = len(candidates) >= MAX_RELATED_CANDIDATE_ROWS
+        candidates_truncated = len(candidates) > candidate_limit
+        if candidates_truncated:
+            candidates = candidates[:candidate_limit]
 
     for relationship, column, anchor_value in (
         ("same_source_ip", "src_ip", anchor["src_ip"]),
@@ -644,7 +650,7 @@ def fetch_investigation(
                 "reason": reason,
                 "exact": False,
                 "truncated": bool(anchor_value) and candidates_truncated,
-                "candidate_limit": MAX_RELATED_CANDIDATE_ROWS,
+                "candidate_limit": candidate_limit,
                 "candidates_examined": len(candidates) if anchor_value else 0,
                 "alerts": alerts,
             }

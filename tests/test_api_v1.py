@@ -1151,6 +1151,27 @@ class InvestigationTests(unittest.TestCase):
         # The exact group is unaffected by the candidate budget.
         self.assertFalse(self.group(payload, "same_rule")["truncated"])
 
+    def test_candidate_budget_boundaries_report_truncation_honestly(self):
+        # The window holds 7 events, the anchor included. Ordered newest first
+        # they are 1, 5, 2, 3, 4, 6, 7 -- so a budget of 6 drops event 7, which
+        # is one of the anchor's source-address matches.
+        window_rows = 7
+        for limit, truncated, examined, expected_ids in (
+            (window_rows - 1, True, window_rows - 1, [2, 5]),
+            (window_rows, False, window_rows, [2, 5, 7]),
+            (window_rows + 1, False, window_rows, [2, 5, 7]),
+        ):
+            with self.subTest(candidate_limit=limit):
+                with patch.object(services, "MAX_RELATED_CANDIDATE_ROWS", limit):
+                    payload = self.investigate(1).json()
+                entry = self.group(payload, "same_source_ip")
+                self.assertEqual(entry["candidate_limit"], limit)
+                self.assertEqual(entry["candidates_examined"], examined)
+                # Exactly at the budget nothing was omitted, so claiming a
+                # partial result there would be a false warning.
+                self.assertEqual(entry["truncated"], truncated)
+                self.assertEqual(sorted(a["id"] for a in entry["alerts"]), expected_ids)
+
     def test_window_is_reported_with_the_payload(self):
         payload = self.investigate(1, hours=1).json()
         self.assertEqual(payload["window_hours"], 1)
