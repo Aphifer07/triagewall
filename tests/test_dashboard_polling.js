@@ -75,6 +75,19 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
   const deferred = [];
   const windowListeners = new Map();
   const saved = new Map();
+  // Controlled timers so debounce behaviour is asserted deterministically
+  // rather than by waiting out a real 300ms.
+  const timers = [];
+  let timerId = 0;
+  const setTimeoutStub = (handler, delay) => {
+    timerId += 1;
+    timers.push({ id: timerId, handler, delay, done: false });
+    return timerId;
+  };
+  const clearTimeoutStub = (id) => {
+    const timer = timers.find((entry) => entry.id === id);
+    if (timer) timer.done = true;
+  };
 
   const document = {
     title: "",
@@ -274,8 +287,8 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
       }),
     URL,
     URLSearchParams,
-    setTimeout,
-    clearTimeout,
+    setTimeout: setTimeoutStub,
+    clearTimeout: clearTimeoutStub,
     console,
     navigator: {},
   };
@@ -318,6 +331,16 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
       queued.forEach(({ release }) => release());
     },
     tick: () => intervals.forEach((handler) => handler()),
+    pendingTimers: () => timers.filter((timer) => !timer.done),
+    // Fire every timer scheduled so far, as elapsing past the longest delay
+    // would. Cancelled timers stay cancelled.
+    advanceTimers() {
+      const due = timers.filter((timer) => !timer.done);
+      due.forEach((timer) => {
+        timer.done = true;
+        timer.handler();
+      });
+    },
     // Simulates the browser restoring a history entry: move the URL, then
     // deliver popstate, exactly as a back/forward press would.
     goBackTo(url) {
@@ -1184,6 +1207,164 @@ test("canonicalization leaves non-triage routes alone", async () => {
 
   assert.deepEqual(harness.replacedUrls, []);
   assert.equal(harness.location.search, "");
+});
+
+// Counts only the queue/detail reads, so health and stats polling never make
+// a "nothing reloaded" assertion look false.
+function routeFetchUrls(harness) {
+  return harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts"));
+}
+
+test("a pending signature debounce cannot remount a detail page", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [
+      { id: 7, verdict: "real", signature: "seven", confidence: 0.5, human_verdict: null },
+    ],
+  });
+  await harness.settle();
+
+  // The real input handler schedules the debounced queue reload.
+  harness.document.getElementById("sigFilter").dispatch("input", {
+    target: { value: "scan" },
+  });
+  assert.equal(harness.pendingTimers().length, 1, "the debounce should be scheduled");
+
+  // The operator opens an alert before it fires and starts writing.
+  harness.api.open(7);
+  await harness.settle();
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "sentinel note the debounce must not destroy";
+  notes.value = sentinel;
+
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBefore = detail.innerHTMLWrites;
+  const fetchesBefore = routeFetchUrls(harness).length;
+
+  harness.advanceTimers();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(notes.value, sentinel, "the stale debounce destroyed the draft");
+  assert.equal(
+    detail.innerHTMLWrites,
+    writesBefore,
+    "the stale debounce remounted the detail page",
+  );
+  assert.equal(state.currentView, "detail");
+  assert.equal(state.activeDetail.id, 7);
+  assert.equal(harness.location.pathname, "/triage/7");
+  assert.equal(routeFetchUrls(harness).length, fetchesBefore, "a reload was issued");
+  assert.equal(harness.document.getElementById("toast").textContent, "");
+  // The typed value itself is kept: only the scheduled reload was dropped.
+  assert.equal(state.currentFilter.signature, "scan");
+});
+
+test("leaving the queue cancels the pending signature debounce", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  harness.document.getElementById("sigFilter").dispatch("input", {
+    target: { value: "scan" },
+  });
+  assert.equal(harness.pendingTimers().length, 1);
+
+  harness.api.open(7);
+  await harness.settle();
+  assert.equal(
+    harness.pendingTimers().length,
+    0,
+    "the queue reload was still scheduled after navigating to detail",
+  );
+});
+
+test("a popstate to a detail route cancels a pending signature debounce", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  harness.document.getElementById("sigFilter").dispatch("input", {
+    target: { value: "scan" },
+  });
+  assert.equal(harness.pendingTimers().length, 1);
+
+  harness.goBackTo("/triage/7?model=llm");
+  await harness.settle();
+  assert.equal(harness.pendingTimers().length, 0);
+
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "written after the back navigation";
+  notes.value = sentinel;
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBefore = detail.innerHTMLWrites;
+  const fetchesBefore = routeFetchUrls(harness).length;
+
+  harness.advanceTimers();
+  await harness.settle();
+
+  assert.equal(notes.value, sentinel);
+  assert.equal(detail.innerHTMLWrites, writesBefore);
+  assert.equal(harness.api.state().activeDetail.id, 7);
+  assert.equal(routeFetchUrls(harness).length, fetchesBefore);
+});
+
+test("applyFilters is queue-only even if a stale timer survives", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  harness.api.open(7);
+  await harness.settle();
+  const notes = harness.document.getElementById("detailNotes");
+  notes.value = "draft";
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBefore = detail.innerHTMLWrites;
+  const fetchesBefore = routeFetchUrls(harness).length;
+
+  // Second layer: even invoked directly from the detail view, it must do
+  // nothing rather than fall through to load().
+  harness.api.applyFilters();
+  await harness.settle();
+
+  assert.equal(notes.value, "draft");
+  assert.equal(detail.innerHTMLWrites, writesBefore);
+  assert.equal(harness.api.state().activeDetail.id, 7);
+  assert.equal(routeFetchUrls(harness).length, fetchesBefore);
+  assert.equal(harness.document.getElementById("toast").textContent, "");
+});
+
+test("signature filtering still reloads the queue exactly once", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+  const before = routeFetchUrls(harness).length;
+
+  harness.document.getElementById("sigFilter").dispatch("input", {
+    target: { value: "scan" },
+  });
+  harness.advanceTimers();
+  await harness.settle();
+
+  const after = routeFetchUrls(harness);
+  assert.equal(after.length, before + 1, "expected exactly one queue reload");
+  assert.match(after.at(-1), /signature=scan/);
+  assert.equal(harness.api.state().currentFilter.signature, "scan");
+  assert.match(String(harness.replacedUrls.at(-1)), /signature=scan/);
+});
+
+test("rapid typing debounces to a single queue reload", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+  const before = routeFetchUrls(harness).length;
+
+  const input = harness.document.getElementById("sigFilter");
+  for (const value of ["s", "sc", "sca", "scan"]) {
+    input.dispatch("input", { target: { value } });
+  }
+  assert.equal(harness.pendingTimers().length, 1, "earlier timers were not cleared");
+
+  harness.advanceTimers();
+  await harness.settle();
+  assert.equal(routeFetchUrls(harness).length, before + 1);
 });
 
 test("queue badge counts declare their global 24h scope", () => {

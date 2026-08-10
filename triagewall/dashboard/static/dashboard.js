@@ -14,6 +14,7 @@ const VALID_FILTERS = {
 // changing the queue scope and the investigation neighbours. Internally All
 // stays the empty string, and the empty string is what the API sees -- the
 // model parameter is simply omitted from the request.
+const SIGNATURE_FILTER_DEBOUNCE_MS = 300;
 const MODEL_ALL_PARAM = "all";
 const DEFAULT_MODEL_FILTER = "llm";
 const TRIAGE_QUEUE_PATHS = new Set(["/", "/triage"]);
@@ -88,6 +89,13 @@ function formatCompact(value) {
   }).format(number);
 }
 
+// Drop a scheduled queue reload without touching the filter it was going to
+// apply: the typed signature is already in currentFilter and in the URL.
+function cancelSignatureFilterTimer() {
+  clearTimeout(window.signatureFilterTimer);
+  window.signatureFilterTimer = null;
+}
+
 function initializeView() {
   const viewByPath = {
     "/": "triage",
@@ -118,6 +126,11 @@ function initializeView() {
   });
   document.title = `${titles[currentView]} — Triagewall`;
   document.body.classList.remove("view-loading");
+  // Every route transition funnels through here, so cancelling the pending
+  // queue reload here covers direct navigation, keyboard shortcuts, related
+  // alert links and popstate alike. Only the scheduled reload is dropped; the
+  // typed signature stays in currentFilter and in the URL.
+  if (currentView !== "triage") cancelSignatureFilterTimer();
   return detailMatch ? Number(detailMatch[1]) : null;
 }
 
@@ -1097,6 +1110,12 @@ async function returnToLive() {
 }
 
 function applyFilters() {
+  // Queue-only. The signature filter is debounced, so this can fire after the
+  // operator has already opened an alert; load() would then remount the detail
+  // page and discard an unsaved note. The filter value itself is already in
+  // currentFilter and in the detail URL, and openDetailById loads the
+  // investigation with it, so there is nothing for a stale call to do here.
+  if (currentView !== "triage") return;
   // Retire any queue read already in flight, including a Load Older page whose
   // rows belong to the filters being replaced.
   invalidateQueueRequests();
@@ -1163,8 +1182,8 @@ document.querySelectorAll(".model-btn").forEach((button) => {
 
 document.getElementById("sigFilter").addEventListener("input", (event) => {
   currentFilter.signature = event.target.value;
-  clearTimeout(window.signatureFilterTimer);
-  window.signatureFilterTimer = setTimeout(applyFilters, 300);
+  cancelSignatureFilterTimer();
+  window.signatureFilterTimer = setTimeout(applyFilters, SIGNATURE_FILTER_DEBOUNCE_MS);
 });
 
 document.getElementById("sourceFilter").addEventListener("change", (event) => {
