@@ -218,6 +218,10 @@ function runDashboard({
           false_positive_count: 0,
           uncertain_count: 0,
           unclassified_count: 0,
+          exact: true,
+          truncated: false,
+          candidate_limit: 2000,
+          candidates_examined: 1,
         },
         related: [
           {
@@ -226,8 +230,8 @@ function runDashboard({
             reason: "same rule",
             exact: true,
             truncated: false,
-            candidate_limit: null,
-            candidates_examined: null,
+            candidate_limit: 2000,
+            candidates_examined: 1,
             alerts: [
               {
                 id: id * 10,
@@ -544,8 +548,8 @@ test("dashboard wires SPC outside the verdict-loading function", () => {
   assert.notEqual(loadStart, -1);
   assert.notEqual(loadEnd, -1);
   assert.doesNotMatch(script.slice(loadStart, loadEnd), /loadSpc\s*\(/);
-  assert.match(script, /startIndependentPolling\(\{\s*\n\s*loadMain: \(\) => \{/);
-  assert.match(script, /\n\s*loadSpc,\n\}\);/);
+  assert.match(script, /startIndependentPolling\(\{\s*\r?\n\s*loadMain: \(\) => \{/);
+  assert.match(script, /\r?\n\s*loadSpc,\r?\n\}\);/);
 
   const indexPath = path.join(
     __dirname,
@@ -752,6 +756,8 @@ test("investigation panels escape sensor text and state their scope", () => {
   assert.match(script, /function relatedScopeNote\(group, windowHours\)/);
   assert.match(script, /related-scope-partial/);
   assert.match(script, /so older matches in this window are not shown/);
+  assert.match(script, /Partial: counted matches among the/);
+  assert.match(script, /First examined/);
   // Recurrence is namespaced by source type, not by signature id alone.
   assert.match(script, /Suricata and Wazuh identifiers are counted separately/);
 });

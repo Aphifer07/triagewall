@@ -880,13 +880,18 @@ function renderRecurrence(data) {
     return;
   }
   const ruleLabel = recurrence.source_type === "wazuh" ? "rule" : "signature";
+  const scope = recurrence.truncated
+    ? `Partial: counted matches among the ${formatCompact(recurrence.candidates_examined)} newest events in this ${data.window_hours}h window.`
+    : `Exact across all ${formatCompact(recurrence.candidates_examined)} events in this ${data.window_hours}h window.`;
+  const firstLabel = recurrence.truncated ? "First examined" : "First in window";
   host.innerHTML = `
     <h3>Recurrence</h3>
-    <p class="recurrence-headline"><strong>${escapeHtml(formatCompact(recurrence.occurrences))}</strong> in the last ${escapeHtml(data.window_hours)}h</p>
+    <p class="recurrence-headline"><strong>${escapeHtml(formatCompact(recurrence.occurrences))}</strong> ${recurrence.truncated ? "matches found in the sampled" : "in the last"} ${escapeHtml(data.window_hours)}h</p>
     <p class="recurrence-basis">Grouped by source type and ${escapeHtml(ruleLabel)} ID (${escapeHtml(recurrence.source_type ?? "unknown")} · ${escapeHtml(recurrence.signature_id)}). Suricata and Wazuh identifiers are counted separately.</p>
+    <p class="related-scope${recurrence.truncated ? " related-scope-partial" : ""}">${escapeHtml(scope)}</p>
     <dl class="detail-grid recurrence-stats">
-      ${detailField("First in window", formatTimestamp(recurrence.first_seen))}
-      ${detailField("Latest in window", formatTimestamp(recurrence.last_seen))}
+      ${detailField(firstLabel, formatTimestamp(recurrence.first_seen))}
+      ${detailField(recurrence.truncated ? "Latest examined" : "Latest in window", formatTimestamp(recurrence.last_seen))}
       ${detailField("Real", formatCompact(recurrence.real_count))}
       ${detailField("False positive", formatCompact(recurrence.false_positive_count))}
       ${detailField("Uncertain", formatCompact(recurrence.uncertain_count))}

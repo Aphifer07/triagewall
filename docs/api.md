@@ -186,11 +186,13 @@ Response: `{generated_at, mode, event_id, window_hours, window_start,
 recurrence, related, neighbors}`.
 
 **`recurrence`** counts events sharing this alert's `(source type, signature
-id)` inside the window. The source qualifier is load-bearing: Suricata stores
-its SID in `signature_id` while Wazuh stores `rule.id` there, so an unqualified
-group would merge two unrelated rules that happen to share an integer. Rows
-predating source provenance are counted as Suricata. A row with no
-`signature_id` has no group and reports `available: false`.
+id)` inside the bounded candidate set. The source qualifier is load-bearing:
+Suricata stores its SID in `signature_id` while Wazuh stores `rule.id` there,
+so an unqualified group would merge two unrelated rules that happen to share an
+integer. Rows predating source provenance are counted as Suricata. A row with
+no `signature_id` has no group and reports `available: false`. `exact`,
+`truncated`, `candidate_limit`, and `candidates_examined` state whether the
+count covers the whole window or only its newest candidates.
 
 **`related`** is a list of groups, each carrying `relationship`, a human
 `label`, a `reason` explaining the link, and the honest scope of the query
@@ -198,16 +200,17 @@ behind it:
 
 | Group | `exact` | Scope |
 |-------|---------|-------|
-| `same_rule` | `true` | Indexed equality on `(source type, signature id)` across the whole window. |
+| `same_rule` | conditional | Exact equality on `(source type, signature id)` inside the bounded candidate set. |
 | `same_source_ip` | `false` | Exact `src_ip` equality, matched inside a bounded candidate set. |
 | `same_destination_ip` | `false` | Exact `dest_ip` equality, matched inside a bounded candidate set. |
 
-`src_ip` and `dest_ip` are not indexed, so the address groups are **not**
-complete correlation across the window. They examine at most `candidate_limit`
-(2000) of the newest events in the window, selected through the `processed_at`
-index. `candidates_examined` reports how many were read, and `truncated` is
-`true` when that budget was reached, meaning older matches inside the window
-were never examined. Each group returns at most 10 alerts.
+All correlation views examine at most `candidate_limit` (2000) of the newest
+events in the window, selected through the `processed_at` index.
+`candidates_examined` reports how many were read. `truncated: true` means an
+additional row proved that older events in the window were not examined, so
+recurrence counts and every related group are partial. When the candidate query
+exhausts the window, recurrence and `same_rule` report `exact: true`; address
+groups remain non-causal bounded matches. Each group returns at most 10 alerts.
 
 An address match is a shared-addressing observation, not a causal finding.
 

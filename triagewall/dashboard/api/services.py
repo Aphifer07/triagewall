@@ -47,8 +47,9 @@ MAX_FEEDBACK_NOTES_LENGTH = 2_000
 # seek; it is a bounded scan, and a wider window would widen that scan without
 # a production-shaped benchmark proving a query-time budget is still met.
 #
-# MAX_RELATED_CANDIDATE_ROWS is the second half of that bound. Address matching
-# examines at most this many of the newest rows in the window, selected through
+# MAX_RELATED_CANDIDATE_ROWS is the second half of that bound. Every correlation
+# view -- recurrence, same-rule activity and address matches -- examines at most
+# this many of the newest rows in the window, selected through
 # idx_triage_processed. Anything older inside the window is not examined, and
 # the response says so via candidate_limit/truncated rather than implying the
 # result is complete correlation across the whole window.
@@ -261,64 +262,10 @@ def fetch_verdict(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None
 # unrelated rules that happen to share an integer.
 _SOURCE_TYPE_EXPR = "COALESCE(sensor.source_type, 'suricata')"
 
-# Both rule queries are pinned to idx_triage_processed rather than left to the
-# planner. Given an equality on signature_id, SQLite prefers
-# idx_triage_signature_id and visits every row that signature has ever produced
-# before applying the window, so a frequent SID costs time proportional to the
-# whole retained history instead of to the 24-hour window being asked about.
-# Pinning the range index makes processed_at >= ? the driving access, so the
-# work is bounded by the window.
-#
-# A composite (signature_id, processed_at) index would also fix this, but
-# creating one is deliberately out of scope here: the first v0.4 migration
-# would have to build it inside BEGIN IMMEDIATE against the live database,
-# which means unplanned writer downtime and disk growth. INDEXED BY needs no
-# schema change, and idx_triage_processed is a REQUIRED_INDEXES member verified
-# fail-closed at startup, so the hint cannot silently refer to a missing index.
-_RECURRENCE_SQL = f"""
-SELECT COUNT(*) AS occurrences,
-       MIN(events.processed_at) AS first_seen,
-       MAX(events.processed_at) AS last_seen,
-       COALESCE(SUM(CASE WHEN events.verdict = 'real' THEN 1 ELSE 0 END), 0)
-           AS real_count,
-       COALESCE(
-           SUM(CASE WHEN events.verdict = 'false_positive' THEN 1 ELSE 0 END), 0
-       ) AS false_positive_count,
-       COALESCE(SUM(CASE WHEN events.verdict = 'uncertain' THEN 1 ELSE 0 END), 0)
-           AS uncertain_count,
-       COALESCE(SUM(CASE WHEN events.verdict IS NULL THEN 1 ELSE 0 END), 0)
-           AS unclassified_count
-FROM triage_events AS events INDEXED BY idx_triage_processed
-LEFT JOIN sensor_event_context AS sensor
-  ON sensor.triage_event_id = events.id
-WHERE events.processed_at >= ?
-  AND events.processed_at IS NOT NULL
-  AND events.signature_id = ?
-  AND {_SOURCE_TYPE_EXPR} = ?
-"""
-
-# Same window-first shape as the recurrence count. See the note above for why
-# the range index is pinned instead of the signature index.
-_RELATED_BY_RULE_SQL = f"""
-SELECT events.id, events.timestamp, events.processed_at,
-       events.signature_id, events.signature, events.verdict,
-       events.confidence, events.src_ip, events.dest_ip,
-       {_SOURCE_TYPE_EXPR} AS source_type
-FROM triage_events AS events INDEXED BY idx_triage_processed
-LEFT JOIN sensor_event_context AS sensor
-  ON sensor.triage_event_id = events.id
-WHERE events.processed_at >= ?
-  AND events.processed_at IS NOT NULL
-  AND events.signature_id = ?
-  AND {_SOURCE_TYPE_EXPR} = ?
-  AND events.id != ?
-ORDER BY events.processed_at DESC, events.id DESC
-LIMIT ?
-"""
-
 # The newest candidates in the window, ordered by the indexed column so
-# idx_triage_processed drives the range. Address matching happens over this
-# bounded set; it never scans triage_events end to end.
+# idx_triage_processed drives the range. All correlation happens over this one
+# bounded set; no investigation query scans a high-volume 24-hour window end to
+# end or builds a new production index during deployment.
 _RELATED_CANDIDATES_SQL = f"""
 SELECT events.id, events.timestamp, events.processed_at,
        events.signature_id, events.signature, events.verdict,
@@ -344,8 +291,8 @@ LEFT JOIN sensor_event_context AS sensor
 RELATIONSHIP_LABELS = {
     "same_rule": (
         "Same rule",
-        "Same source type and signature id as this alert. Exact match within "
-        "the window.",
+        "Same source type and signature id as this alert among the examined "
+        "candidates. The scope below states whether the whole window was read.",
     ),
     "same_source_ip": (
         "Same source address",
@@ -560,8 +507,24 @@ def fetch_investigation(
         "ip_secret": ip_secret,
     }
 
+    # Fetch one bounded candidate set for every correlation view. Over-fetch by
+    # one row: exactly reaching the budget does not prove that anything was
+    # omitted, while the extra row does.
+    candidate_limit = MAX_RELATED_CANDIDATE_ROWS
+    candidates: list[sqlite3.Row] = []
+    candidates_truncated = False
+    if signature_id is not None or anchor["src_ip"] or anchor["dest_ip"]:
+        candidates = conn.execute(
+            _RELATED_CANDIDATES_SQL,
+            (window_start, candidate_limit + 1),
+        ).fetchall()
+        candidates_truncated = len(candidates) > candidate_limit
+        if candidates_truncated:
+            candidates = candidates[:candidate_limit]
+
     # Recurrence. A row without a signature_id has no group to belong to;
-    # correlating on NULL would join every other signature-less row.
+    # correlating on NULL would join every other signature-less row. Counts are
+    # exact only when the candidate query proves it exhausted the whole window.
     if signature_id is None:
         recurrence = {
             "available": False,
@@ -574,40 +537,60 @@ def fetch_investigation(
             "false_positive_count": 0,
             "uncertain_count": 0,
             "unclassified_count": 0,
+            "exact": False,
+            "truncated": False,
+            "candidate_limit": None,
+            "candidates_examined": 0,
         }
     else:
-        row = conn.execute(
-            _RECURRENCE_SQL,
-            (window_start, signature_id, source_type),
-        ).fetchone()
+        recurrence_rows = [
+            candidate
+            for candidate in candidates
+            if candidate["signature_id"] == signature_id
+            and candidate["source_type"] == source_type
+        ]
+        processed_values = [
+            candidate["processed_at"]
+            for candidate in recurrence_rows
+            if candidate["processed_at"]
+        ]
         recurrence = {
             "available": True,
             "signature_id": int(signature_id),
             "source_type": source_type,
-            "occurrences": int(row["occurrences"] or 0),
-            "first_seen": _normalize_timestamp(row["first_seen"]),
-            "last_seen": _normalize_timestamp(row["last_seen"]),
-            "real_count": int(row["real_count"] or 0),
-            "false_positive_count": int(row["false_positive_count"] or 0),
-            "uncertain_count": int(row["uncertain_count"] or 0),
-            "unclassified_count": int(row["unclassified_count"] or 0),
+            "occurrences": len(recurrence_rows),
+            "first_seen": _normalize_timestamp(min(processed_values, default=None)),
+            "last_seen": _normalize_timestamp(max(processed_values, default=None)),
+            "real_count": sum(row["verdict"] == "real" for row in recurrence_rows),
+            "false_positive_count": sum(
+                row["verdict"] == "false_positive" for row in recurrence_rows
+            ),
+            "uncertain_count": sum(
+                row["verdict"] == "uncertain" for row in recurrence_rows
+            ),
+            "unclassified_count": sum(
+                row["verdict"] is None for row in recurrence_rows
+            ),
+            "exact": not candidates_truncated,
+            "truncated": candidates_truncated,
+            "candidate_limit": candidate_limit,
+            "candidates_examined": len(candidates),
         }
 
     groups: list[dict[str, Any]] = []
 
-    # Same rule: index-backed equality, so this group is exact for the window.
+    # Same rule uses the same bounded candidates as recurrence. This keeps one
+    # frequent SID from monopolizing the dashboard and gives both panels the
+    # same honest completeness boundary.
     rule_alerts: list[dict[str, Any]] = []
     if signature_id is not None:
-        rule_rows = conn.execute(
-            _RELATED_BY_RULE_SQL,
-            (
-                window_start,
-                signature_id,
-                source_type,
-                event_id,
-                MAX_RELATED_ALERTS,
-            ),
-        ).fetchall()
+        rule_rows = [
+            candidate
+            for candidate in candidates
+            if int(candidate["id"]) != event_id
+            and candidate["signature_id"] == signature_id
+            and candidate["source_type"] == source_type
+        ][:MAX_RELATED_ALERTS]
         rule_alerts = [
             _related_row_to_dict(r, "same_rule", **ip_policy) for r in rule_rows
         ]
@@ -617,29 +600,15 @@ def fetch_investigation(
             "relationship": "same_rule",
             "label": label,
             "reason": reason,
-            "exact": signature_id is not None,
-            "truncated": False,
-            "candidate_limit": None,
-            "candidates_examined": None,
+            "exact": signature_id is not None and not candidates_truncated,
+            "truncated": signature_id is not None and candidates_truncated,
+            "candidate_limit": candidate_limit if signature_id is not None else None,
+            "candidates_examined": len(candidates) if signature_id is not None else 0,
             "alerts": rule_alerts,
         }
     )
 
-    # Address groups: bounded candidate set, matched in application code.
-    # Over-fetch by one row. A window holding exactly the budget has omitted
-    # nothing, so only a row *beyond* the budget proves the scan was partial.
-    candidate_limit = MAX_RELATED_CANDIDATE_ROWS
-    candidates: list[sqlite3.Row] = []
-    candidates_truncated = False
-    if anchor["src_ip"] or anchor["dest_ip"]:
-        candidates = conn.execute(
-            _RELATED_CANDIDATES_SQL,
-            (window_start, candidate_limit + 1),
-        ).fetchall()
-        candidates_truncated = len(candidates) > candidate_limit
-        if candidates_truncated:
-            candidates = candidates[:candidate_limit]
-
+    # Address groups are matched in application code over the same candidates.
     for relationship, column, anchor_value in (
         ("same_source_ip", "src_ip", anchor["src_ip"]),
         ("same_destination_ip", "dest_ip", anchor["dest_ip"]),
