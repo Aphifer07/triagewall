@@ -261,6 +261,20 @@ def fetch_verdict(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None
 # unrelated rules that happen to share an integer.
 _SOURCE_TYPE_EXPR = "COALESCE(sensor.source_type, 'suricata')"
 
+# Both rule queries are pinned to idx_triage_processed rather than left to the
+# planner. Given an equality on signature_id, SQLite prefers
+# idx_triage_signature_id and visits every row that signature has ever produced
+# before applying the window, so a frequent SID costs time proportional to the
+# whole retained history instead of to the 24-hour window being asked about.
+# Pinning the range index makes processed_at >= ? the driving access, so the
+# work is bounded by the window.
+#
+# A composite (signature_id, processed_at) index would also fix this, but
+# creating one is deliberately out of scope here: the first v0.4 migration
+# would have to build it inside BEGIN IMMEDIATE against the live database,
+# which means unplanned writer downtime and disk growth. INDEXED BY needs no
+# schema change, and idx_triage_processed is a REQUIRED_INDEXES member verified
+# fail-closed at startup, so the hint cannot silently refer to a missing index.
 _RECURRENCE_SQL = f"""
 SELECT COUNT(*) AS occurrences,
        MIN(events.processed_at) AS first_seen,
@@ -274,30 +288,30 @@ SELECT COUNT(*) AS occurrences,
            AS uncertain_count,
        COALESCE(SUM(CASE WHEN events.verdict IS NULL THEN 1 ELSE 0 END), 0)
            AS unclassified_count
-FROM triage_events AS events
+FROM triage_events AS events INDEXED BY idx_triage_processed
 LEFT JOIN sensor_event_context AS sensor
   ON sensor.triage_event_id = events.id
-WHERE events.signature_id = ?
-  AND {_SOURCE_TYPE_EXPR} = ?
+WHERE events.processed_at >= ?
   AND events.processed_at IS NOT NULL
-  AND events.processed_at >= ?
+  AND events.signature_id = ?
+  AND {_SOURCE_TYPE_EXPR} = ?
 """
 
-# events.signature_id = ? leads the predicate so idx_triage_signature_id can
-# drive this query instead of a triage_events scan.
+# Same window-first shape as the recurrence count. See the note above for why
+# the range index is pinned instead of the signature index.
 _RELATED_BY_RULE_SQL = f"""
 SELECT events.id, events.timestamp, events.processed_at,
        events.signature_id, events.signature, events.verdict,
        events.confidence, events.src_ip, events.dest_ip,
        {_SOURCE_TYPE_EXPR} AS source_type
-FROM triage_events AS events
+FROM triage_events AS events INDEXED BY idx_triage_processed
 LEFT JOIN sensor_event_context AS sensor
   ON sensor.triage_event_id = events.id
-WHERE events.signature_id = ?
+WHERE events.processed_at >= ?
+  AND events.processed_at IS NOT NULL
+  AND events.signature_id = ?
   AND {_SOURCE_TYPE_EXPR} = ?
   AND events.id != ?
-  AND events.processed_at IS NOT NULL
-  AND events.processed_at >= ?
 ORDER BY events.processed_at DESC, events.id DESC
 LIMIT ?
 """
@@ -564,7 +578,7 @@ def fetch_investigation(
     else:
         row = conn.execute(
             _RECURRENCE_SQL,
-            (signature_id, source_type, window_start),
+            (window_start, signature_id, source_type),
         ).fetchone()
         recurrence = {
             "available": True,
@@ -587,10 +601,10 @@ def fetch_investigation(
         rule_rows = conn.execute(
             _RELATED_BY_RULE_SQL,
             (
+                window_start,
                 signature_id,
                 source_type,
                 event_id,
-                window_start,
                 MAX_RELATED_ALERTS,
             ),
         ).fetchall()

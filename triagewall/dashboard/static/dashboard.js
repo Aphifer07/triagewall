@@ -405,9 +405,14 @@ async function loadVerdictPage(cursor = null, append = false, request = beginQue
   if (!queueRequestIsCurrent(request)) return false;
   mode = data.mode;
   nextCursor = data.next_cursor;
-  currentVerdicts = append ? [...currentVerdicts, ...data.verdicts] : data.verdicts;
+  // The next page is built locally and handed to renderVerdicts, which is the
+  // single owner of currentVerdicts. Assigning it here first would destroy the
+  // old list before renderVerdicts could read which alert was selected, so an
+  // inserted or reordered row would silently move the J/K selection onto a
+  // different event.
+  const nextVerdicts = append ? [...currentVerdicts, ...data.verdicts] : data.verdicts;
   document.getElementById("demoBanner").classList.toggle("hidden", mode !== "demo");
-  renderVerdicts(currentVerdicts);
+  renderVerdicts(nextVerdicts);
   renderPagination();
   return true;
 }
@@ -616,9 +621,18 @@ function renderVerdicts(list) {
 
   currentVerdicts = Array.isArray(list) ? list : [];
 
+  // DOM focus wins when it is genuinely in the list; otherwise the J/K
+  // selection is followed. Either way the alert is tracked by id, so Enter,
+  // A and U keep acting on the alert the operator chose.
   const followed = findVerdictIndex(domFocusedEventId ?? selectedEventId);
-  if (followed >= 0) focusedIndex = followed;
-  if (focusedIndex >= currentVerdicts.length) focusedIndex = Math.max(0, currentVerdicts.length - 1);
+  if (followed >= 0) {
+    focusedIndex = followed;
+  } else if (focusedIndex >= currentVerdicts.length) {
+    // The selected alert is no longer in the results. Fall back to a bounded
+    // position; its identity is deliberately not carried onto whatever row now
+    // occupies the old index.
+    focusedIndex = Math.max(0, currentVerdicts.length - 1);
+  }
 
   if (!currentVerdicts.length) {
     document.getElementById("verdicts").innerHTML = `

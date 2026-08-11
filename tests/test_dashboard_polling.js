@@ -1970,6 +1970,112 @@ test("a keyboard-focused queue card keeps focus across a scheduled refresh", asy
   assert.match(String(harness.pushedUrls.at(-1)), /^\/triage\/22\?/);
 });
 
+// Three unreviewed rows; J moves the logical selection without giving any card
+// DOM focus, which is the case the Tab-focus restoration does not cover.
+function queueOfThree() {
+  return [
+    { id: 11, verdict: "real", signature: "eleven", confidence: 0.5, human_verdict: null },
+    { id: 22, verdict: "real", signature: "twenty-two", confidence: 0.5, human_verdict: null },
+    { id: 33, verdict: "real", signature: "thirty-three", confidence: 0.5, human_verdict: null },
+  ];
+}
+
+async function selectEvent22WithoutDomFocus(harness) {
+  harness.dispatchKey("j");
+  await harness.settle();
+  assert.equal(harness.api.state().focusedIndex, 1);
+  assert.equal(harness.api.state().currentVerdicts[1].id, 22);
+  assert.equal(harness.activeEventId(), null, "this case must not use DOM focus");
+}
+
+test("a J/K selection follows its alert when a refresh inserts a row", async () => {
+  const harness = runDashboard({ pathname: "/triage", verdicts: queueOfThree() });
+  await harness.settle();
+  await selectEvent22WithoutDomFocus(harness);
+
+  harness.setVerdicts([
+    { id: 44, verdict: "real", signature: "forty-four", confidence: 0.5, human_verdict: null },
+    ...queueOfThree(),
+  ]);
+  harness.tick();
+  await harness.settle();
+
+  assert.equal(
+    harness.api.state().focusedIndex,
+    2,
+    "the selection did not follow event 22 to its new position",
+  );
+  assert.equal(harness.api.state().currentVerdicts[2].id, 22);
+
+  harness.dispatchKey("Enter");
+  await harness.settle();
+  assert.match(String(harness.pushedUrls.at(-1)), /^\/triage\/22\?/);
+});
+
+test("A after an inserting refresh writes only to the selected alert", async () => {
+  const harness = runDashboard({ pathname: "/triage", verdicts: queueOfThree() });
+  await harness.settle();
+  await selectEvent22WithoutDomFocus(harness);
+
+  harness.setVerdicts([
+    { id: 44, verdict: "real", signature: "forty-four", confidence: 0.5, human_verdict: null },
+    ...queueOfThree(),
+  ]);
+  harness.tick();
+  await harness.settle();
+
+  harness.dispatchKey("a");
+  await harness.settle();
+  assert.deepEqual(feedbackPosts(harness), ["/api/v1/feedback/22"]);
+});
+
+test("U after an inserting refresh writes only to the selected alert", async () => {
+  const harness = runDashboard({ pathname: "/triage", verdicts: queueOfThree() });
+  await harness.settle();
+  await selectEvent22WithoutDomFocus(harness);
+
+  harness.setVerdicts([
+    { id: 44, verdict: "real", signature: "forty-four", confidence: 0.5, human_verdict: null },
+    ...queueOfThree(),
+  ]);
+  harness.tick();
+  await harness.settle();
+
+  harness.dispatchKey("u");
+  await harness.settle();
+  assert.deepEqual(feedbackPosts(harness), ["/api/v1/feedback/22"]);
+});
+
+test("a selection whose alert disappears is not carried onto another one", async () => {
+  const harness = runDashboard({ pathname: "/triage", verdicts: queueOfThree() });
+  await harness.settle();
+  await selectEvent22WithoutDomFocus(harness);
+
+  // Event 22 leaves the results entirely.
+  harness.setVerdicts([
+    { id: 11, verdict: "real", signature: "eleven", confidence: 0.5, human_verdict: null },
+    { id: 33, verdict: "real", signature: "thirty-three", confidence: 0.5, human_verdict: null },
+  ]);
+  harness.tick();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.ok(!state.currentVerdicts.some((row) => row.id === 22));
+  assert.ok(state.focusedIndex < state.currentVerdicts.length, "index left out of range");
+
+  // Whatever is now selected, it must not be treated as event 22.
+  harness.dispatchKey("a");
+  await harness.settle();
+  assert.ok(
+    !feedbackPosts(harness).includes("/api/v1/feedback/22"),
+    "a write was attributed to the alert that disappeared",
+  );
+
+  harness.dispatchKey("Enter");
+  await harness.settle();
+  assert.doesNotMatch(String(harness.pushedUrls.at(-1)), /^\/triage\/22(\?|$)/);
+});
+
 test("a queue refresh does not steal focus from the search field", async () => {
   const harness = runDashboard({
     pathname: "/triage",

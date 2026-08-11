@@ -1570,26 +1570,36 @@ class InvestigationScaleTests(unittest.TestCase):
             if "triage_events" in step and step.startswith("SCAN") and "USING" not in step:
                 self.fail(f"unbounded triage_events scan: {steps}")
 
-    def test_recurrence_is_driven_by_the_signature_index(self):
-        window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
-        steps = self.plan_for(services._RECURRENCE_SQL, (2001, "suricata", window))
+    def assertWindowDrivenPlan(self, steps, label):
+        """The window, not the signature, must drive the row access.
+
+        With an equality on signature_id available, SQLite prefers
+        idx_triage_signature_id and visits every row that signature has ever
+        produced before applying the window, so cost grows with total retention
+        rather than with the window being asked about.
+        """
         self.assertTrue(
+            any("idx_triage_processed" in step for step in steps),
+            f"{label} should range-scan idx_triage_processed: {steps}",
+        )
+        self.assertFalse(
             any("idx_triage_signature_id" in step for step in steps),
-            f"recurrence should use the signature index: {steps}",
+            f"{label} must not be driven by the signature index: {steps}",
         )
         self.assertNoUnboundedEventScan(steps)
 
-    def test_related_by_rule_is_driven_by_the_signature_index(self):
+    def test_recurrence_is_bounded_by_the_processed_at_window(self):
+        window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
+        steps = self.plan_for(services._RECURRENCE_SQL, (window, 2001, "suricata"))
+        self.assertWindowDrivenPlan(steps, "recurrence")
+
+    def test_related_by_rule_is_bounded_by_the_processed_at_window(self):
         window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
         steps = self.plan_for(
             services._RELATED_BY_RULE_SQL,
-            (2001, "suricata", 1, window, services.MAX_RELATED_ALERTS),
+            (window, 2001, "suricata", 1, services.MAX_RELATED_ALERTS),
         )
-        self.assertTrue(
-            any("idx_triage_signature_id" in step for step in steps),
-            f"related-by-rule should use the signature index: {steps}",
-        )
-        self.assertNoUnboundedEventScan(steps)
+        self.assertWindowDrivenPlan(steps, "related-by-rule")
 
     def test_candidate_selection_is_driven_by_the_processed_at_index(self):
         window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
@@ -1632,6 +1642,216 @@ class InvestigationScaleTests(unittest.TestCase):
             budget_seconds,
             f"investigation took {elapsed:.2f}s over {self.ROW_COUNT} rows",
         )
+
+
+class LongRetentionRecurrenceTests(unittest.TestCase):
+    """Recurrence must cost what the window holds, not what retention holds.
+
+    Fixtures are generated here. No production database is opened or read.
+    """
+
+    RECENT_SURICATA = 6
+    RECENT_WAZUH = 4
+    SHARED_RULE_ID = 2001
+
+    @classmethod
+    def build_database(cls, path, old_rows):
+        """Seed `old_rows` long-retained rows for the shared rule id, plus a
+        small recent window containing both Suricata and Wazuh rows."""
+        conn = sqlite3.connect(path)
+        conn.executescript((PROJECT_ROOT / "triagewall" / "schema.sql").read_text())
+        now = datetime.now(timezone.utc)
+        events = []
+        contexts = []
+        next_id = 1
+
+        # Long-retained history: same signature id, far outside any window.
+        for index in range(old_rows):
+            stamp = format_utc_timestamp(now - timedelta(days=30, seconds=index * 7))
+            events.append(
+                (
+                    next_id,
+                    stamp,
+                    cls.SHARED_RULE_ID,
+                    "Old recurring signature",
+                    "{}",
+                    "false_positive",
+                    0.8,
+                    "reason",
+                    "test-llm",
+                    stamp,
+                    "10.0.0.9",
+                    "192.168.1.9",
+                )
+            )
+            contexts.append((next_id, "suricata", "instance-a", f"old-{index}", None, None))
+            next_id += 1
+
+        # Recent window. Wazuh reuses the same numeric rule id on purpose.
+        recent_ids = {"suricata": [], "wazuh": []}
+        for source, count in (
+            ("suricata", cls.RECENT_SURICATA),
+            ("wazuh", cls.RECENT_WAZUH),
+        ):
+            for index in range(count):
+                stamp = format_utc_timestamp(now - timedelta(minutes=index + 1))
+                events.append(
+                    (
+                        next_id,
+                        stamp,
+                        cls.SHARED_RULE_ID,
+                        f"Recent {source} signature",
+                        "{}",
+                        "real",
+                        0.9,
+                        "reason",
+                        "test-llm",
+                        stamp,
+                        "10.0.0.5",
+                        "192.168.1.20",
+                    )
+                )
+                contexts.append(
+                    (next_id, source, "instance-a", f"{source}-{index}", None, None)
+                )
+                recent_ids[source].append(next_id)
+                next_id += 1
+
+        conn.executemany(
+            """
+            INSERT INTO triage_events (
+                id, timestamp, signature_id, signature, raw_alert, verdict,
+                confidence, reasoning, model_used, processed_at, src_ip, dest_ip
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            events,
+        )
+        conn.executemany(
+            """
+            INSERT INTO sensor_event_context (
+                triage_event_id, source_type, source_instance,
+                source_event_id, agent_id, agent_name
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            contexts,
+        )
+        conn.commit()
+        conn.close()
+        return recent_ids
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.small_path = Path(cls.temp_dir.name) / "small.db"
+        cls.large_path = Path(cls.temp_dir.name) / "large.db"
+        cls.recent_ids = cls.build_database(cls.small_path, old_rows=500)
+        cls.build_database(cls.large_path, old_rows=5_000)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp_dir.cleanup()
+
+    def setUp(self):
+        self.old_db_path = dashboard.DB_PATH
+        self.old_mode = dashboard.MODE
+        self.old_allow = dashboard.auth_state.allow_unauthenticated_reads
+        dashboard.DB_PATH = self.small_path
+        dashboard.MODE = "local"
+        dashboard.auth_state.allow_unauthenticated_reads = True
+        services.reset_caches()
+        self.client = TestClient(dashboard.app)
+        self.host = {"host": "localhost"}
+
+    def tearDown(self):
+        dashboard.DB_PATH = self.old_db_path
+        dashboard.MODE = self.old_mode
+        dashboard.auth_state.allow_unauthenticated_reads = self.old_allow
+        services.reset_caches()
+
+    def investigate(self, event_id):
+        return self.client.get(
+            f"/api/v1/verdicts/{event_id}/investigation", headers=self.host
+        ).json()
+
+    def test_recurrence_counts_only_the_recent_window(self):
+        anchor = self.recent_ids["suricata"][0]
+        recurrence = self.investigate(anchor)["recurrence"]
+        self.assertEqual(recurrence["source_type"], "suricata")
+        self.assertEqual(recurrence["signature_id"], self.SHARED_RULE_ID)
+        # The 500 long-retained rows share the signature id but sit outside the
+        # window, and the Wazuh rows share the integer but not the namespace.
+        self.assertEqual(recurrence["occurrences"], self.RECENT_SURICATA)
+        self.assertEqual(recurrence["real_count"], self.RECENT_SURICATA)
+        self.assertEqual(recurrence["false_positive_count"], 0)
+
+    def test_wazuh_keeps_its_own_group_for_the_same_rule_id(self):
+        recurrence = self.investigate(self.recent_ids["wazuh"][0])["recurrence"]
+        self.assertEqual(recurrence["source_type"], "wazuh")
+        self.assertEqual(recurrence["signature_id"], self.SHARED_RULE_ID)
+        self.assertEqual(recurrence["occurrences"], self.RECENT_WAZUH)
+
+    def test_related_by_rule_returns_recent_rows_newest_first(self):
+        anchor = self.recent_ids["suricata"][0]
+        payload = self.investigate(anchor)
+        group = next(
+            entry for entry in payload["related"] if entry["relationship"] == "same_rule"
+        )
+        returned = [alert["id"] for alert in group["alerts"]]
+        self.assertTrue(returned, "expected recent same-rule alerts")
+        self.assertLessEqual(len(returned), services.MAX_RELATED_ALERTS)
+        # Only recent Suricata rows, never the long-retained history or Wazuh.
+        self.assertTrue(set(returned) <= set(self.recent_ids["suricata"]))
+        self.assertNotIn(anchor, returned)
+        stamps = [alert["processed_at"] for alert in group["alerts"]]
+        self.assertEqual(stamps, sorted(stamps, reverse=True), "ordering is not newest-first")
+
+    def measure_steps(self, db_path, sql, params):
+        """Count VM progress ticks for one query, as a deterministic proxy for
+        work done. Wall-clock timing would be flaky on shared CI runners."""
+        conn = sqlite3.connect(db_path)
+        ticks = {"count": 0}
+
+        def handler():
+            ticks["count"] += 1
+            return 0
+
+        try:
+            conn.set_progress_handler(handler, 1000)
+            conn.execute(sql, params).fetchall()
+            conn.set_progress_handler(None, 0)
+        finally:
+            conn.close()
+        return ticks["count"]
+
+    def test_retained_history_does_not_add_proportional_work(self):
+        window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
+        cases = (
+            ("recurrence", services._RECURRENCE_SQL, (window, self.SHARED_RULE_ID, "suricata")),
+            (
+                "related-by-rule",
+                services._RELATED_BY_RULE_SQL,
+                (
+                    window,
+                    self.SHARED_RULE_ID,
+                    "suricata",
+                    self.recent_ids["suricata"][0],
+                    services.MAX_RELATED_ALERTS,
+                ),
+            ),
+        )
+        for label, sql, params in cases:
+            with self.subTest(query=label):
+                small = self.measure_steps(self.small_path, sql, params)
+                large = self.measure_steps(self.large_path, sql, params)
+                # Ten times the retained history. If the signature index were
+                # driving, the work would scale with it; bounded by the window
+                # it must not. The allowance is deliberately loose so this
+                # cannot fail on incidental planner overhead.
+                self.assertLess(
+                    large,
+                    max(small * 2, small + 20),
+                    f"{label}: work scaled with retention ({small} -> {large})",
+                )
 
 
 if __name__ == "__main__":
