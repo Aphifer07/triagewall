@@ -40,6 +40,23 @@ MAX_SIGNATURE_SEARCH_LENGTH = 200
 MAX_CURSOR_LENGTH = 512
 MAX_FEEDBACK_NOTES_LENGTH = 2_000
 
+# Investigation bounds.
+#
+# The window is capped at 24 hours rather than the 168 the timeline allows.
+# src_ip and dest_ip are not indexed, so address correlation cannot be an index
+# seek; it is a bounded scan, and a wider window would widen that scan without
+# a production-shaped benchmark proving a query-time budget is still met.
+#
+# MAX_RELATED_CANDIDATE_ROWS is the second half of that bound. Address matching
+# examines at most this many of the newest rows in the window, selected through
+# idx_triage_processed. Anything older inside the window is not examined, and
+# the response says so via candidate_limit/truncated rather than implying the
+# result is complete correlation across the whole window.
+DEFAULT_INVESTIGATION_WINDOW_HOURS = 24
+MAX_INVESTIGATION_WINDOW_HOURS = 24
+MAX_RELATED_ALERTS = 10
+MAX_RELATED_CANDIDATE_ROWS = 2_000
+
 _stats_cache: dict[str, Any] = {"data": None, "ts": 0.0, "generated_at": None}
 _timeline_cache: dict[str, Any] = {"data": None, "ts": 0.0, "key": None}
 _spc_cache: dict[str, Any] = {"data": None, "ts": 0.0}
@@ -94,6 +111,8 @@ def build_verdict_filters(
     verdict: str | None,
     signature: str | None,
     model: str | None,
+    source: str | None = None,
+    review: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     where: list[str] = []
     params: list[Any] = []
@@ -107,6 +126,18 @@ def build_verdict_filters(
         where.append("events.model_used != 'prefilter'")
     elif model == "prefilter":
         where.append("events.model_used = 'prefilter'")
+    if source == "suricata":
+        # Rows created before source provenance was introduced are Suricata
+        # rows: Wazuh support and sensor_event_context shipped together.
+        where.append("(sensor.source_type = 'suricata' OR sensor.source_type IS NULL)")
+    elif source == "wazuh":
+        where.append("sensor.source_type = 'wazuh'")
+    if review == "unreviewed":
+        where.append("events.human_verdict IS NULL")
+    elif review == "agreed":
+        where.append("events.human_verdict IS NOT NULL AND events.agreed = 1")
+    elif review == "corrected":
+        where.append("events.human_verdict IS NOT NULL AND events.agreed = 0")
     return where, params
 
 
@@ -134,6 +165,11 @@ LEFT JOIN sensor_event_context AS sensor
   ON sensor.triage_event_id = events.id
 """
 
+_VERDICT_DETAIL_SELECT = _VERDICT_SELECT.replace(
+    "events.reasoning, events.model_used, events.processed_at,",
+    "events.reasoning, events.raw_alert, events.model_used, events.processed_at,",
+)
+
 
 def fetch_verdicts(
     conn: sqlite3.Connection,
@@ -141,6 +177,8 @@ def fetch_verdicts(
     verdict: str | None = None,
     signature: str | None = None,
     model: str | None = None,
+    source: str | None = None,
+    review: str | None = None,
     limit: int = DEFAULT_VERDICT_LIMIT,
     cursor: str | None = None,
 ) -> tuple[list[sqlite3.Row], str | None]:
@@ -150,7 +188,13 @@ def fetch_verdicts(
             status_code=422,
             detail=f"limit must be between 1 and {MAX_VERDICT_LIMIT}",
         )
-    where, params = build_verdict_filters(verdict, signature, model)
+    where, params = build_verdict_filters(
+        verdict,
+        signature,
+        model,
+        source,
+        review,
+    )
     if cursor:
         processed_at, event_id = decode_cursor(cursor)
         where.append(
@@ -197,6 +241,463 @@ def fetch_verdicts(
         # Exact page with no more rows.
         next_cursor = None
     return list(rows), next_cursor
+
+
+def fetch_verdict(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+    """Return one complete decision, including its original sensor record."""
+    return conn.execute(
+        f"""{_VERDICT_DETAIL_SELECT}
+            WHERE events.id = ?""",
+        (event_id,),
+    ).fetchone()
+
+
+# --- Investigation context -------------------------------------------------
+#
+# Provenance is normalized the same way build_verdict_filters treats it: rows
+# written before sensor_event_context existed are Suricata rows. Qualifying by
+# source type is not cosmetic. Suricata stores its SID in signature_id while
+# Wazuh stores rule.id there, so an unqualified group would silently merge two
+# unrelated rules that happen to share an integer.
+_SOURCE_TYPE_EXPR = "COALESCE(sensor.source_type, 'suricata')"
+
+# Both rule queries are pinned to idx_triage_processed rather than left to the
+# planner. Given an equality on signature_id, SQLite prefers
+# idx_triage_signature_id and visits every row that signature has ever produced
+# before applying the window, so a frequent SID costs time proportional to the
+# whole retained history instead of to the 24-hour window being asked about.
+# Pinning the range index makes processed_at >= ? the driving access, so the
+# work is bounded by the window.
+#
+# A composite (signature_id, processed_at) index would also fix this, but
+# creating one is deliberately out of scope here: the first v0.4 migration
+# would have to build it inside BEGIN IMMEDIATE against the live database,
+# which means unplanned writer downtime and disk growth. INDEXED BY needs no
+# schema change, and idx_triage_processed is a REQUIRED_INDEXES member verified
+# fail-closed at startup, so the hint cannot silently refer to a missing index.
+_RECURRENCE_SQL = f"""
+SELECT COUNT(*) AS occurrences,
+       MIN(events.processed_at) AS first_seen,
+       MAX(events.processed_at) AS last_seen,
+       COALESCE(SUM(CASE WHEN events.verdict = 'real' THEN 1 ELSE 0 END), 0)
+           AS real_count,
+       COALESCE(
+           SUM(CASE WHEN events.verdict = 'false_positive' THEN 1 ELSE 0 END), 0
+       ) AS false_positive_count,
+       COALESCE(SUM(CASE WHEN events.verdict = 'uncertain' THEN 1 ELSE 0 END), 0)
+           AS uncertain_count,
+       COALESCE(SUM(CASE WHEN events.verdict IS NULL THEN 1 ELSE 0 END), 0)
+           AS unclassified_count
+FROM triage_events AS events INDEXED BY idx_triage_processed
+LEFT JOIN sensor_event_context AS sensor
+  ON sensor.triage_event_id = events.id
+WHERE events.processed_at >= ?
+  AND events.processed_at IS NOT NULL
+  AND events.signature_id = ?
+  AND {_SOURCE_TYPE_EXPR} = ?
+"""
+
+# Same window-first shape as the recurrence count. See the note above for why
+# the range index is pinned instead of the signature index.
+_RELATED_BY_RULE_SQL = f"""
+SELECT events.id, events.timestamp, events.processed_at,
+       events.signature_id, events.signature, events.verdict,
+       events.confidence, events.src_ip, events.dest_ip,
+       {_SOURCE_TYPE_EXPR} AS source_type
+FROM triage_events AS events INDEXED BY idx_triage_processed
+LEFT JOIN sensor_event_context AS sensor
+  ON sensor.triage_event_id = events.id
+WHERE events.processed_at >= ?
+  AND events.processed_at IS NOT NULL
+  AND events.signature_id = ?
+  AND {_SOURCE_TYPE_EXPR} = ?
+  AND events.id != ?
+ORDER BY events.processed_at DESC, events.id DESC
+LIMIT ?
+"""
+
+# The newest candidates in the window, ordered by the indexed column so
+# idx_triage_processed drives the range. Address matching happens over this
+# bounded set; it never scans triage_events end to end.
+_RELATED_CANDIDATES_SQL = f"""
+SELECT events.id, events.timestamp, events.processed_at,
+       events.signature_id, events.signature, events.verdict,
+       events.confidence, events.src_ip, events.dest_ip,
+       {_SOURCE_TYPE_EXPR} AS source_type
+FROM triage_events AS events
+LEFT JOIN sensor_event_context AS sensor
+  ON sensor.triage_event_id = events.id
+WHERE events.processed_at IS NOT NULL
+  AND events.processed_at >= ?
+ORDER BY events.processed_at DESC, events.id DESC
+LIMIT ?
+"""
+
+_NEIGHBOR_SELECT = f"""
+SELECT events.id, events.signature, events.verdict, events.processed_at,
+       {_SOURCE_TYPE_EXPR} AS source_type
+FROM triage_events AS events
+LEFT JOIN sensor_event_context AS sensor
+  ON sensor.triage_event_id = events.id
+"""
+
+RELATIONSHIP_LABELS = {
+    "same_rule": (
+        "Same rule",
+        "Same source type and signature id as this alert. Exact match within "
+        "the window.",
+    ),
+    "same_source_ip": (
+        "Same source address",
+        "Recorded src_ip is identical to this alert's src_ip. Shared "
+        "addressing only; it does not establish a shared cause.",
+    ),
+    "same_destination_ip": (
+        "Same destination address",
+        "Recorded dest_ip is identical to this alert's dest_ip. Shared "
+        "addressing only; it does not establish a shared cause.",
+    ),
+}
+
+
+def _apply_ip_policy(
+    value: str | None,
+    *,
+    mode: str,
+    mask_ip_fn: Callable,
+    redact_ips: bool,
+    ip_secret: bytes | None,
+) -> str | None:
+    """Apply the same address-disclosure policy the verdict rows use."""
+    if not value:
+        return value
+    if mode == "demo":
+        return mask_ip_fn(value)
+    if redact_ips:
+        return hash_ip(value, ip_secret)
+    return value
+
+
+def _normalize_timestamp(value: str | None) -> str | None:
+    """Re-canonicalize a stored timestamp, matching app.row_to_dict."""
+    if not value:
+        return None
+    try:
+        return format_utc_timestamp(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _related_row_to_dict(
+    row: sqlite3.Row,
+    relationship: str,
+    *,
+    mode: str,
+    mask_ip_fn: Callable,
+    redact_ips: bool,
+    ip_secret: bytes | None,
+) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "timestamp": _normalize_timestamp(row["timestamp"]),
+        "processed_at": _normalize_timestamp(row["processed_at"]),
+        "signature_id": row["signature_id"],
+        "signature": row["signature"],
+        "verdict": row["verdict"],
+        "confidence": row["confidence"],
+        "src_ip": _apply_ip_policy(
+            row["src_ip"],
+            mode=mode,
+            mask_ip_fn=mask_ip_fn,
+            redact_ips=redact_ips,
+            ip_secret=ip_secret,
+        ),
+        "dest_ip": _apply_ip_policy(
+            row["dest_ip"],
+            mode=mode,
+            mask_ip_fn=mask_ip_fn,
+            redact_ips=redact_ips,
+            ip_secret=ip_secret,
+        ),
+        "source_type": row["source_type"],
+        "relationship": relationship,
+    }
+
+
+def _neighbor_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "signature": row["signature"],
+        "verdict": row["verdict"],
+        "processed_at": _normalize_timestamp(row["processed_at"]),
+        "source_type": row["source_type"],
+    }
+
+
+def _fetch_neighbors(
+    conn: sqlite3.Connection,
+    *,
+    anchor_id: int,
+    anchor_processed_at: str | None,
+    where: list[str],
+    params: list[Any],
+) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+    """Return the (previous, next) rows around an anchor in queue order.
+
+    Queue order is ``processed_at DESC NULLS LAST, id DESC``. "Next" is the row
+    immediately after the anchor in that order (older); "previous" is the row
+    immediately before it (newer). Filters are the caller's, so navigation stays
+    inside whatever queue the analyst was looking at.
+    """
+
+    def run(extra_clauses: list[str], extra_params: list[Any], order: str):
+        clauses = where + extra_clauses
+        where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        return conn.execute(
+            f"""{_NEIGHBOR_SELECT}
+                {where_sql}
+                ORDER BY {order}
+                LIMIT 1""",
+            params + extra_params,
+        ).fetchone()
+
+    if anchor_processed_at is None:
+        # Unprocessed rows sort last, ordered by descending id.
+        next_row = run(
+            ["events.processed_at IS NULL", "events.id < ?"],
+            [anchor_id],
+            "events.id DESC",
+        )
+        previous_row = run(
+            ["events.processed_at IS NULL", "events.id > ?"],
+            [anchor_id],
+            "events.id ASC",
+        )
+        if previous_row is None:
+            # Nothing unprocessed above it, so the neighbour is the oldest
+            # processed row.
+            previous_row = run(
+                ["events.processed_at IS NOT NULL"],
+                [],
+                "events.processed_at ASC, events.id ASC",
+            )
+        return previous_row, next_row
+
+    next_row = run(
+        [
+            """(
+                events.processed_at < ?
+                OR (events.processed_at = ? AND events.id < ?)
+                OR events.processed_at IS NULL
+            )"""
+        ],
+        [anchor_processed_at, anchor_processed_at, anchor_id],
+        "events.processed_at DESC, events.id DESC",
+    )
+    previous_row = run(
+        [
+            "events.processed_at IS NOT NULL",
+            """(
+                events.processed_at > ?
+                OR (events.processed_at = ? AND events.id > ?)
+            )""",
+        ],
+        [anchor_processed_at, anchor_processed_at, anchor_id],
+        "events.processed_at ASC, events.id ASC",
+    )
+    return previous_row, next_row
+
+
+def fetch_investigation(
+    conn: sqlite3.Connection,
+    event_id: int,
+    *,
+    hours: int = DEFAULT_INVESTIGATION_WINDOW_HOURS,
+    mode: str = "local",
+    mask_ip_fn: Callable = lambda value: value,
+    redact_ips: bool = False,
+    ip_secret: bytes | None = None,
+    verdict: str | None = None,
+    signature: str | None = None,
+    model: str | None = None,
+    source: str | None = None,
+    review: str | None = None,
+) -> dict[str, Any] | None:
+    """Return bounded recurrence, related activity and queue neighbours.
+
+    Returns ``None`` when the anchor event does not exist, so the caller can
+    answer 404 the same way the detail route does.
+    """
+    if hours < 1 or hours > MAX_INVESTIGATION_WINDOW_HOURS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"hours must be between 1 and {MAX_INVESTIGATION_WINDOW_HOURS}",
+        )
+
+    anchor = conn.execute(
+        f"""SELECT events.id, events.processed_at, events.signature_id,
+                   events.src_ip, events.dest_ip,
+                   {_SOURCE_TYPE_EXPR} AS source_type
+            FROM triage_events AS events
+            LEFT JOIN sensor_event_context AS sensor
+              ON sensor.triage_event_id = events.id
+            WHERE events.id = ?""",
+        (event_id,),
+    ).fetchone()
+    if anchor is None:
+        return None
+
+    window_start = format_utc_timestamp(utc_now() - timedelta(hours=hours))
+    source_type = anchor["source_type"]
+    signature_id = anchor["signature_id"]
+
+    ip_policy = {
+        "mode": mode,
+        "mask_ip_fn": mask_ip_fn,
+        "redact_ips": redact_ips,
+        "ip_secret": ip_secret,
+    }
+
+    # Recurrence. A row without a signature_id has no group to belong to;
+    # correlating on NULL would join every other signature-less row.
+    if signature_id is None:
+        recurrence = {
+            "available": False,
+            "signature_id": None,
+            "source_type": source_type,
+            "occurrences": 0,
+            "first_seen": None,
+            "last_seen": None,
+            "real_count": 0,
+            "false_positive_count": 0,
+            "uncertain_count": 0,
+            "unclassified_count": 0,
+        }
+    else:
+        row = conn.execute(
+            _RECURRENCE_SQL,
+            (window_start, signature_id, source_type),
+        ).fetchone()
+        recurrence = {
+            "available": True,
+            "signature_id": int(signature_id),
+            "source_type": source_type,
+            "occurrences": int(row["occurrences"] or 0),
+            "first_seen": _normalize_timestamp(row["first_seen"]),
+            "last_seen": _normalize_timestamp(row["last_seen"]),
+            "real_count": int(row["real_count"] or 0),
+            "false_positive_count": int(row["false_positive_count"] or 0),
+            "uncertain_count": int(row["uncertain_count"] or 0),
+            "unclassified_count": int(row["unclassified_count"] or 0),
+        }
+
+    groups: list[dict[str, Any]] = []
+
+    # Same rule: index-backed equality, so this group is exact for the window.
+    rule_alerts: list[dict[str, Any]] = []
+    if signature_id is not None:
+        rule_rows = conn.execute(
+            _RELATED_BY_RULE_SQL,
+            (
+                window_start,
+                signature_id,
+                source_type,
+                event_id,
+                MAX_RELATED_ALERTS,
+            ),
+        ).fetchall()
+        rule_alerts = [
+            _related_row_to_dict(r, "same_rule", **ip_policy) for r in rule_rows
+        ]
+    label, reason = RELATIONSHIP_LABELS["same_rule"]
+    groups.append(
+        {
+            "relationship": "same_rule",
+            "label": label,
+            "reason": reason,
+            "exact": signature_id is not None,
+            "truncated": False,
+            "candidate_limit": None,
+            "candidates_examined": None,
+            "alerts": rule_alerts,
+        }
+    )
+
+    # Address groups: bounded candidate set, matched in application code.
+    # Over-fetch by one row. A window holding exactly the budget has omitted
+    # nothing, so only a row *beyond* the budget proves the scan was partial.
+    candidate_limit = MAX_RELATED_CANDIDATE_ROWS
+    candidates: list[sqlite3.Row] = []
+    candidates_truncated = False
+    if anchor["src_ip"] or anchor["dest_ip"]:
+        candidates = conn.execute(
+            _RELATED_CANDIDATES_SQL,
+            (window_start, candidate_limit + 1),
+        ).fetchall()
+        candidates_truncated = len(candidates) > candidate_limit
+        if candidates_truncated:
+            candidates = candidates[:candidate_limit]
+
+    for relationship, column, anchor_value in (
+        ("same_source_ip", "src_ip", anchor["src_ip"]),
+        ("same_destination_ip", "dest_ip", anchor["dest_ip"]),
+    ):
+        label, reason = RELATIONSHIP_LABELS[relationship]
+        alerts: list[dict[str, Any]] = []
+        if anchor_value:
+            for candidate in candidates:
+                if len(alerts) >= MAX_RELATED_ALERTS:
+                    break
+                if int(candidate["id"]) == event_id:
+                    continue
+                if candidate[column] != anchor_value:
+                    continue
+                alerts.append(
+                    _related_row_to_dict(candidate, relationship, **ip_policy)
+                )
+        groups.append(
+            {
+                "relationship": relationship,
+                "label": label,
+                "reason": reason,
+                "exact": False,
+                "truncated": bool(anchor_value) and candidates_truncated,
+                "candidate_limit": candidate_limit,
+                "candidates_examined": len(candidates) if anchor_value else 0,
+                "alerts": alerts,
+            }
+        )
+
+    where, params = build_verdict_filters(verdict, signature, model, source, review)
+    previous_row, next_row = _fetch_neighbors(
+        conn,
+        anchor_id=int(anchor["id"]),
+        anchor_processed_at=anchor["processed_at"],
+        where=list(where),
+        params=list(params),
+    )
+
+    return {
+        "generated_at": utc_now_iso(),
+        "event_id": int(anchor["id"]),
+        "window_hours": hours,
+        "window_start": window_start,
+        "recurrence": recurrence,
+        "related": groups,
+        "neighbors": {
+            "previous": _neighbor_row_to_dict(previous_row),
+            "next": _neighbor_row_to_dict(next_row),
+            "filters": {
+                "verdict": verdict,
+                "signature": signature,
+                "model": model,
+                "source": source,
+                "review": review,
+            },
+        },
+    }
 
 
 def get_cached_stats(

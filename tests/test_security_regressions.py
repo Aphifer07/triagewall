@@ -309,6 +309,14 @@ class DashboardBoundaryTests(unittest.TestCase):
             dashboard_service,
         )
 
+    def test_named_dashboard_views_serve_the_operator_console(self):
+        for path in ("/triage", "/overview", "/behavioral"):
+            with self.subTest(path=path):
+                response = self.client.get(path, headers={"host": "localhost"})
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("text/html", response.headers["content-type"])
+                self.assertIn('data-view="triage"', response.text)
+
     def test_rebinding_style_host_is_rejected_for_read_and_write_routes(self):
         for method, path, kwargs in (
             ("get", "/api/verdicts", {}),

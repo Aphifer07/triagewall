@@ -88,6 +88,11 @@ pseudonym**:
   providing.
 - Pseudonyms are deterministic within a deployment, so correlation across
   responses still works. Changing the secret changes every pseudonym.
+- Verdict `reasoning`, operator `human_notes`, retained `raw_alert`, and both
+  `asset_context` snapshots are omitted while redaction is enabled. Those are
+  free-form channels that can repeat endpoint addresses or contain additional
+  inventory addresses; withholding them keeps the boundary fail-closed rather
+  than implying that changing only `src_ip` / `dest_ip` sanitized the row.
 
 Demo mode continues to apply its stricter masking independently of this
 setting.
@@ -106,7 +111,11 @@ curl -sS -H 'Host: localhost' http://127.0.0.1:8084/api/v1/health
 ### `GET /api/v1/stats`
 
 Summary counters for the rolling 24h window plus lifetime total. Includes
-canonical `real` and deprecated `real_`.
+canonical `real` and deprecated `real_`. The model-only queue fields
+`model_real_count`, `model_fp_count`, `model_uncertain_count`, and
+`unreviewed_model_count` exclude deterministic prefilter decisions so the
+operator queue can display source-of-truth totals rather than counts from only
+the currently loaded page.
 
 ```bash
 curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
@@ -121,11 +130,13 @@ Verdict rows only (no stats).
 |-------|------|-------|
 | `verdict` | enum | `real` \| `false_positive` \| `uncertain` |
 | `model` | enum | `llm` \| `prefilter` |
+| `source` | enum | `suricata` \| `wazuh` |
+| `review` | enum | `unreviewed` \| `agreed` \| `corrected` |
 | `signature` | string | ≤ 200 characters (substring match) |
 | `limit` | integer | 1–500, default 100 |
 | `cursor` | opaque string | ≤ 512 characters |
 
-Filter values are typed: an unrecognized `verdict` or `model` returns **422**
+Filter values are typed: an unrecognized `verdict`, `model`, `source`, or `review` returns **422**
 rather than silently behaving like no filter. Values over a documented bound
 also return 422.
 
@@ -135,6 +146,83 @@ as `cursor` for the next page. Cursor is opaque over `(processed_at, id)`.
 ```bash
 curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
   'http://127.0.0.1:8084/api/v1/verdicts?limit=50&model=llm'
+```
+
+### `GET /api/v1/verdicts/{event_id}`
+
+One complete decision for the routed alert-detail view. Response:
+`{generated_at, mode, verdict}`. Unlike the bounded list endpoint, the detail
+row includes the stored `raw_alert` sensor record when local-mode disclosure
+policy permits it. Demo mode and API IP-redaction mode continue to omit that
+field. IP-redaction mode also omits reasoning, operator notes, and asset
+snapshots as described under **IP exposure**.
+
+```bash
+curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
+  http://127.0.0.1:8084/api/v1/verdicts/1
+```
+
+### `GET /api/v1/verdicts/{event_id}/investigation`
+
+Bounded recurrence, related activity, and queue-aware neighbours for one alert.
+Additive: it does not change `/api/v1/verdicts` or
+`/api/v1/verdicts/{event_id}`.
+
+| Param | Type | Bound |
+|-------|------|-------|
+| `hours` | integer | 1–24, default 24 |
+| `verdict` | enum | `real` \| `false_positive` \| `uncertain` |
+| `model` | enum | `llm` \| `prefilter` |
+| `source` | enum | `suricata` \| `wazuh` |
+| `review` | enum | `unreviewed` \| `agreed` \| `corrected` |
+| `signature` | string | ≤ 200 characters (substring match) |
+
+The filter parameters are the ones `/api/v1/verdicts` accepts, and they apply
+only to `neighbors`, so previous/next stay inside the queue the analyst was
+working from. An unknown event id returns **404**; unrecognized filter values
+and an out-of-bound `hours` return **422**.
+
+Response: `{generated_at, mode, event_id, window_hours, window_start,
+recurrence, related, neighbors}`.
+
+**`recurrence`** counts events sharing this alert's `(source type, signature
+id)` inside the window. The source qualifier is load-bearing: Suricata stores
+its SID in `signature_id` while Wazuh stores `rule.id` there, so an unqualified
+group would merge two unrelated rules that happen to share an integer. Rows
+predating source provenance are counted as Suricata. A row with no
+`signature_id` has no group and reports `available: false`.
+
+**`related`** is a list of groups, each carrying `relationship`, a human
+`label`, a `reason` explaining the link, and the honest scope of the query
+behind it:
+
+| Group | `exact` | Scope |
+|-------|---------|-------|
+| `same_rule` | `true` | Indexed equality on `(source type, signature id)` across the whole window. |
+| `same_source_ip` | `false` | Exact `src_ip` equality, matched inside a bounded candidate set. |
+| `same_destination_ip` | `false` | Exact `dest_ip` equality, matched inside a bounded candidate set. |
+
+`src_ip` and `dest_ip` are not indexed, so the address groups are **not**
+complete correlation across the window. They examine at most `candidate_limit`
+(2000) of the newest events in the window, selected through the `processed_at`
+index. `candidates_examined` reports how many were read, and `truncated` is
+`true` when that budget was reached, meaning older matches inside the window
+were never examined. Each group returns at most 10 alerts.
+
+An address match is a shared-addressing observation, not a causal finding.
+
+**`neighbors`** is `{previous, next, filters}` in the queue's own order
+(`processed_at DESC NULLS LAST, id DESC`). `previous` is the newer neighbour and
+`next` the older one; either is `null` at a queue edge or when the filters
+exclude every candidate. `filters` echoes what the neighbours were resolved
+against.
+
+Addresses inside `related` follow the same disclosure policy as verdict rows:
+demo mode masks them, and API IP-redaction mode pseudonymizes them.
+
+```bash
+curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
+  'http://127.0.0.1:8084/api/v1/verdicts/1/investigation?hours=24&model=llm'
 ```
 
 ### `POST /api/v1/feedback/{event_id}`
@@ -199,6 +287,15 @@ and a weak `ETag`. The ETag is derived from the **validated** representation,
 so it always matches the bytes actually served. Send `If-None-Match` to receive
 HTTP 304 when unchanged. Stats/timeline/SPC results also use short in-process
 TTL caches. Payloads include `generated_at` (UTC).
+
+The verdict endpoints are the exception. `GET /api/v1/verdicts`,
+`GET /api/v1/verdicts/{event_id}` and
+`GET /api/v1/verdicts/{event_id}/investigation` emit
+`Cache-Control: private, no-store` and **no** `ETag`, and never answer 304.
+Saving operator feedback rewrites the underlying row, so a stored or
+revalidated copy would report a reviewed alert as unreviewed. Stats, timeline,
+SPC and health keep their existing caching, as does the deprecated
+`GET /api/verdicts` alias, whose shape and headers are frozen until removal.
 
 ## Deprecated aliases
 

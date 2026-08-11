@@ -248,6 +248,57 @@ explanation of what changed and what deserves attention.
 - [ ] **Constrained MITRE ATT&CK mapping** backed by controlled references
 - [ ] Operator-controlled webhooks for selected high-confidence findings
 
+#### Analyst investigation context — delivered
+
+The routed alert-detail page is the first functional investigation surface. It
+reads only what Triagewall already persists; no schema change, no new index,
+and no new sensor field were introduced.
+
+- [x] **Recurrence for the selected alert.** Occurrence count, first and latest
+  occurrence, and verdict distribution inside a bounded window.
+- [x] **Related activity** by rule, source address, and destination address,
+  each stating why it is related.
+- [x] **Queue-aware navigation.** The complete queue query string travels
+  through the detail page, previous/next, and the back link, and neighbours are
+  resolved server-side against every filter the list endpoint supports — so
+  previous/next now work on a deep link or refresh, which the client-side
+  implementation could not do.
+- [x] **Source-aware presentation.** Wazuh rule, agent, manager, location, and
+  decoder context is presented separately from the Suricata flow envelope.
+  Neither is forced into the other's labels.
+
+**Exact versus navigational.** Recurrence and the same-rule group are exact
+within the window: both are equality on `(source type, signature id)` served by
+the signature index. Qualifying by source type is required for correctness, not
+neatness — Suricata keeps its SID and Wazuh keeps `rule.id` in the same column.
+
+The address groups are navigational aids, not complete correlation.
+`src_ip`/`dest_ip` are unindexed, so matching runs inside a bounded set of the
+newest candidates in the window, selected through the `processed_at` index. The
+API returns `candidate_limit`, `candidates_examined`, and `truncated`, and the
+UI labels a truncated result as partial. Shared addressing is an observation
+about addressing; it does not establish a shared cause.
+
+**Known data limitations.** These are shown as "not recorded" rather than
+inferred:
+
+- Model latency is not persisted, so no per-decision latency can be displayed.
+- There is no per-event integrity attestation. The boundary panel describes
+  current classifier posture, not what ran for a historical row.
+- Wazuh `manager`, `location`, `decoder`, and `rule.groups` are not columns.
+  They are read from the retained sensor record, so demo mode and API
+  IP-redaction mode — which withhold that record — show them as unavailable.
+- Wazuh rows carry no `flow_id`, `in_iface`, `category`, or `action`.
+- The window is capped at 24 hours. A wider window needs a production-shaped
+  benchmark against a defined query-time budget first.
+
+**Deliberately not in this slice.** Configuration mutation from the UI is out
+of scope: no prefilter rule creation or editing, no asset-enrichment editing,
+and no configuration activation or rollback. Those belong to the versioned
+operator-configuration subsystem, which must land with its own authorization
+and audit story rather than riding along with a read-only investigation
+surface.
+
 ### v0.5 — Late 2026
 
 Vulnerability prioritization.

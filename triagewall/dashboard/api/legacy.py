@@ -13,9 +13,9 @@ from triagewall.dashboard.api.v1.models import (
     FeedbackRequest,
     FeedbackResponse,
     LegacyHealthResponse,
+    LegacyStatsModel,
     LegacyVerdictsResponse,
     SpcAnomaliesResponse,
-    StatsModel,
     TimelineBucket,
 )
 
@@ -88,7 +88,7 @@ def create_legacy_router(
         stats_dict, _generated = services.get_cached_stats(db_factory)
         payload = {
             "mode": get_mode(),
-            "stats": StatsModel.model_validate(stats_dict).model_dump(),
+            "stats": LegacyStatsModel.model_validate(stats_dict).model_dump(),
             "verdicts": [row_to_dict(r) for r in rows],
         }
         return cached_json_response(request, payload, max_age=5)

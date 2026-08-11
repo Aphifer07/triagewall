@@ -13,6 +13,8 @@ from triagewall.dashboard.api.services import MAX_FEEDBACK_NOTES_LENGTH
 # rather than a filter that silently does nothing.
 VerdictFilter = Literal["real", "false_positive", "uncertain"]
 ModelFilter = Literal["llm", "prefilter"]
+SourceFilter = Literal["suricata", "wazuh"]
+ReviewFilter = Literal["unreviewed", "agreed", "corrected"]
 TimelineInterval = Literal["1h"]
 
 
@@ -36,6 +38,10 @@ class StatsModel(BaseModel):
     today_total: int
     today_prefilter: int
     today_llm: int
+    model_real_count: int
+    model_fp_count: int
+    model_uncertain_count: int
+    unreviewed_model_count: int
 
 
 class StatsResponse(BaseModel):
@@ -44,6 +50,28 @@ class StatsResponse(BaseModel):
     generated_at: str
     mode: Literal["local", "demo"]
     stats: StatsModel
+
+
+class LegacyStatsModel(BaseModel):
+    """Frozen counter shape used by the deprecated combined endpoint."""
+
+    # New internal/v1 counters are intentionally ignored so this deprecated
+    # response remains byte-shape compatible until its removal date.
+    model_config = ConfigDict(extra="ignore")
+
+    total: int
+    real: int
+    real_: int
+    fp: int
+    unc: int
+    reviewed: int
+    agreed: int
+    disagreed: int
+    prefilter_count: int
+    llm_count: int
+    today_total: int
+    today_prefilter: int
+    today_llm: int
 
 
 class AgentContext(BaseModel):
@@ -114,6 +142,120 @@ class VerdictsResponse(BaseModel):
     mode: Literal["local", "demo"]
     verdicts: list[VerdictRow]
     next_cursor: str | None = None
+
+
+class VerdictDetailResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    mode: Literal["local", "demo"]
+    verdict: VerdictRow
+
+
+RelationshipKind = Literal["same_rule", "same_source_ip", "same_destination_ip"]
+
+
+class RelatedAlert(BaseModel):
+    """A slim row shown inside a related-activity group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    timestamp: str | None = None
+    processed_at: str | None = None
+    signature_id: int | None = None
+    signature: str | None = None
+    verdict: str | None = None
+    confidence: float | None = None
+    src_ip: str | None = None
+    dest_ip: str | None = None
+    source_type: str | None = None
+    relationship: RelationshipKind
+
+
+class RelatedGroup(BaseModel):
+    """One relationship, with the honest scope of the query behind it.
+
+    ``exact`` marks a group answered by an indexed equality over the whole
+    window. Address groups are false: they are matched inside a bounded set of
+    the newest ``candidate_limit`` rows, so ``truncated`` reports that older
+    rows in the window were never examined.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    relationship: RelationshipKind
+    label: str
+    reason: str
+    exact: bool
+    truncated: bool
+    candidate_limit: int | None = None
+    candidates_examined: int | None = None
+    alerts: list[RelatedAlert]
+
+
+class RecurrenceSummary(BaseModel):
+    """Occurrences of this alert's (source type, signature id) in the window.
+
+    ``available`` is false when the row carries no signature_id: there is no
+    group to belong to, and correlating on NULL would gather unrelated rows.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+    signature_id: int | None = None
+    source_type: str | None = None
+    occurrences: int
+    first_seen: str | None = None
+    last_seen: str | None = None
+    real_count: int
+    false_positive_count: int
+    uncertain_count: int
+    unclassified_count: int
+
+
+class NeighborAlert(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    signature: str | None = None
+    verdict: str | None = None
+    processed_at: str | None = None
+    source_type: str | None = None
+
+
+class QueueFilters(BaseModel):
+    """The queue filters the neighbours were resolved against."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: VerdictFilter | None = None
+    signature: str | None = None
+    model: ModelFilter | None = None
+    source: SourceFilter | None = None
+    review: ReviewFilter | None = None
+
+
+class QueueNeighbors(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    previous: NeighborAlert | None = None
+    next: NeighborAlert | None = None
+    filters: QueueFilters
+
+
+class InvestigationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    mode: Literal["local", "demo"]
+    event_id: int
+    window_hours: int
+    window_start: str
+    recurrence: RecurrenceSummary
+    related: list[RelatedGroup]
+    neighbors: QueueNeighbors
 
 
 class TimelineBucket(BaseModel):
@@ -194,5 +336,5 @@ class LegacyVerdictsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal["local", "demo"]
-    stats: StatsModel
+    stats: LegacyStatsModel
     verdicts: list[VerdictRow]
