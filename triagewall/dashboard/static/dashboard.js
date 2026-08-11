@@ -450,6 +450,10 @@ async function load({ refreshDetail = true } = {}) {
       showToast(error.message, true);
     }
   } else if (currentView === "triage") {
+    // Browsing history: the loaded pages are kept rather than refetched, but
+    // they are repainted so a row corrected by a committed write is not left
+    // showing its pre-commit state.
+    renderVerdicts(currentVerdicts);
     renderPagination();
   }
 }
@@ -1043,22 +1047,47 @@ function toggleCorrection(eventId, trigger) {
   trigger?.setAttribute("aria-expanded", String(expanded));
 }
 
-// Where a feedback action was raised from. A slow POST outlives the route that
-// started it, so its completion is only allowed to refresh that same route.
-function feedbackOriginIsCurrent(origin) {
-  if (currentView !== origin.view) return false;
-  if (origin.view === "detail") return detailPathEventId() === origin.eventId;
-  return window.location.pathname === origin.pathname;
+// Patch a committed review onto the loaded rows. A queue read taken before
+// the write committed still shows the row as unreviewed, and the one-key
+// agree action keys off exactly that field, so leaving it stale invites a
+// second write that would replace the saved note with an empty one.
+function applySavedFeedback(eventId, humanVerdict, notes) {
+  currentVerdicts = currentVerdicts.map((row) => {
+    if (Number(row.id) !== eventId) return row;
+    return {
+      ...row,
+      human_verdict: humanVerdict,
+      human_notes: notes,
+      agreed: row.verdict === humanVerdict ? 1 : 0,
+    };
+  });
 }
+
+async function reconcileQueueAfterFeedback() {
+  // Retire any queue read issued before the commit: letting it land would
+  // repaint the row as unreviewed again.
+  invalidateQueueRequests();
+  if (browsingHistory) {
+    // The loaded historical pages are the operator's context. Repaint the
+    // patched row instead of discarding them; the next live refresh takes the
+    // server's version.
+    renderVerdicts(currentVerdicts);
+    renderPagination();
+    return;
+  }
+  resetPagination();
+  await load();
+}
+
+// One write per event at a time. While a POST is in flight the row it belongs
+// to can still look unreviewed, and a second submit would race the first.
+const pendingFeedback = new Set();
 
 async function feedback(id, agentVerdict, customVerdict = null, notes = "") {
   const humanVerdict = customVerdict || agentVerdict;
   const eventId = Number(id);
-  const origin = {
-    view: currentView,
-    pathname: window.location.pathname,
-    eventId,
-  };
+  if (pendingFeedback.has(eventId)) return;
+  pendingFeedback.add(eventId);
   try {
     // The write is never aborted: a save that reached the server must not be
     // cancelled because the operator moved on.
@@ -1068,20 +1097,31 @@ async function feedback(id, agentVerdict, customVerdict = null, notes = "") {
       body: JSON.stringify({ human_verdict: humanVerdict, notes }),
     });
     if (!response.ok) throw new Error(`Feedback was not saved (${response.status})`);
-    // The toast is a global status line and reports the write truthfully
-    // wherever the operator now is. Everything below it is route-specific and
-    // only runs when this completion still owns the route it came from.
     showToast("Operator feedback saved.");
-    if (!feedbackOriginIsCurrent(origin)) return;
-    if (origin.view === "detail") {
-      await loadDetail(eventId, beginDetailNavigation());
+    // The server has committed, so the in-memory row is corrected wherever the
+    // operator now is. Route ownership decides what may be re-rendered, not
+    // whether the write is recorded.
+    applySavedFeedback(eventId, humanVerdict, notes);
+    if (currentView === "detail") {
+      // Only the alert this write belongs to may be reloaded. Another detail
+      // page has its own unsaved draft to protect.
+      if (detailPathEventId() === eventId) {
+        await loadDetail(eventId, beginDetailNavigation());
+      }
       return;
     }
-    resetPagination();
-    await load();
+    if (currentView === "triage") {
+      // Reconcile even when the write was raised from a detail page the
+      // operator has already left.
+      await reconcileQueueAfterFeedback();
+    }
   } catch (error) {
-    if (!feedbackOriginIsCurrent(origin)) return;
-    showToast(error.message, true);
+    // Route ownership guards DOM reloads, not write-result notifications.
+    // Navigating away must never hide that a review failed to save, so this
+    // names the alert and reports wherever the operator is.
+    showToast(`Alert ${eventId}: ${error.message}`, true);
+  } finally {
+    pendingFeedback.delete(eventId);
   }
 }
 
@@ -1089,18 +1129,27 @@ async function loadOlder() {
   if (!nextCursor || pageLoading) return;
   const cursor = nextCursor;
   const request = beginQueueRequest();
+  // History mode is taken transactionally. Claiming it now stops a polling
+  // refresh from superseding the page being fetched, and a failure hands back
+  // exactly what was taken: a failed first page returns to live, while a
+  // failed later page stays in history because earlier rows are still loaded.
+  const wasBrowsingHistory = browsingHistory;
+  let appended = false;
   pageLoading = true;
   browsingHistory = true;
   renderPagination();
   try {
-    await loadVerdictPage(cursor, true, request);
+    appended = await loadVerdictPage(cursor, true, request);
   } catch (error) {
     if (queueRequestIsCurrent(request)) showToast(error.message, true);
   } finally {
     pageLoading = false;
     // If the filters moved on, the newer request owns the rendering; appending
     // this page or repainting from it would splice old-filter rows into it.
-    if (queueRequestIsCurrent(request)) renderPagination();
+    if (queueRequestIsCurrent(request)) {
+      if (!appended) browsingHistory = wasBrowsingHistory;
+      renderPagination();
+    }
   }
 }
 

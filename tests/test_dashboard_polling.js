@@ -21,6 +21,7 @@ const STATIC_DIR = path.join(
 // proven by executing the shipped script rather than by matching its text.
 function createElement(id) {
   const listeners = new Map();
+  const classes = new Set();
   let innerHTML = "";
   const element = {
     id,
@@ -33,11 +34,17 @@ function createElement(id) {
     innerHTMLWrites: 0,
     dataset: {},
     style: {},
+    // Backed by a real set so visibility toggles can be asserted.
     classList: {
-      add() {},
-      remove() {},
-      toggle() {},
-      contains: () => false,
+      add: (...names) => names.forEach((name) => classes.add(name)),
+      remove: (...names) => names.forEach((name) => classes.delete(name)),
+      toggle(name, force) {
+        const on = force === undefined ? !classes.has(name) : Boolean(force);
+        if (on) classes.add(name);
+        else classes.delete(name);
+        return on;
+      },
+      contains: (name) => classes.has(name),
     },
     setAttribute() {},
     removeAttribute() {},
@@ -66,7 +73,13 @@ function createElement(id) {
   return element;
 }
 
-function runDashboard({ pathname, search = "", verdicts = [], defer = () => false }) {
+function runDashboard({
+  pathname,
+  search = "",
+  verdicts = [],
+  defer = () => false,
+  fail = () => false,
+}) {
   const elements = new Map();
   const documentListeners = new Map();
   const intervals = [];
@@ -197,15 +210,17 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
       const params = new URLSearchParams(list[1]);
       const tag = params.get("model") || "any";
       const cursor = params.get("cursor");
-      // Rows are tagged with the filter that asked for them, so a response can
-      // be traced back to the request that produced it.
+      // Cursors carry their page depth so several Load Older pages can be
+      // walked. Rows are tagged with the filter that asked for them, so a
+      // response can be traced back to the request that produced it.
+      const page = cursor ? Number(cursor.split("-").at(-1)) : 0;
       const rows = verdicts.length
         ? verdicts
         : [
             {
-              id: cursor ? 900 : 100,
+              id: 100 + page,
               verdict: "real",
-              signature: `row-${tag}${cursor ? "-older" : ""}`,
+              signature: page ? `row-${tag}-older-${page}` : `row-${tag}`,
               confidence: 0.5,
               human_verdict: null,
             },
@@ -217,7 +232,7 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
         verdicts: rows.map((row) =>
           saved.has(row.id) ? { ...row, ...saved.get(row.id) } : row,
         ),
-        next_cursor: cursor ? null : `cursor-${tag}`,
+        next_cursor: `cursor-${tag}-${page + 1}`,
       };
     }
     return { mode: "local", verdicts, next_cursor: null };
@@ -227,22 +242,37 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
   const fetchStub = (url, options) => {
     const target = String(url);
     fetchCalls.push({ url: target, options });
-    const posted = target.match(/\/api\/v1\/feedback\/(\d+)$/);
-    if (posted && options?.method === "POST") {
+    // A write commits when its response is produced, not when it is issued, so
+    // a deferred POST leaves the fixture unreviewed until it is released. That
+    // is what lets a test interleave a genuine pre-commit queue read.
+    const commit = () => {
+      const posted = target.match(/\/api\/v1\/feedback\/(\d+)$/);
+      if (!posted || options?.method !== "POST") return;
       const payload = JSON.parse(options.body);
       saved.set(Number(posted[1]), {
         human_verdict: payload.human_verdict,
         human_notes: payload.notes,
         agreed: 1,
       });
-    }
-    const body = bodyFor(target);
+    };
+    const failure = () => ({ ok: false, status: 500, json: () => Promise.resolve({}) });
     if (defer(target)) {
       return new Promise((resolve) => {
-        deferred.push({ url: target, release: () => resolve(response(body)) });
+        deferred.push({
+          url: target,
+          release: () => {
+            commit();
+            // Body is built at release time so it reflects whatever has
+            // committed by then.
+            resolve(response(bodyFor(target)));
+          },
+          reject: () => resolve(failure()),
+        });
       });
     }
-    return Promise.resolve(response(body));
+    if (fail(target)) return Promise.resolve(failure());
+    commit();
+    return Promise.resolve(response(bodyFor(target)));
   };
 
   // A real location object: pushState moves it, so the script's own
@@ -309,6 +339,7 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
     currentFilter: { ...currentFilter },
     currentVerdicts: currentVerdicts.map((row) => ({ ...row })),
     nextCursor,
+    browsingHistory,
   }),
 };`;
 
@@ -326,9 +357,19 @@ function runDashboard({ pathname, search = "", verdicts = [], defer = () => fals
     location,
     api: sandbox.__probe,
     deferred,
-    releaseDeferred: () => {
-      const queued = deferred.splice(0, deferred.length);
-      queued.forEach(({ release }) => release());
+    releaseDeferred: (predicate = () => true) => {
+      const queued = deferred.filter(({ url }) => predicate(url));
+      queued.forEach((entry) => {
+        deferred.splice(deferred.indexOf(entry), 1);
+        entry.release();
+      });
+    },
+    rejectDeferred: (predicate = () => true) => {
+      const queued = deferred.filter(({ url }) => predicate(url));
+      queued.forEach((entry) => {
+        deferred.splice(deferred.indexOf(entry), 1);
+        entry.reject();
+      });
     },
     tick: () => intervals.forEach((handler) => handler()),
     pendingTimers: () => timers.filter((timer) => !timer.done),
@@ -926,7 +967,7 @@ test("a filter change invalidates an in-flight Load Older page", async () => {
   });
   await harness.settle();
   assert.equal(harness.api.state().currentVerdicts[0].signature, "row-llm");
-  assert.equal(harness.api.state().nextCursor, "cursor-llm");
+  assert.equal(harness.api.state().nextCursor, "cursor-llm-1");
 
   harness.api.loadOlder();
   await harness.settle();
@@ -1365,6 +1406,339 @@ test("rapid typing debounces to a single queue reload", async () => {
   harness.advanceTimers();
   await harness.settle();
   assert.equal(routeFetchUrls(harness).length, before + 1);
+});
+
+test("a failed first Load older returns the queue to live mode", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    fail: (url) => url.includes("cursor="),
+  });
+  await harness.settle();
+  assert.equal(harness.api.state().browsingHistory, false);
+
+  await harness.api.loadOlder();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(state.browsingHistory, false, "history mode stuck after a failure");
+  assert.equal(
+    harness.document.getElementById("returnLiveButton").classList.contains("hidden"),
+    true,
+  );
+  assert.doesNotMatch(
+    harness.document.getElementById("paginationMeta").textContent,
+    /browsing history/,
+  );
+
+  // Live polling resumes: a tick refetches the queue.
+  const before = routeFetchUrls(harness).length;
+  harness.tick();
+  await harness.settle();
+  assert.ok(routeFetchUrls(harness).length > before, "live polling did not resume");
+});
+
+test("a failed later Load older stays in history mode", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    // The first historical page succeeds; the second fails.
+    fail: (url) => url.includes("cursor=cursor-llm-2"),
+  });
+  await harness.settle();
+
+  await harness.api.loadOlder();
+  await harness.settle();
+  assert.equal(harness.api.state().browsingHistory, true);
+  assert.equal(harness.api.state().currentVerdicts.length, 2);
+
+  await harness.api.loadOlder();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(state.browsingHistory, true, "history was abandoned on a later failure");
+  assert.equal(state.currentVerdicts.length, 2, "loaded historical rows were lost");
+  assert.match(
+    harness.document.getElementById("verdicts").innerHTML,
+    /row-llm-older-1/,
+  );
+});
+
+test("a superseded Load older failure cannot revert newer queue state", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => url.includes("cursor="),
+  });
+  await harness.settle();
+
+  harness.api.loadOlder();
+  await harness.settle();
+  assert.equal(harness.api.state().browsingHistory, true);
+
+  // A filter change supersedes the pending page and returns to live.
+  harness.api.setFilter("model", "prefilter");
+  harness.api.applyFilters();
+  await harness.settle();
+  assert.equal(harness.api.state().browsingHistory, false);
+
+  harness.rejectDeferred();
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(state.browsingHistory, false, "a stale failure changed newer state");
+  assert.equal(state.currentVerdicts[0].signature, "row-prefilter");
+  assert.equal(harness.document.getElementById("toast").textContent, "");
+});
+
+test("a failed feedback write is reported even after navigating away", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [
+      { id: 11, verdict: "real", signature: "one", confidence: 0.5, human_verdict: null },
+    ],
+    defer: (url) => url.includes("/api/v1/feedback/"),
+  });
+  await harness.settle();
+
+  harness.document.getElementById("verdicts").dispatch("focusin", {
+    target: { closest: () => ({ dataset: { idx: "0" } }) },
+  });
+  harness.dispatchKey("a");
+  await harness.settle();
+
+  harness.api.open(22);
+  await harness.settle();
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "draft on the new alert";
+  notes.value = sentinel;
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBefore = detail.innerHTMLWrites;
+
+  harness.rejectDeferred();
+  await harness.settle();
+
+  const toast = harness.document.getElementById("toast");
+  assert.match(toast.textContent, /Alert 11/, "the failure did not name the alert");
+  assert.match(toast.textContent, /not saved/i);
+  // The new route is untouched.
+  assert.equal(notes.value, sentinel);
+  assert.equal(detail.innerHTMLWrites, writesBefore);
+  assert.equal(harness.api.state().activeDetail.id, 22);
+  assert.equal(harness.location.pathname, "/triage/22");
+});
+
+test("a review saved from a historical row survives the return to the queue", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  await harness.api.loadOlder();
+  await harness.settle();
+  assert.equal(harness.api.state().browsingHistory, true);
+  const historical = harness.api.state().currentVerdicts.at(-1);
+  assert.equal(historical.human_verdict, null);
+
+  harness.api.open(historical.id);
+  await harness.settle();
+  harness.document.getElementById("detailNotes").value = "kept from the historical page";
+  harness.document.getElementById("detailPageContent").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-detail-feedback]"
+          ? { dataset: { detailFeedback: "real" } }
+          : null,
+    },
+  });
+  await harness.settle();
+
+  harness.dispatchKey("Escape");
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(state.browsingHistory, true, "historical context was discarded");
+  assert.equal(state.currentVerdicts.length, 2, "historical rows were dropped");
+  const row = state.currentVerdicts.find((entry) => entry.id === historical.id);
+  assert.equal(row.human_verdict, "real");
+  assert.equal(row.human_notes, "kept from the historical page");
+
+  // The one-key agree action must now refuse to write again.
+  const postsBefore = harness.fetchCalls.filter(({ url }) =>
+    url.includes("/api/v1/feedback/"),
+  ).length;
+  const index = state.currentVerdicts.findIndex((entry) => entry.id === historical.id);
+  harness.document.getElementById("verdicts").dispatch("focusin", {
+    target: { closest: () => ({ dataset: { idx: String(index) } }) },
+  });
+  harness.dispatchKey("a");
+  harness.dispatchKey("u");
+  await harness.settle();
+  assert.equal(
+    harness.fetchCalls.filter(({ url }) => url.includes("/api/v1/feedback/")).length,
+    postsBefore,
+    "a second feedback write was submitted",
+  );
+});
+
+test("a pre-commit queue read cannot beat a resolving feedback write", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => url.includes("/api/v1/feedback/"),
+  });
+  await harness.settle();
+  const target = harness.api.state().currentVerdicts[0];
+
+  harness.api.open(target.id);
+  await harness.settle();
+  harness.document.getElementById("detailNotes").value = "notes that must survive";
+  harness.document.getElementById("detailPageContent").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-detail-feedback]"
+          ? { dataset: { detailFeedback: "real" } }
+          : null,
+    },
+  });
+  await harness.settle();
+  assert.equal(harness.deferred.length, 1, "the write should still be pending");
+
+  // Back to the queue. This read happens before the write commits, so it
+  // returns the row as unreviewed.
+  harness.dispatchKey("Escape");
+  await harness.settle();
+  assert.equal(harness.api.state().currentVerdicts[0].human_verdict, null);
+
+  // Now the write commits.
+  harness.releaseDeferred();
+  await harness.settle();
+
+  const row = harness.api.state().currentVerdicts.find(
+    (entry) => entry.id === target.id,
+  );
+  assert.equal(row.human_verdict, "real", "the stale pre-commit read won");
+  assert.equal(row.human_notes, "notes that must survive");
+  // The visible queue must be reconciled too, not just the in-memory array:
+  // the rendered row was painted from the pre-commit read.
+  assert.match(
+    harness.document.getElementById("verdicts").innerHTML,
+    /agreed/,
+    "the rendered queue still shows the pre-commit state",
+  );
+
+  const postsBefore = harness.fetchCalls.filter(({ url }) =>
+    url.includes("/api/v1/feedback/"),
+  ).length;
+  harness.document.getElementById("verdicts").dispatch("focusin", {
+    target: { closest: () => ({ dataset: { idx: "0" } }) },
+  });
+  harness.dispatchKey("a");
+  await harness.settle();
+  assert.equal(
+    harness.fetchCalls.filter(({ url }) => url.includes("/api/v1/feedback/")).length,
+    postsBefore,
+  );
+});
+
+test("reviewing from the historical queue repaints without discarding history", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  await harness.api.loadOlder();
+  await harness.settle();
+  const loaded = harness.api.state().currentVerdicts;
+  assert.equal(loaded.length, 2);
+  assert.equal(harness.api.state().browsingHistory, true);
+
+  // Agree on the historical row straight from the queue.
+  harness.document.getElementById("verdicts").dispatch("focusin", {
+    target: { closest: () => ({ dataset: { idx: "1" } }) },
+  });
+  harness.dispatchKey("a");
+  await harness.settle();
+
+  const state = harness.api.state();
+  assert.equal(state.browsingHistory, true, "history was discarded on review");
+  assert.equal(state.currentVerdicts.length, 2, "historical pages were dropped");
+  assert.equal(state.currentVerdicts[1].human_verdict, "real");
+  // Repainted from the patched rows rather than left showing the old state.
+  assert.match(
+    harness.document.getElementById("verdicts").innerHTML,
+    /agreed/,
+    "the historical queue was not repainted after the write",
+  );
+  assert.match(
+    harness.document.getElementById("verdicts").innerHTML,
+    /row-llm-older-1/,
+    "historical rows disappeared from the rendered queue",
+  );
+});
+
+test("a duplicate feedback submission while one is pending is ignored", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [
+      { id: 11, verdict: "real", signature: "one", confidence: 0.5, human_verdict: null },
+    ],
+    defer: (url) => url.includes("/api/v1/feedback/"),
+  });
+  await harness.settle();
+
+  harness.document.getElementById("verdicts").dispatch("focusin", {
+    target: { closest: () => ({ dataset: { idx: "0" } }) },
+  });
+  harness.dispatchKey("a");
+  await harness.settle();
+  harness.dispatchKey("a");
+  harness.dispatchKey("u");
+  await harness.settle();
+
+  assert.equal(
+    harness.fetchCalls.filter(({ url }) => url.includes("/api/v1/feedback/11")).length,
+    1,
+    "a duplicate write was submitted while the first was pending",
+  );
+
+  // Once it settles, the event leaves the pending set.
+  harness.releaseDeferred();
+  await harness.settle();
+  assert.equal(harness.api.state().currentVerdicts[0].human_verdict, "real");
+});
+
+test("a feedback completion never remounts a different detail page", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [
+      { id: 11, verdict: "real", signature: "one", confidence: 0.5, human_verdict: null },
+    ],
+    defer: (url) => url.includes("/api/v1/feedback/"),
+  });
+  await harness.settle();
+
+  harness.api.open(11);
+  await harness.settle();
+  harness.document.getElementById("detailPageContent").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-detail-feedback]"
+          ? { dataset: { detailFeedback: "real" } }
+          : null,
+    },
+  });
+  await harness.settle();
+
+  // Move to a different alert and start a draft there.
+  harness.api.open(33);
+  await harness.settle();
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "draft belonging to alert 33";
+  notes.value = sentinel;
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBefore = detail.innerHTMLWrites;
+  const fetchesBefore = routeFetchUrls(harness).length;
+
+  harness.releaseDeferred();
+  await harness.settle();
+
+  assert.equal(notes.value, sentinel);
+  assert.equal(detail.innerHTMLWrites, writesBefore);
+  assert.equal(harness.api.state().activeDetail.id, 33);
+  assert.equal(routeFetchUrls(harness).length, fetchesBefore);
 });
 
 test("queue badge counts declare their global 24h scope", () => {
