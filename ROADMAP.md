@@ -84,9 +84,9 @@ Multi-sensor Core is implemented and deployed in the maintainer environment.
 The operational and release gates below are complete: the gold-set baseline is
 calibrated and the calibrated gate passes, and all five required release-evidence
 scenarios are recorded in
-[docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md). v0.3 is **not yet
-tagged** — what remains is review, merge, and release mechanics. Adversarial
-probing is explicitly out of v0.3 scope; see
+[docs/release-evidence-v0.3.md](docs/release-evidence-v0.3.md). v0.3 was
+[released on August 9, 2026](https://github.com/aaronphifer/triagewall/releases/tag/v0.3).
+Adversarial probing is explicitly out of v0.3 scope; see
 [Adversarial probing (post-v0.3)](#adversarial-probing-post-v03).
 
 #### Implemented
@@ -238,6 +238,8 @@ applications. See
 The awareness layer turns disconnected sensor findings into a concise
 explanation of what changed and what deserves attention.
 
+- [ ] Dashboard UI refresh and visual polish, preserving the existing
+  source-aware API and security contracts
 - [ ] **Daily digest** of material events, changes, and trends
 - [ ] **Coverage-gap detection** between known assets and enrolled sensors
 - [ ] **Cross-sensor correlation** for related IPs, domains, agents, and time

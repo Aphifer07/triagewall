@@ -4,6 +4,13 @@ This records the release-evidence checks required by the ROADMAP closeout item
 *"Record supported fresh-install, upgrade, rollback, Core-only, and
 Core-plus-Wazuh checks before tagging v0.3."*
 
+**Release status:** v0.3 was
+[published on August 9, 2026](https://github.com/aaronphifer/triagewall/releases/tag/v0.3)
+from release commit `c28cde13a187a3a07bdd8ff65d7fb2e5f8f90860`. That commit
+differs from the runtime candidate below only in `README.md`, `ROADMAP.md`, and
+this release-evidence document; the operational evidence remains bound to the
+tested runtime candidate exactly as recorded.
+
 Everything here is sanitized aggregate evidence: commits, timestamps, exit
 codes, counts, and hashes. It contains no secrets, alert content, asset
 inventory contents, addresses, or host identifiers.
