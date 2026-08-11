@@ -2,9 +2,9 @@ name: Regression suite
 
 on:
   pull_request:
-    branches: ["main"]
+    branches: ["main", "v0.4-stabilization"]
   push:
-    branches: ["main"]
+    branches: ["main", "v0.4-stabilization"]
 
 permissions:
   contents: read
