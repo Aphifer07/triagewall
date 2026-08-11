@@ -51,6 +51,8 @@ function createElement(id) {
     getAttribute: () => null,
     scrollIntoView() {},
     querySelectorAll: () => [],
+    querySelector: () => null,
+    contains: () => false,
     closest: () => null,
     focus() {
       this.focused = true;
@@ -102,11 +104,69 @@ function runDashboard({
     if (timer) timer.done = true;
   };
 
+  // Models the queue list well enough for focus behaviour: cards are derived
+  // from the data-event-id attributes actually present in the rendered markup,
+  // so contains()/querySelector() answer against what is really on screen.
+  //
+  // listRows is the queue the fake server returns; tests reassign it to model
+  // rows being inserted, reordered or removed between refreshes.
+  let listRows = verdicts;
+  const queueCards = new Map();
+  function attachQueueListModel(element) {
+    const renderedIds = () =>
+      [...String(element.innerHTML).matchAll(/data-event-id="(\d+)"/g)].map((m) =>
+        Number(m[1]),
+      );
+    const cardFor = (eventId) => {
+      if (!queueCards.has(eventId)) {
+        const card = createElement(`queue-card-${eventId}`);
+        card.dataset.eventId = String(eventId);
+        card.closest = (selector) =>
+          selector === "[data-event-id]" || selector === "[data-idx]" ? card : null;
+        card.focus = (options) => {
+          card.focused = true;
+          card.focusOptions = options;
+          document.activeElement = card;
+        };
+        queueCards.set(eventId, card);
+      }
+      return queueCards.get(eventId);
+    };
+    element.renderedEventIds = renderedIds;
+    element.cardFor = cardFor;
+    element.querySelector = (selector) => {
+      const match = /\[data-event-id="(\d+)"\]/.exec(String(selector));
+      if (!match) return null;
+      const eventId = Number(match[1]);
+      return renderedIds().includes(eventId) ? cardFor(eventId) : null;
+    };
+    element.contains = (node) => {
+      const eventId = Number(node?.dataset?.eventId);
+      return (
+        Number.isInteger(eventId) &&
+        queueCards.get(eventId) === node &&
+        renderedIds().includes(eventId)
+      );
+    };
+  }
+
   const document = {
     title: "",
+    activeElement: null,
     body: { classList: { add() {}, remove() {}, toggle() {} } },
     getElementById(id) {
-      if (!elements.has(id)) elements.set(id, createElement(id));
+      if (!elements.has(id)) {
+        const element = createElement(id);
+        // Any focusable element becomes the active element, so a refresh that
+        // wrongly stole focus from the search box would be visible.
+        element.focus = (options) => {
+          element.focused = true;
+          element.focusOptions = options;
+          document.activeElement = element;
+        };
+        if (id === "verdicts") attachQueueListModel(element);
+        elements.set(id, element);
+      }
       return elements.get(id);
     },
     // Only id selectors resolve. That is enough for the listeners the script
@@ -214,8 +274,8 @@ function runDashboard({
       // walked. Rows are tagged with the filter that asked for them, so a
       // response can be traced back to the request that produced it.
       const page = cursor ? Number(cursor.split("-").at(-1)) : 0;
-      const rows = verdicts.length
-        ? verdicts
+      const rows = listRows.length
+        ? listRows
         : [
             {
               id: 100 + page,
@@ -235,7 +295,7 @@ function runDashboard({
         next_cursor: `cursor-${tag}-${page + 1}`,
       };
     }
-    return { mode: "local", verdicts, next_cursor: null };
+    return { mode: "local", verdicts: listRows, next_cursor: null };
   }
 
   const fetchCalls = [];
@@ -332,6 +392,8 @@ function runDashboard({
   setFilter: (key, value) => { currentFilter[key] = value; },
   applyFilters: () => applyFilters(),
   loadOlder: () => loadOlder(),
+  feedback: (id, agentVerdict, customVerdict, notes) =>
+    feedback(id, agentVerdict, customVerdict, notes),
   state: () => ({
     currentView,
     activeDetail,
@@ -340,6 +402,7 @@ function runDashboard({
     currentVerdicts: currentVerdicts.map((row) => ({ ...row })),
     nextCursor,
     browsingHistory,
+    focusedIndex,
   }),
 };`;
 
@@ -370,6 +433,21 @@ function runDashboard({
         deferred.splice(deferred.indexOf(entry), 1);
         entry.reject();
       });
+    },
+    setVerdicts: (rows) => {
+      listRows = rows;
+    },
+    // Focus a rendered queue card the way a Tab press would.
+    focusCard: (eventId) => {
+      const card = document.getElementById("verdicts").querySelector(
+        `[data-event-id="${eventId}"]`,
+      );
+      card?.focus();
+      return card;
+    },
+    activeEventId: () => {
+      const id = Number(document.activeElement?.dataset?.eventId);
+      return Number.isInteger(id) ? id : null;
     },
     tick: () => intervals.forEach((handler) => handler()),
     pendingTimers: () => timers.filter((timer) => !timer.done),
@@ -641,8 +719,14 @@ test("previous and next come from the server, not the loaded page", () => {
   assert.match(script, /function renderDetailNavigation\(neighbors\)/);
   assert.match(script, /neighbors\?\.previous \?\? null/);
   assert.match(script, /neighbors\?\.next \?\? null/);
-  // Deep links and refreshes have no loaded queue page to index into.
-  assert.doesNotMatch(script, /currentVerdicts\.findIndex/);
+  // Deep links and refreshes have no loaded queue page to index into, so the
+  // navigation renderer must not consult it. Scoped to that function: the
+  // queue's own focus tracking legitimately searches currentVerdicts.
+  const navStart = script.indexOf("function renderDetailNavigation(");
+  const navEnd = script.indexOf("async function loadInvestigation", navStart);
+  assert.notEqual(navStart, -1);
+  assert.notEqual(navEnd, -1);
+  assert.doesNotMatch(script.slice(navStart, navEnd), /currentVerdicts/);
 });
 
 test("investigation panels escape sensor text and state their scope", () => {
@@ -1739,6 +1823,206 @@ test("a feedback completion never remounts a different detail page", async () =>
   assert.equal(detail.innerHTMLWrites, writesBefore);
   assert.equal(harness.api.state().activeDetail.id, 33);
   assert.equal(routeFetchUrls(harness).length, fetchesBefore);
+});
+
+function clickDetailFeedback(harness, verdict = "real") {
+  harness.document.getElementById("detailPageContent").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-detail-feedback]"
+          ? { dataset: { detailFeedback: verdict } }
+          : null,
+    },
+  });
+}
+
+function feedbackPosts(harness) {
+  return harness.fetchCalls
+    .filter(({ url }) => url.includes("/api/v1/feedback/"))
+    .map(({ url }) => url);
+}
+
+test("controls from the previous alert are retired the moment navigation starts", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => /\/api\/v1\/verdicts\/8(\/investigation)?(\?|$)/.test(url),
+  });
+  await harness.settle();
+
+  // Alert 7 is fully rendered and interactive.
+  harness.api.open(7);
+  await harness.settle();
+  assert.equal(harness.api.state().activeDetail.id, 7);
+  harness.document.getElementById("detailNotes").value = "notes for seven";
+
+  // Navigate to alert 8; its responses are held open.
+  harness.api.open(8);
+  await harness.settle();
+  assert.equal(harness.location.pathname, "/triage/8");
+
+  const state = harness.api.state();
+  assert.equal(state.activeDetail, null, "the previous alert stayed active");
+  assert.equal(state.activeInvestigation, null);
+  assert.match(
+    harness.document.getElementById("detailPageContent").innerHTML,
+    /Loading alert detail/,
+    "the previous alert's controls are still mounted",
+  );
+  assert.equal(harness.document.getElementById("previousAlertButton").disabled, true);
+  assert.equal(harness.document.getElementById("nextAlertButton").disabled, true);
+  assert.equal(harness.document.getElementById("previousAlertButton").dataset.eventId, "");
+
+  // Activating the former feedback control must write nothing at all.
+  clickDetailFeedback(harness);
+  await harness.settle();
+  assert.deepEqual(feedbackPosts(harness), [], "a stale control issued a write");
+
+  // Once alert 8 has rendered, feedback works normally and targets 8.
+  harness.releaseDeferred();
+  await harness.settle();
+  assert.equal(harness.api.state().activeDetail.id, 8);
+  clickDetailFeedback(harness);
+  await harness.settle();
+  assert.deepEqual(feedbackPosts(harness), ["/api/v1/feedback/8"]);
+});
+
+test("a detail-to-detail popstate retires the previous alert's controls", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => /\/api\/v1\/verdicts\/8(\/investigation)?(\?|$)/.test(url),
+  });
+  await harness.settle();
+
+  harness.api.open(7);
+  await harness.settle();
+  assert.equal(harness.api.state().activeDetail.id, 7);
+
+  harness.goBackTo("/triage/8?model=llm");
+  await harness.settle();
+
+  assert.equal(harness.api.state().activeDetail, null);
+  assert.equal(harness.document.getElementById("nextAlertButton").disabled, true);
+  clickDetailFeedback(harness);
+  await harness.settle();
+  assert.deepEqual(feedbackPosts(harness), []);
+
+  harness.releaseDeferred();
+  await harness.settle();
+  assert.equal(harness.api.state().activeDetail.id, 8);
+  clickDetailFeedback(harness);
+  await harness.settle();
+  assert.deepEqual(feedbackPosts(harness), ["/api/v1/feedback/8"]);
+});
+
+test("feedback refuses an id that does not match the routed alert", async () => {
+  const harness = runDashboard({ pathname: "/triage" });
+  await harness.settle();
+
+  harness.api.open(7);
+  await harness.settle();
+
+  // Write-side guard: neither a stale id nor a missing one may be sent.
+  await harness.api.feedback(8, "real");
+  await harness.api.feedback(undefined, "real");
+  await harness.api.feedback(NaN, "real");
+  await harness.settle();
+  assert.deepEqual(feedbackPosts(harness), []);
+
+  await harness.api.feedback(7, "real");
+  await harness.settle();
+  assert.deepEqual(feedbackPosts(harness), ["/api/v1/feedback/7"]);
+});
+
+test("a keyboard-focused queue card keeps focus across a scheduled refresh", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [
+      { id: 22, verdict: "real", signature: "twenty-two", confidence: 0.5 },
+      { id: 33, verdict: "real", signature: "thirty-three", confidence: 0.5 },
+    ],
+  });
+  await harness.settle();
+
+  harness.focusCard(22);
+  assert.equal(harness.activeEventId(), 22);
+  assert.equal(harness.api.state().focusedIndex, 0);
+
+  // A newer alert arrives ahead of it, so its index moves.
+  harness.setVerdicts([
+    { id: 44, verdict: "real", signature: "forty-four", confidence: 0.5 },
+    { id: 22, verdict: "real", signature: "twenty-two", confidence: 0.5 },
+    { id: 33, verdict: "real", signature: "thirty-three", confidence: 0.5 },
+  ]);
+  // Through the real scheduled poll, not a direct render call.
+  harness.tick();
+  await harness.settle();
+
+  assert.equal(harness.activeEventId(), 22, "focus was lost on refresh");
+  assert.equal(harness.api.state().focusedIndex, 1, "focusedIndex did not follow");
+  assert.equal(
+    harness.document.getElementById("verdicts").cardFor(22).focusOptions?.preventScroll,
+    true,
+  );
+
+  // Enter must open the alert that is actually focused.
+  harness.dispatchKey("Enter");
+  await harness.settle();
+  assert.match(String(harness.pushedUrls.at(-1)), /^\/triage\/22\?/);
+});
+
+test("a queue refresh does not steal focus from the search field", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [{ id: 22, verdict: "real", signature: "twenty-two", confidence: 0.5 }],
+  });
+  await harness.settle();
+
+  const search = harness.document.getElementById("sigFilter");
+  search.focus();
+  assert.equal(harness.document.activeElement, search);
+
+  harness.setVerdicts([
+    { id: 44, verdict: "real", signature: "forty-four", confidence: 0.5 },
+    { id: 22, verdict: "real", signature: "twenty-two", confidence: 0.5 },
+  ]);
+  harness.tick();
+  await harness.settle();
+
+  assert.equal(
+    harness.document.activeElement,
+    search,
+    "the queue renderer stole focus from the search field",
+  );
+  assert.equal(harness.activeEventId(), null);
+});
+
+test("a refresh that drops the focused alert does not focus another card", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    verdicts: [
+      { id: 22, verdict: "real", signature: "twenty-two", confidence: 0.5 },
+      { id: 33, verdict: "real", signature: "thirty-three", confidence: 0.5 },
+    ],
+  });
+  await harness.settle();
+
+  const card = harness.focusCard(22);
+  assert.equal(harness.activeEventId(), 22);
+
+  harness.setVerdicts([
+    { id: 33, verdict: "real", signature: "thirty-three", confidence: 0.5 },
+  ]);
+  harness.tick();
+  await harness.settle();
+
+  // Focus stays on the now-detached card rather than jumping to an unrelated
+  // alert; the browser would drop it to the document.
+  assert.equal(harness.document.activeElement, card);
+  assert.equal(
+    harness.document.getElementById("verdicts").cardFor(33).focused,
+    false,
+    "an unrelated card was focused",
+  );
 });
 
 test("queue badge counts declare their global 24h scope", () => {

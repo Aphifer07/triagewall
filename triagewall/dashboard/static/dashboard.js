@@ -218,10 +218,25 @@ function detailPathEventId() {
   return match ? Number(match[1]) : null;
 }
 
+// Retire the alert currently on screen the moment a new one is requested.
+// pushState changes the URL immediately, so anything left interactive here
+// belongs to the previous alert while the address bar names the next one --
+// clicking Agree then writes feedback to the wrong event.
+function retireActiveDetail() {
+  activeDetail = null;
+  activeInvestigation = null;
+  const content = document.getElementById("detailPageContent");
+  if (content) {
+    content.innerHTML = '<div class="loading-state">Loading alert detail…</div>';
+  }
+  renderDetailNavigation(null);
+}
+
 function beginDetailNavigation() {
   detailGeneration += 1;
   if (detailAbort) detailAbort.abort();
   detailAbort = typeof AbortController === "function" ? new AbortController() : null;
+  retireActiveDetail();
   return { generation: detailGeneration, signal: detailAbort?.signal };
 }
 
@@ -572,8 +587,37 @@ function renderPagination() {
   document.getElementById("returnLiveButton").classList.toggle("hidden", !browsingHistory);
 }
 
+// Resolve the queue card an element belongs to, by stable event id.
+function cardEventId(element) {
+  const card = element?.closest?.("[data-event-id]");
+  const eventId = Number(card?.dataset?.eventId);
+  return Number.isInteger(eventId) && eventId > 0 ? eventId : null;
+}
+
+function findVerdictIndex(eventId) {
+  if (!Number.isInteger(eventId) || eventId < 1) return -1;
+  return currentVerdicts.findIndex((row) => Number(row.id) === eventId);
+}
+
 function renderVerdicts(list) {
+  const host = document.getElementById("verdicts");
+  // Capture two things before the markup is replaced: whether DOM focus is
+  // genuinely inside the list, and which alert the logical selection points
+  // at. Both travel by event id, so a refresh that reorders or inserts rows
+  // cannot leave J/K/Enter aimed at a different alert, and focus is only ever
+  // restored when it was already in the list -- never stolen from the search
+  // box, the filters, or anything else.
+  const active = document.activeElement;
+  const focusWasInList = Boolean(
+    host && active && typeof host.contains === "function" && host.contains(active),
+  );
+  const domFocusedEventId = focusWasInList ? cardEventId(active) : null;
+  const selectedEventId = Number(currentVerdicts[focusedIndex]?.id ?? NaN);
+
   currentVerdicts = Array.isArray(list) ? list : [];
+
+  const followed = findVerdictIndex(domFocusedEventId ?? selectedEventId);
+  if (followed >= 0) focusedIndex = followed;
   if (focusedIndex >= currentVerdicts.length) focusedIndex = Math.max(0, currentVerdicts.length - 1);
 
   if (!currentVerdicts.length) {
@@ -600,7 +644,7 @@ function renderVerdicts(list) {
       : "";
 
     return `
-      <article class="decision-card verdict-${escapeHtml(verdict.verdict)} ${index === focusedIndex ? "focused" : ""}" data-idx="${index}" tabindex="0" aria-label="Open alert details for ${escapeHtml(verdict.signature ?? "unnamed alert")}">
+      <article class="decision-card verdict-${escapeHtml(verdict.verdict)} ${index === focusedIndex ? "focused" : ""}" data-idx="${index}" data-event-id="${Number(verdict.id)}" tabindex="0" aria-label="Open alert details for ${escapeHtml(verdict.signature ?? "unnamed alert")}">
         <time class="queue-time">${escapeHtml(timestamp)}</time>
         <div class="queue-signature">
           <strong>${escapeHtml(verdict.signature ?? "Unnamed alert")}</strong>
@@ -612,6 +656,13 @@ function renderVerdicts(list) {
         <span class="queue-confidence">${Number.isFinite(confidence) ? confidence.toFixed(2) : "—"}</span>
       </article>`;
   }).join("");
+
+  // Put keyboard focus back on the same alert. If it is gone from the results,
+  // focus nothing rather than an unrelated card.
+  if (domFocusedEventId == null) return;
+  if (findVerdictIndex(domFocusedEventId) < 0) return;
+  const card = host?.querySelector?.(`[data-event-id="${domFocusedEventId}"]`);
+  card?.focus?.({ preventScroll: true });
 }
 
 function renderAssets(assetContext) {
@@ -1086,6 +1137,11 @@ const pendingFeedback = new Set();
 async function feedback(id, agentVerdict, customVerdict = null, notes = "") {
   const humanVerdict = customVerdict || agentVerdict;
   const eventId = Number(id);
+  // Write-side guard, before anything is reserved or sent. A control left over
+  // from a previous alert must not be able to write to it once the URL has
+  // moved on, and a missing id must never reach /feedback/NaN.
+  if (!Number.isInteger(eventId) || eventId < 1) return;
+  if (currentView === "detail" && detailPathEventId() !== eventId) return;
   if (pendingFeedback.has(eventId)) return;
   pendingFeedback.add(eventId);
   try {
@@ -1266,7 +1322,11 @@ document.getElementById("returnLiveButton").addEventListener("click", returnToLi
 document.getElementById("detailPageContent").addEventListener("click", async (event) => {
   const feedbackButton = event.target.closest("[data-detail-feedback]");
   if (feedbackButton) {
+    // Refuse a click on controls belonging to an alert that is no longer the
+    // routed one; feedback() repeats the check on the write side.
     const eventId = Number(activeDetail?.id);
+    if (!Number.isInteger(eventId) || eventId < 1) return;
+    if (detailPathEventId() !== eventId) return;
     const notes = document.getElementById("detailNotes")?.value ?? "";
     await feedback(eventId, activeDetail?.verdict, feedbackButton.dataset.detailFeedback, notes);
     return;
