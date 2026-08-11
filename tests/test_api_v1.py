@@ -1697,6 +1697,34 @@ class InvestigationScaleTests(unittest.TestCase):
             f"investigation took {elapsed:.2f}s over {self.ROW_COUNT} rows",
         )
 
+    def investigation_progress_ticks(self, event_id):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        ticks = {"count": 0}
+
+        def handler():
+            ticks["count"] += 1
+            return 0
+
+        try:
+            conn.set_progress_handler(handler, 1000)
+            services.fetch_investigation(conn, event_id)
+        finally:
+            conn.close()
+        return ticks["count"]
+
+    def test_neighbor_work_does_not_scale_with_distance_from_newest(self):
+        near_newest = self.investigation_progress_ticks(25)
+        near_oldest = self.investigation_progress_ticks(self.ROW_COUNT - 25)
+        # Correlation examines the same fixed candidate budget for both. Queue
+        # navigation must add only bounded seeks, not a walk over the thousands
+        # of rows newer than the old anchor.
+        self.assertLess(
+            near_oldest,
+            max(near_newest * 2, near_newest + 30),
+            f"neighbor work scaled with queue distance ({near_newest} -> {near_oldest})",
+        )
+
 
 class LongRetentionRecurrenceTests(unittest.TestCase):
     """Recurrence must cost what the window holds, not what retention holds.

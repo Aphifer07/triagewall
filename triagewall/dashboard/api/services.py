@@ -432,28 +432,39 @@ def _fetch_neighbors(
             )
         return previous_row, next_row
 
+    # Keep the timestamp tie and the adjacent timestamp as separate seeks.
+    # Combining them with OR makes SQLite walk and order every row on the
+    # newer side of an old alert before LIMIT 1 can apply. That was more than
+    # five seconds on a production database even though each seek is instant.
     next_row = run(
-        [
-            """(
-                events.processed_at < ?
-                OR (events.processed_at = ? AND events.id < ?)
-                OR events.processed_at IS NULL
-            )"""
-        ],
-        [anchor_processed_at, anchor_processed_at, anchor_id],
-        "events.processed_at DESC, events.id DESC",
+        ["events.processed_at = ?", "events.id < ?"],
+        [anchor_processed_at, anchor_id],
+        "events.id DESC",
     )
+    if next_row is None:
+        next_row = run(
+            ["events.processed_at < ?"],
+            [anchor_processed_at],
+            "events.processed_at DESC, events.id DESC",
+        )
+    if next_row is None:
+        next_row = run(
+            ["events.processed_at IS NULL"],
+            [],
+            "events.id DESC",
+        )
+
     previous_row = run(
-        [
-            "events.processed_at IS NOT NULL",
-            """(
-                events.processed_at > ?
-                OR (events.processed_at = ? AND events.id > ?)
-            )""",
-        ],
-        [anchor_processed_at, anchor_processed_at, anchor_id],
-        "events.processed_at ASC, events.id ASC",
+        ["events.processed_at = ?", "events.id > ?"],
+        [anchor_processed_at, anchor_id],
+        "events.id ASC",
     )
+    if previous_row is None:
+        previous_row = run(
+            ["events.processed_at > ?"],
+            [anchor_processed_at],
+            "events.processed_at ASC, events.id ASC",
+        )
     return previous_row, next_row
 
 
