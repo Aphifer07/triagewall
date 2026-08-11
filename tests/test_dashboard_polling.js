@@ -1476,6 +1476,99 @@ test("signature filtering still reloads the queue exactly once", async () => {
   assert.match(String(harness.replacedUrls.at(-1)), /signature=scan/);
 });
 
+test("a typed signature is live URL state before the debounce fires", async () => {
+  const harness = runDashboard({ pathname: "/triage", search: "?model=llm" });
+  await harness.settle();
+  const fetchesBefore = routeFetchUrls(harness).length;
+  const pushesBefore = harness.pushedUrls.length;
+
+  harness.document.getElementById("sigFilter").dispatch("input", {
+    target: { value: "scan" },
+  });
+
+  // The queue entry already carries the typed value...
+  const queueUrl = String(harness.replacedUrls.at(-1));
+  assert.match(queueUrl, /signature=scan/);
+  assert.match(queueUrl, /model=llm/);
+  assert.match(queueUrl, /^\/triage\?/);
+  // ...written with replaceState, and without fetching yet.
+  assert.equal(harness.pushedUrls.length, pushesBefore, "typing created a history entry");
+  assert.equal(
+    routeFetchUrls(harness).length,
+    fetchesBefore,
+    "typing issued a queue request before the debounce",
+  );
+  assert.equal(harness.pendingTimers().length, 1);
+
+  // Opening an alert during the debounce carries the signature forward.
+  harness.api.open(7);
+  await harness.settle();
+  const detailUrl = String(harness.pushedUrls.at(-1));
+  assert.match(detailUrl, /^\/triage\/7\?/);
+  assert.match(detailUrl, /signature=scan/);
+  assert.equal(harness.pendingTimers().length, 0, "the obsolete timer was not cancelled");
+
+  // The cancelled debounce must not remount the detail page.
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "draft written during the debounce";
+  notes.value = sentinel;
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBefore = detail.innerHTMLWrites;
+  harness.advanceTimers();
+  await harness.settle();
+  assert.equal(notes.value, sentinel);
+  assert.equal(detail.innerHTMLWrites, writesBefore);
+  assert.equal(harness.api.state().activeDetail.id, 7);
+
+  // Back restores the queue entry exactly as typing left it.
+  harness.goBackTo(queueUrl);
+  await harness.settle();
+  assert.equal(harness.api.state().currentFilter.signature, "scan");
+  assert.equal(harness.document.getElementById("sigFilter").value, "scan");
+  assert.match(
+    routeFetchUrls(harness).at(-1),
+    /signature=scan/,
+    "the restored queue request lost the typed signature",
+  );
+});
+
+test("clearing the search removes the signature from the URL immediately", async () => {
+  const harness = runDashboard({ pathname: "/triage", search: "?model=llm" });
+  await harness.settle();
+  const input = harness.document.getElementById("sigFilter");
+
+  input.dispatch("input", { target: { value: "scan" } });
+  assert.match(String(harness.replacedUrls.at(-1)), /signature=scan/);
+
+  input.dispatch("input", { target: { value: "" } });
+  const cleared = String(harness.replacedUrls.at(-1));
+  assert.doesNotMatch(cleared, /signature=/, "the cleared search stayed in the URL");
+  assert.match(cleared, /model=llm/, "clearing the search dropped the other filters");
+  assert.equal(harness.api.state().currentFilter.signature, "");
+});
+
+test("rapid typing writes no history entries and fetches once", async () => {
+  const harness = runDashboard({ pathname: "/triage", search: "?model=llm" });
+  await harness.settle();
+  const fetchesBefore = routeFetchUrls(harness).length;
+  const pushesBefore = harness.pushedUrls.length;
+  const input = harness.document.getElementById("sigFilter");
+
+  for (const value of ["s", "sc", "sca", "scan"]) {
+    input.dispatch("input", { target: { value } });
+  }
+
+  assert.equal(harness.pushedUrls.length, pushesBefore, "typing created history entries");
+  assert.match(String(harness.replacedUrls.at(-1)), /signature=scan/);
+  assert.equal(harness.pendingTimers().length, 1, "earlier timers were not cleared");
+  assert.equal(routeFetchUrls(harness).length, fetchesBefore);
+
+  harness.advanceTimers();
+  await harness.settle();
+  assert.equal(routeFetchUrls(harness).length, fetchesBefore + 1);
+  assert.match(routeFetchUrls(harness).at(-1), /signature=scan/);
+});
+
 test("rapid typing debounces to a single queue reload", async () => {
   const harness = runDashboard({ pathname: "/triage" });
   await harness.settle();

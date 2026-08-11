@@ -1301,6 +1301,13 @@ document.querySelectorAll(".model-btn").forEach((button) => {
 
 document.getElementById("sigFilter").addEventListener("input", (event) => {
   currentFilter.signature = event.target.value;
+  // The typed value is active URL state from the first keystroke, not once the
+  // debounce fires. Otherwise opening an alert mid-debounce pushes a detail URL
+  // carrying the new signature while the queue entry behind it still holds the
+  // old one, and Back silently discards what was typed. replaceState only:
+  // typing must never create history entries. Only the request stays debounced.
+  syncUrlState();
+  syncQueueLinks();
   cancelSignatureFilterTimer();
   window.signatureFilterTimer = setTimeout(applyFilters, SIGNATURE_FILTER_DEBOUNCE_MS);
 });
