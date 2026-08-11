@@ -88,6 +88,11 @@ pseudonym**:
   providing.
 - Pseudonyms are deterministic within a deployment, so correlation across
   responses still works. Changing the secret changes every pseudonym.
+- Verdict `reasoning`, operator `human_notes`, retained `raw_alert`, and both
+  `asset_context` snapshots are omitted while redaction is enabled. Those are
+  free-form channels that can repeat endpoint addresses or contain additional
+  inventory addresses; withholding them keeps the boundary fail-closed rather
+  than implying that changing only `src_ip` / `dest_ip` sanitized the row.
 
 Demo mode continues to apply its stricter masking independently of this
 setting.
@@ -149,7 +154,8 @@ One complete decision for the routed alert-detail view. Response:
 `{generated_at, mode, verdict}`. Unlike the bounded list endpoint, the detail
 row includes the stored `raw_alert` sensor record when local-mode disclosure
 policy permits it. Demo mode and API IP-redaction mode continue to omit that
-field.
+field. IP-redaction mode also omits reasoning, operator notes, and asset
+snapshots as described under **IP exposure**.
 
 ```bash
 curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \

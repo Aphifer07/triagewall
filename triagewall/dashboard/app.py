@@ -262,9 +262,15 @@ def row_to_dict(row):
     elif API_REDACT_IPS:
         d["src_ip"] = services.hash_ip(d.get("src_ip"), API_IP_HASH_SECRET)
         d["dest_ip"] = services.hash_ip(d.get("dest_ip"), API_IP_HASH_SECRET)
-        # raw_alert may contain the original addresses and other unprojected
-        # identifiers, so it cannot be returned alongside redacted fields.
+        # These free-form channels can repeat endpoint addresses or carry
+        # additional inventory addresses that cannot be pseudonymized safely
+        # by changing only the structured src_ip/dest_ip fields. Fail closed:
+        # retain the keyed endpoint pseudonyms, but withhold text and snapshots
+        # rather than claiming an incomplete IP-redaction boundary.
         d["raw_alert"] = None
+        d["reasoning"] = None
+        d["human_notes"] = None
+        d["asset_context"] = {"source": None, "destination": None}
     return d
 
 

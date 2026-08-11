@@ -372,15 +372,63 @@ class ApiV1Tests(unittest.TestCase):
         self.assertEqual(second.status_code, 304)
 
     def test_ip_redaction_option(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO asset_snapshots (
+                    id, snapshot_hash, asset_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    1,
+                    "redaction-snapshot",
+                    '{"hostname":"sensor","ips":["10.0.0.5"],"owner":"ops"}',
+                    format_utc_timestamp(datetime.now(timezone.utc)),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE triage_events
+                SET reasoning = ?, human_notes = ?, raw_alert = ?,
+                    src_asset_snapshot_id = ?
+                WHERE id = 1
+                """,
+                (
+                    "10.0.0.5 contacted 192.168.1.20",
+                    "Owner confirmed 10.0.0.5",
+                    '{"src_ip":"10.0.0.5","dest_ip":"192.168.1.20"}',
+                    1,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
         dashboard.API_REDACT_IPS = True
         dashboard.API_IP_HASH_SECRET = b"x" * 40
         services.reset_caches()
-        verdict = self.client.get(
+        list_verdict = self.client.get(
             "/api/v1/verdicts?limit=1",
             headers=self.host,
         ).json()["verdicts"][0]
-        self.assertTrue(verdict["src_ip"].startswith("ip_"))
-        self.assertIsNone(verdict["raw_alert"])
+        detail_verdict = self.client.get(
+            "/api/v1/verdicts/1",
+            headers=self.host,
+        ).json()["verdict"]
+        for verdict in (list_verdict, detail_verdict):
+            self.assertTrue(verdict["src_ip"].startswith("ip_"))
+            self.assertTrue(verdict["dest_ip"].startswith("ip_"))
+            self.assertIsNone(verdict["raw_alert"])
+            self.assertIsNone(verdict["reasoning"])
+            self.assertIsNone(verdict["human_notes"])
+            self.assertEqual(
+                verdict["asset_context"],
+                {"source": None, "destination": None},
+            )
+            serialized = str(verdict)
+            self.assertNotIn("10.0.0.5", serialized)
+            self.assertNotIn("192.168.1.20", serialized)
         anomaly = self.client.get(
             "/api/v1/spc-anomalies",
             headers=self.host,

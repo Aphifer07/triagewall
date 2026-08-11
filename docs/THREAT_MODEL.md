@@ -251,8 +251,11 @@ digest would be reversible by exhaustive search over the address space, so
 enabling redaction without a valid secret fails startup. Because the mapping is
 deterministic within a deployment — which is what makes correlation useful — an
 attacker who learns the secret can still re-identify addresses, and one who can
-observe traffic can confirm a guessed address. Demo-mode masking is separate
-and unaffected.
+observe traffic can confirm a guessed address. When this mode is enabled, API
+verdict rows also withhold free-form reasoning, operator notes, raw sensor
+records, and asset snapshots because those channels can repeat or add cleartext
+addresses outside the structured endpoint fields. Demo-mode masking is
+separate and unaffected.
 
 **Retention remains an operator-controlled maintenance action.** The bounded,
 backup-first host runner restores monitoring between short deletion pauses and

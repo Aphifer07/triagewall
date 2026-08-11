@@ -909,6 +909,52 @@ test("a delayed detail load remains bound to its original alert", async () => {
   );
 });
 
+test("a delayed detail load cannot reclaim the same alert after it is reopened", async () => {
+  let deferFirstHealth = true;
+  const harness = runDashboard({
+    pathname: "/triage/7",
+    defer: (url) => {
+      if (!url.includes("/api/health") || !deferFirstHealth) return false;
+      deferFirstHealth = false;
+      return true;
+    },
+  });
+  await harness.settle();
+  assert.equal(harness.deferred.length, 1, "the initial detail load should be suspended");
+
+  // Leave the original detail generation, then open the same URL as a new
+  // detail session. Path and event id are intentionally identical.
+  harness.dispatchKey("Escape");
+  await harness.settle();
+  assert.equal(harness.location.pathname, "/triage");
+  harness.api.open(7);
+  await harness.settle();
+
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "draft from the reopened alert";
+  notes.value = sentinel;
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBeforeRelease = detail.innerHTMLWrites;
+  const detailFetchesBeforeRelease = harness.fetchCalls.filter(({ url }) =>
+    /\/api\/v1\/verdicts\/7(\/investigation)?(\?|$)/.test(url),
+  ).length;
+
+  harness.releaseDeferred((url) => url.includes("/api/health"));
+  await harness.settle();
+
+  assert.equal(harness.location.pathname, "/triage/7");
+  assert.equal(harness.api.state().activeDetail.id, 7);
+  assert.equal(notes.value, sentinel);
+  assert.equal(detail.innerHTMLWrites, writesBeforeRelease);
+  assert.equal(
+    harness.fetchCalls.filter(({ url }) =>
+      /\/api\/v1\/verdicts\/7(\/investigation)?(\?|$)/.test(url),
+    ).length,
+    detailFetchesBeforeRelease,
+    "the retired detail generation refreshed the reopened alert",
+  );
+});
+
 test("focusing a queue card syncs the index so Enter opens that card", async () => {
   const verdicts = [
     { id: 11, verdict: "real", signature: "one", confidence: 0.5 },

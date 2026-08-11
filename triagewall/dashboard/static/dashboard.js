@@ -290,6 +290,10 @@ function captureLoadOrigin() {
     view: currentView,
     pathname: window.location.pathname,
     detailEventId: detailPathEventId(),
+    // The same URL can be left and reopened while this load is suspended.
+    // Route equality alone cannot distinguish that new detail session from
+    // the one that originally requested the refresh.
+    detailGeneration,
     filter: { ...currentFilter },
     browsingHistory,
   };
@@ -299,6 +303,9 @@ function loadOriginIsCurrent(origin) {
   if (currentView !== origin.view) return false;
   if (window.location.pathname !== origin.pathname) return false;
   if (origin.view === "detail" && detailPathEventId() !== origin.detailEventId) {
+    return false;
+  }
+  if (origin.view === "detail" && detailGeneration !== origin.detailGeneration) {
     return false;
   }
   if (origin.view === "triage" || origin.view === "detail") {
