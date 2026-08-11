@@ -269,12 +269,47 @@ function invalidateQueueRequests() {
   queueGeneration += 1;
   if (queueAbort) queueAbort.abort();
   queueAbort = null;
+  // A superseded historical-page request no longer owns the loading state.
+  // Clear it here, at the handoff, rather than waiting for an aborted or slow
+  // request to settle and leaving the current queue controls disabled.
+  pageLoading = false;
 }
 
 function queueRequestIsCurrent(request) {
   if (request.generation !== queueGeneration) return false;
   if (currentView !== "triage") return false;
   return FILTER_KEYS.every((key) => currentFilter[key] === request.filter[key]);
+}
+
+// Health and stats are global, but load() performs route-specific work only
+// after awaiting both of them. Bind that later work to the route and queue
+// state that asked for it so a slow queue refresh cannot turn into a detail
+// refresh after the operator opens an alert (or vice versa).
+function captureLoadOrigin() {
+  return {
+    view: currentView,
+    pathname: window.location.pathname,
+    detailEventId: detailPathEventId(),
+    filter: { ...currentFilter },
+    browsingHistory,
+  };
+}
+
+function loadOriginIsCurrent(origin) {
+  if (currentView !== origin.view) return false;
+  if (window.location.pathname !== origin.pathname) return false;
+  if (origin.view === "detail" && detailPathEventId() !== origin.detailEventId) {
+    return false;
+  }
+  if (origin.view === "triage" || origin.view === "detail") {
+    if (!FILTER_KEYS.every((key) => currentFilter[key] === origin.filter[key])) {
+      return false;
+    }
+  }
+  if (origin.view === "triage" && browsingHistory !== origin.browsingHistory) {
+    return false;
+  }
+  return true;
 }
 
 function syncQueueLinks() {
@@ -422,6 +457,7 @@ async function loadVerdictPage(cursor = null, append = false, request = beginQue
 // unsaved operator note in #detailNotes. Explicit navigation, deep links and
 // the post-feedback reload all pass through loadDetail directly.
 async function load({ refreshDetail = true } = {}) {
+  const origin = captureLoadOrigin();
   try {
     const healthResponse = await fetch(`${API}/api/health`);
     const health = await healthResponse.json();
@@ -441,23 +477,29 @@ async function load({ refreshDetail = true } = {}) {
     showToast(error.message, true);
   }
 
-  if (currentView === "overview") {
+  // Everything below is owned by the route that started this load. The global
+  // health/stat panels above may update across navigation, but an old call may
+  // never reinterpret itself as work for the route now on screen.
+  if (!loadOriginIsCurrent(origin)) return;
+
+  if (origin.view === "overview") {
     try {
       const points = await loadTimeline();
+      if (!loadOriginIsCurrent(origin)) return;
       renderTimeline(points);
       document.getElementById("timelineMeta").textContent = points.length ? `${points.length} hourly buckets` : "No activity";
     } catch (_error) {
+      if (!loadOriginIsCurrent(origin)) return;
       document.getElementById("timelineChart").innerHTML = '<div class="empty-state">Decision volume is temporarily unavailable.</div>';
       document.getElementById("timelineMeta").textContent = "Activity unavailable";
     }
 
   }
 
-  if (currentView === "detail") {
+  if (origin.view === "detail") {
     if (!refreshDetail) return;
-    const detailId = Number(window.location.pathname.split("/").at(-1));
-    await loadDetail(detailId);
-  } else if (currentView === "triage" && !browsingHistory) {
+    await loadDetail(origin.detailEventId);
+  } else if (origin.view === "triage" && !origin.browsingHistory) {
     const request = beginQueueRequest();
     try {
       const applied = await loadVerdictPage(null, false, request);
@@ -469,7 +511,7 @@ async function load({ refreshDetail = true } = {}) {
       document.getElementById("freshness").textContent = "Decision feed unavailable";
       showToast(error.message, true);
     }
-  } else if (currentView === "triage") {
+  } else if (origin.view === "triage") {
     // Browsing history: the loaded pages are kept rather than refetched, but
     // they are repainted so a row corrected by a committed write is not left
     // showing its pre-commit state.
@@ -1213,10 +1255,11 @@ async function loadOlder() {
   } catch (error) {
     if (queueRequestIsCurrent(request)) showToast(error.message, true);
   } finally {
-    pageLoading = false;
     // If the filters moved on, the newer request owns the rendering; appending
-    // this page or repainting from it would splice old-filter rows into it.
+    // this page, clearing its loading state or repainting from it would splice
+    // old-filter state into the current queue.
     if (queueRequestIsCurrent(request)) {
+      pageLoading = false;
       if (!appended) browsingHistory = wasBrowsingHistory;
       renderPagination();
     }
@@ -1224,6 +1267,10 @@ async function loadOlder() {
 }
 
 async function returnToLive() {
+  // Retire a pending historical page before resetting its state. Without this
+  // handoff, that page can append after the operator has explicitly returned
+  // to the live queue and can later clear loading state owned by newer work.
+  invalidateQueueRequests();
   resetPagination();
   await load();
 }

@@ -392,6 +392,8 @@ function runDashboard({
   setFilter: (key, value) => { currentFilter[key] = value; },
   applyFilters: () => applyFilters(),
   loadOlder: () => loadOlder(),
+  returnToLive: () => returnToLive(),
+  load: (options) => load(options),
   feedback: (id, agentVerdict, customVerdict, notes) =>
     feedback(id, agentVerdict, customVerdict, notes),
   state: () => ({
@@ -822,6 +824,89 @@ test("a scheduled polling tick preserves an unsaved review note", async () => {
   assert.ok(polled.some((url) => url.includes("/api/health")));
   assert.ok(polled.some((url) => url.includes("/api/v1/stats")));
   assert.ok(!polled.some((url) => /\/api\/v1\/verdicts\/7/.test(url)));
+});
+
+test("a queue load delayed by global reads cannot become a detail refresh", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => url.includes("/api/health"),
+  });
+  await harness.settle();
+  assert.equal(harness.deferred.length, 1, "the queue load should be waiting on health");
+
+  // Detail navigation owns its own request and renders while the older queue
+  // load is still suspended before its route-specific branch.
+  harness.api.open(7);
+  await harness.settle();
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "draft owned by the direct detail navigation";
+  notes.value = sentinel;
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBeforeRelease = detail.innerHTMLWrites;
+  const detailFetchesBeforeRelease = harness.fetchCalls.filter(({ url }) =>
+    /\/api\/v1\/verdicts\/7(\/investigation)?(\?|$)/.test(url),
+  ).length;
+
+  harness.releaseDeferred((url) => url.includes("/api/health"));
+  await harness.settle();
+
+  assert.equal(harness.location.pathname, "/triage/7");
+  assert.equal(harness.api.state().activeDetail.id, 7);
+  assert.equal(notes.value, sentinel, "the old queue load destroyed the detail draft");
+  assert.equal(
+    detail.innerHTMLWrites,
+    writesBeforeRelease,
+    "the old queue load remounted the detail route",
+  );
+  assert.equal(
+    harness.fetchCalls.filter(({ url }) =>
+      /\/api\/v1\/verdicts\/7(\/investigation)?(\?|$)/.test(url),
+    ).length,
+    detailFetchesBeforeRelease,
+    "the old queue load issued a second detail refresh",
+  );
+});
+
+test("a delayed detail load remains bound to its original alert", async () => {
+  let holdHealth = false;
+  const harness = runDashboard({
+    pathname: "/triage/7",
+    defer: (url) => holdHealth && url.includes("/api/health"),
+  });
+  await harness.settle();
+  assert.equal(harness.api.state().activeDetail.id, 7);
+
+  holdHealth = true;
+  const staleLoad = harness.api.load({ refreshDetail: true });
+  await harness.settle();
+  assert.equal(harness.deferred.length, 1, "the detail load should be waiting on health");
+
+  holdHealth = false;
+  harness.api.open(8);
+  await harness.settle();
+  const notes = harness.document.getElementById("detailNotes");
+  const sentinel = "alert eight draft";
+  notes.value = sentinel;
+  const detail = harness.document.getElementById("detailPageContent");
+  const writesBeforeRelease = detail.innerHTMLWrites;
+  const eventEightFetches = harness.fetchCalls.filter(({ url }) =>
+    /\/api\/v1\/verdicts\/8(\/investigation)?(\?|$)/.test(url),
+  ).length;
+
+  harness.releaseDeferred((url) => url.includes("/api/health"));
+  await staleLoad;
+  await harness.settle();
+
+  assert.equal(harness.location.pathname, "/triage/8");
+  assert.equal(harness.api.state().activeDetail.id, 8);
+  assert.equal(notes.value, sentinel);
+  assert.equal(detail.innerHTMLWrites, writesBeforeRelease);
+  assert.equal(
+    harness.fetchCalls.filter(({ url }) =>
+      /\/api\/v1\/verdicts\/8(\/investigation)?(\?|$)/.test(url),
+    ).length,
+    eventEightFetches,
+  );
 });
 
 test("focusing a queue card syncs the index so Enter opens that card", async () => {
@@ -1663,6 +1748,46 @@ test("a superseded Load older failure cannot revert newer queue state", async ()
   assert.equal(state.browsingHistory, false, "a stale failure changed newer state");
   assert.equal(state.currentVerdicts[0].signature, "row-prefilter");
   assert.equal(harness.document.getElementById("toast").textContent, "");
+});
+
+test("returning live retires a pending historical page", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    defer: (url) => url.includes("cursor="),
+  });
+  await harness.settle();
+
+  harness.api.loadOlder();
+  await harness.settle();
+  assert.equal(harness.api.state().browsingHistory, true);
+  assert.equal(harness.document.getElementById("loadOlderButton").disabled, true);
+  assert.equal(harness.deferred.length, 1);
+
+  await harness.api.returnToLive();
+  await harness.settle();
+
+  let state = harness.api.state();
+  assert.equal(state.browsingHistory, false);
+  assert.equal(state.currentVerdicts.length, 1, "the live page was not restored");
+  assert.equal(harness.document.getElementById("loadOlderButton").disabled, false);
+  assert.equal(
+    harness.document.getElementById("returnLiveButton").classList.contains("hidden"),
+    true,
+  );
+
+  // A late response from the retired page owns neither the rows nor the
+  // controls of the live queue.
+  harness.releaseDeferred();
+  await harness.settle();
+
+  state = harness.api.state();
+  assert.equal(state.browsingHistory, false);
+  assert.equal(state.currentVerdicts.length, 1);
+  assert.doesNotMatch(
+    harness.document.getElementById("verdicts").innerHTML,
+    /older/,
+  );
+  assert.equal(harness.document.getElementById("loadOlderButton").disabled, false);
 });
 
 test("a failed feedback write is reported even after navigating away", async () => {
