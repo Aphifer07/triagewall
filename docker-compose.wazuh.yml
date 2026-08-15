@@ -42,7 +42,7 @@ services:
     security_opt:
       - no-new-privileges:true
     depends_on:
-      migrate:
+      config-bootstrap:
         condition: service_completed_successfully
     restart: unless-stopped
 

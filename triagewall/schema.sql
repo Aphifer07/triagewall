@@ -90,3 +90,77 @@ ON sensor_event_context (
     source_event_id
 )
 WHERE source_event_id IS NOT NULL;
+
+-- Immutable, canonical operator configuration documents. Content is never
+-- updated in place; lifecycle metadata changes as a revision is validated,
+-- activated, superseded, rejected, or reactivated for rollback.
+CREATE TABLE IF NOT EXISTS operator_config_revisions (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('prefilter_policy', 'asset_inventory')),
+    revision TEXT NOT NULL,
+    document_json TEXT NOT NULL CHECK (length(document_json) <= 1048576),
+    source TEXT NOT NULL CHECK (source IN ('shipped', 'operator_import', 'operator')),
+    parent_revision_id INTEGER,
+    shipped_base_revision TEXT,
+    state TEXT NOT NULL CHECK (
+        state IN ('draft', 'validated', 'active', 'superseded', 'rejected')
+    ),
+    validation_json TEXT,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    note TEXT,
+    FOREIGN KEY (parent_revision_id) REFERENCES operator_config_revisions(id),
+    UNIQUE (kind, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_config_revisions_kind_state
+ON operator_config_revisions(kind, state, id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_config_one_active_kind
+ON operator_config_revisions(kind)
+WHERE state = 'active';
+
+-- One singleton row names the complete active configuration bundle. A single
+-- generation prevents consumers from observing a half-activated pair.
+CREATE TABLE IF NOT EXISTS operator_config_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    active_prefilter_revision_id INTEGER NOT NULL,
+    active_asset_revision_id INTEGER NOT NULL,
+    previous_prefilter_revision_id INTEGER,
+    previous_asset_revision_id INTEGER,
+    mode TEXT NOT NULL DEFAULT 'legacy' CHECK (mode IN ('legacy', 'database')),
+    generation INTEGER NOT NULL CHECK (generation >= 1),
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (active_prefilter_revision_id)
+        REFERENCES operator_config_revisions(id),
+    FOREIGN KEY (active_asset_revision_id)
+        REFERENCES operator_config_revisions(id),
+    FOREIGN KEY (previous_prefilter_revision_id)
+        REFERENCES operator_config_revisions(id),
+    FOREIGN KEY (previous_asset_revision_id)
+        REFERENCES operator_config_revisions(id)
+);
+
+-- Append-only lifecycle evidence. Configuration content, credentials, and
+-- sensor records are deliberately excluded from audit details.
+CREATE TABLE IF NOT EXISTS operator_config_audit (
+    id INTEGER PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    kind TEXT CHECK (
+        kind IS NULL OR kind IN ('prefilter_policy', 'asset_inventory')
+    ),
+    revision_id INTEGER,
+    from_revision_id INTEGER,
+    to_revision_id INTEGER,
+    actor TEXT NOT NULL,
+    auth_via TEXT NOT NULL,
+    request_id TEXT,
+    action TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (revision_id) REFERENCES operator_config_revisions(id),
+    FOREIGN KEY (from_revision_id) REFERENCES operator_config_revisions(id),
+    FOREIGN KEY (to_revision_id) REFERENCES operator_config_revisions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_config_audit_occurred
+ON operator_config_audit(occurred_at, id);

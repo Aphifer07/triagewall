@@ -23,6 +23,9 @@ REQUIRED_TABLES = {
     "ingest_failures",
     "asset_snapshots",
     "sensor_event_context",
+    "operator_config_revisions",
+    "operator_config_state",
+    "operator_config_audit",
     "spc_ip_state",
     "spc_rate_buckets",
     "spc_seen_sids",
@@ -39,9 +42,52 @@ REQUIRED_INDEXES = {
     "idx_triage_src_asset_snapshot",
     "idx_triage_dest_asset_snapshot",
     "idx_sensor_event_source_identity",
+    "idx_operator_config_revisions_kind_state",
+    "idx_operator_config_one_active_kind",
+    "idx_operator_config_audit_occurred",
     "idx_spc_anom_ip",
     "idx_spc_anom_detected",
     "idx_spc_buckets_ip",
+}
+
+REQUIRED_CONFIG_COLUMNS = {
+    "operator_config_revisions": {
+        "id",
+        "kind",
+        "revision",
+        "document_json",
+        "source",
+        "parent_revision_id",
+        "shipped_base_revision",
+        "state",
+        "validation_json",
+        "created_at",
+        "created_by",
+        "note",
+    },
+    "operator_config_state": {
+        "id",
+        "active_prefilter_revision_id",
+        "active_asset_revision_id",
+        "previous_prefilter_revision_id",
+        "previous_asset_revision_id",
+        "mode",
+        "generation",
+        "updated_at",
+    },
+    "operator_config_audit": {
+        "id",
+        "occurred_at",
+        "kind",
+        "revision_id",
+        "from_revision_id",
+        "to_revision_id",
+        "actor",
+        "auth_via",
+        "request_id",
+        "action",
+        "detail_json",
+    },
 }
 
 
@@ -110,6 +156,24 @@ def ensure_db_initialized(db_path: str | Path) -> None:
                         "NOT NULL DEFAULT 'suricata'"
                     )
 
+            config_state_exists = conn.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table' AND name = 'operator_config_state'"""
+            ).fetchone()
+            if config_state_exists:
+                config_state_columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info('operator_config_state')"
+                    )
+                }
+                if "mode" not in config_state_columns:
+                    conn.execute(
+                        "ALTER TABLE operator_config_state ADD COLUMN mode TEXT "
+                        "NOT NULL DEFAULT 'legacy' "
+                        "CHECK (mode IN ('legacy', 'database'))"
+                    )
+
             _execute_statements(conn, schema_sql)
             _execute_statements(conn, spc.SCHEMA)
             conn.commit()
@@ -160,6 +224,13 @@ def verify_db_initialized(db_path: str | Path) -> None:
         failure_columns = {
             row[1] for row in conn.execute("PRAGMA table_info('ingest_failures')")
         }
+        config_columns = {
+            table: {
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info('{table}')")
+            }
+            for table in REQUIRED_CONFIG_COLUMNS
+        }
     finally:
         conn.close()
 
@@ -171,6 +242,11 @@ def verify_db_initialized(db_path: str | Path) -> None:
     } - event_columns
     if "source_type" not in failure_columns:
         missing_columns.add("ingest_failures.source_type")
+    for table, required_columns in REQUIRED_CONFIG_COLUMNS.items():
+        missing_columns.update(
+            f"{table}.{column}"
+            for column in required_columns - config_columns[table]
+        )
     if missing_tables or missing_indexes or missing_columns:
         details = []
         if missing_tables:

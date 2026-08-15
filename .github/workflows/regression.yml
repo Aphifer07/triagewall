@@ -48,6 +48,7 @@ jobs:
           tests.test_dashboard_stats
           tests.test_gold_gate
           tests.test_ingest_checkpoint
+          tests.test_operator_config
           tests.test_prefilter
           tests.test_retention
           tests.test_retention_cycle

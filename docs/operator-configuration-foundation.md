@@ -1,6 +1,6 @@
 # Operator configuration foundation
 
-Status: Proposed for v0.4
+Status: Accepted; implementation in progress for v0.4
 
 ## Purpose
 
@@ -48,8 +48,10 @@ dashboard, Suricata ingest, Wazuh ingest, migrations, backup, and rollback.
 
 Store canonical, immutable operator revisions and the active configuration
 pointer in the Core SQLite database. Keep repository defaults as read-only
-bootstrap inputs. Do not rewrite or depend on mutable mounted files after an
-operator revision is activated.
+bootstrap inputs. During the persistence-only compatibility slice, mirror the
+mounted runtime inputs into durable state at every startup. After runtime
+cutover, do not rewrite or depend on mutable mounted files as behavioural
+inputs.
 
 The first release manages two complete document kinds:
 
@@ -108,6 +110,7 @@ One singleton row names the complete active bundle:
 | `active_asset_revision_id` | Current validated asset revision |
 | `previous_prefilter_revision_id` | Previous prefilter rollback target |
 | `previous_asset_revision_id` | Previous asset rollback target |
+| `mode` | `legacy` while mounts are authoritative; `database` after runtime cutover |
 | `generation` | Monotonic integer incremented by every activation |
 | `updated_at` | UTC activation timestamp |
 
@@ -141,7 +144,9 @@ stateDiagram-v2
    validates the packaged default, the legacy mounted prefilter, and the mounted
    private inventory. It imports the packaged default as `shipped` and the
    current effective legacy documents as `operator_import` revisions. It does
-   not copy private inventory content into logs.
+   not copy private inventory content into logs. Until runtime cutover, each
+   later startup validates and mirrors changed mounted inputs as a new active
+   generation so database state cannot diverge from actual ingest behaviour.
 2. **Draft.** An attributable operator submits a complete candidate based on a
    named active revision and generation.
 3. **Validate.** Core runs the existing strict parser, canonicalization, size,
@@ -219,18 +224,23 @@ phase after schema migration and before dashboard or ingest startup:
 - import a differing legacy prefilter and the private inventory as
   `operator_import`;
 - create the singleton active bundle and generation atomically;
+- initialize it in `legacy` mode and, on later starts, atomically mirror any
+  valid change to either mounted effective document;
 - make dashboard, Suricata ingest, and optional Wazuh ingest depend on successful
   bootstrap completion.
 
-On later upgrades the owner records a new shipped revision when the packaged
-digest changes but leaves the active operator bundle untouched. The dashboard
-can report base drift and offer an explicit comparison. It never auto-merges or
-auto-activates new defaults.
+In `legacy` mode, invalid mounted configuration fails bootstrap closed because
+those files are still what ingest will load. A packaged-default change is
+recorded independently as a shipped revision; it affects the active bundle only
+when the mounted effective policy also changes. This preserves existing upgrade
+and rollback behaviour while making the durable record truthful.
 
-Once a database-backed active bundle exists, long-running processes no longer
-read the legacy mounts as behavioural inputs. The mounts remain available only
-for explicit compatibility import until their removal is covered by a later
-upgrade and rollback plan.
+The runtime-cutover slice atomically changes the singleton to `database` mode
+when activation and hot reload are ready. In that mode bootstrap ignores legacy
+mount changes, new packaged defaults never replace active operator pointers,
+and long-running processes load the complete durable bundle. The mounts then
+remain only for explicit compatibility import until a later removal and
+rollback plan covers them.
 
 ## Decision provenance
 
@@ -312,6 +322,8 @@ full-history completeness when truncated.
 - Add the serialized one-shot bootstrap owner and its read-only legacy mounts.
 - Canonicalize/import packaged, legacy prefilter, and private asset documents
   without logging private content.
+- Keep the durable active bundle synchronized with mounted runtime inputs while
+  the singleton is in explicit `legacy` compatibility mode.
 - Add unit coverage for immutable revisions, digests, and bootstrap idempotency.
 
 ### Slice 2 — authorization and draft lifecycle
@@ -325,6 +337,8 @@ full-history completeness when truncated.
 
 - Add bounded prefilter and asset previews.
 - Add generation-based conflict handling and atomic activation.
+- Switch the singleton from `legacy` to `database` authority only through the
+  guarded activation path once both ingest consumers support durable bundles.
 - Persist decision bundle provenance.
 
 ### Slice 4 — hot reload and rollback

@@ -21,6 +21,36 @@ services:
     network_mode: none
     restart: "no"
 
+  config-bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command:
+      - python3
+      - triagewall/config_bootstrap.py
+    environment:
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONDONTWRITEBYTECODE: "1"
+      DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
+      PACKAGED_PREFILTER_PATH: /app/triagewall/defaults/prefilter.json
+      LEGACY_PREFILTER_PATH: /var/lib/triagewall-config/prefilter.json
+      ASSET_INVENTORY_PATH: /var/lib/triagewall-config/assets.json
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+      - ./triagewall/config/prefilter.json:/var/lib/triagewall-config/prefilter.json:ro
+      - ${HOST_ASSET_INVENTORY:-./triagewall/config/assets.example.json}:/var/lib/triagewall-config/assets.json:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   ingest:
     build:
       context: .
@@ -49,7 +79,7 @@ services:
       - ./triagewall/config/prefilter.json:/app/triagewall/config/prefilter.json:ro
       - ${HOST_ASSET_INVENTORY:-./triagewall/config/assets.example.json}:/app/triagewall/config/assets.json:ro
     depends_on:
-      migrate:
+      config-bootstrap:
         condition: service_completed_successfully
     restart: unless-stopped
 
@@ -79,7 +109,7 @@ services:
     ports:
       - "${DASHBOARD_PORT:-8084}:${DASHBOARD_PORT:-8084}"
     depends_on:
-      migrate:
+      config-bootstrap:
         condition: service_completed_successfully
       ingest:
         condition: service_started
