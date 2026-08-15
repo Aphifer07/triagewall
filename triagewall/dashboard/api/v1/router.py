@@ -7,11 +7,22 @@ from typing import Callable
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
+from triagewall import config_repository
 from triagewall.dashboard.api.auth import AuthContext, AuthState
 from triagewall.dashboard.api.cache_headers import validated_json_response
 from triagewall.dashboard.api import metrics as metrics_mod
 from triagewall.dashboard.api import services
 from triagewall.dashboard.api.v1.models import (
+    ActiveConfigResponse,
+    ConfigAuditResponse,
+    ConfigDraftRequest,
+    ConfigDraftResponse,
+    ConfigKind,
+    ConfigRevisionState,
+    ConfigRevisionResponse,
+    ConfigRevisionsResponse,
+    ConfigSummaryResponse,
+    ConfigValidationResponse,
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
@@ -42,11 +53,56 @@ def create_v1_router(
     mask_ip_fn: Callable,
     redact_ips: Callable[[], bool],
     get_ip_secret: Callable[[], bytes | None] = lambda: None,
+    config_writes_enabled: Callable[[], bool] = lambda: False,
 ) -> APIRouter:
     """Build the v1 router with injected app dependencies."""
     router = APIRouter(prefix="/api/v1", tags=["v1"])
     require_read = auth.require_read
     require_write = auth.require_feedback_write
+
+    def require_config_access(
+        ctx: AuthContext = Depends(auth.require_config_write),
+    ) -> AuthContext:
+        if get_mode() == "demo":
+            raise HTTPException(
+                status_code=403,
+                detail="configuration access is unavailable in demo mode",
+            )
+        return ctx
+
+    def require_config_mutation(
+        ctx: AuthContext = Depends(require_config_access),
+    ) -> AuthContext:
+        if not config_writes_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="configuration writes are disabled",
+            )
+        return ctx
+
+    def request_id(request: Request) -> str | None:
+        value = request.headers.get("X-Request-ID")
+        if value is None:
+            return None
+        if (
+            not value
+            or len(value) > config_repository.MAX_REQUEST_ID_LENGTH
+            or not all(character.isascii() and character.isprintable() for character in value)
+        ):
+            raise HTTPException(status_code=422, detail="invalid X-Request-ID")
+        return value
+
+    def repository_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, config_repository.ConfigNotFoundError):
+            return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, config_repository.ConfigConflictError):
+            return HTTPException(status_code=409, detail=str(exc))
+        if isinstance(exc, config_repository.ConfigIntegrityError):
+            return HTTPException(
+                status_code=500,
+                detail="operator configuration storage is inconsistent",
+            )
+        return HTTPException(status_code=422, detail=str(exc))
 
     @router.get(
         "/health",
@@ -277,6 +333,209 @@ def create_v1_router(
             body,
             model=SpcAnomaliesResponse,
             max_age=int(services.SPC_TTL),
+        )
+
+    @router.get("/config", response_model=ConfigSummaryResponse)
+    def config_summary(
+        request: Request,
+        _auth: AuthContext = Depends(require_config_access),
+    ):
+        try:
+            with db_factory(readonly=True) as conn:
+                payload = config_repository.get_config_summary(
+                    conn,
+                    writes_enabled=config_writes_enabled(),
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigSummaryResponse,
+            max_age=0,
+            no_store=True,
+        )
+
+    @router.get("/config/audit", response_model=ConfigAuditResponse)
+    def config_audit(
+        request: Request,
+        limit: int = Query(
+            default=config_repository.DEFAULT_AUDIT_LIMIT,
+            ge=1,
+            le=config_repository.MAX_AUDIT_LIMIT,
+        ),
+        cursor: str | None = Query(
+            default=None,
+            max_length=config_repository.MAX_CONFIG_CURSOR_LENGTH,
+        ),
+        kind: ConfigKind | None = None,
+        _auth: AuthContext = Depends(require_config_access),
+    ):
+        try:
+            with db_factory(readonly=True) as conn:
+                payload = config_repository.list_audit(
+                    conn,
+                    limit=limit,
+                    cursor=cursor,
+                    kind=kind,
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigAuditResponse,
+            max_age=0,
+            no_store=True,
+        )
+
+    @router.get("/config/{kind}", response_model=ActiveConfigResponse)
+    def active_config(
+        request: Request,
+        kind: ConfigKind,
+        _auth: AuthContext = Depends(require_config_access),
+    ):
+        try:
+            with db_factory(readonly=True) as conn:
+                payload = config_repository.get_active_config(conn, kind)
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ActiveConfigResponse,
+            max_age=0,
+            no_store=True,
+        )
+
+    @router.get(
+        "/config/{kind}/revisions",
+        response_model=ConfigRevisionsResponse,
+    )
+    def config_revisions(
+        request: Request,
+        kind: ConfigKind,
+        limit: int = Query(
+            default=config_repository.DEFAULT_REVISION_LIMIT,
+            ge=1,
+            le=config_repository.MAX_REVISION_LIMIT,
+        ),
+        cursor: str | None = Query(
+            default=None,
+            max_length=config_repository.MAX_CONFIG_CURSOR_LENGTH,
+        ),
+        state: ConfigRevisionState | None = None,
+        _auth: AuthContext = Depends(require_config_access),
+    ):
+        try:
+            with db_factory(readonly=True) as conn:
+                payload = config_repository.list_revisions(
+                    conn,
+                    kind=kind,
+                    limit=limit,
+                    cursor=cursor,
+                    state=state,
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigRevisionsResponse,
+            max_age=0,
+            no_store=True,
+        )
+
+    @router.get(
+        "/config/{kind}/revisions/{revision_id}",
+        response_model=ConfigRevisionResponse,
+    )
+    def config_revision(
+        request: Request,
+        kind: ConfigKind,
+        revision_id: int,
+        _auth: AuthContext = Depends(require_config_access),
+    ):
+        try:
+            with db_factory(readonly=True) as conn:
+                payload = config_repository.get_config_revision(
+                    conn,
+                    kind=kind,
+                    revision_id=revision_id,
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigRevisionResponse,
+            max_age=0,
+            no_store=True,
+        )
+
+    @router.post(
+        "/config/{kind}/drafts",
+        response_model=ConfigDraftResponse,
+        status_code=201,
+    )
+    def create_config_draft(
+        request: Request,
+        kind: ConfigKind,
+        body: ConfigDraftRequest,
+        auth_ctx: AuthContext = Depends(require_config_mutation),
+    ):
+        try:
+            with db_factory() as conn:
+                payload = config_repository.create_draft(
+                    conn,
+                    kind=kind,
+                    document=body.document,
+                    parent_revision_id=body.parent_revision_id,
+                    expected_generation=body.expected_generation,
+                    note=body.note,
+                    actor=auth_ctx.principal,
+                    auth_via=auth_ctx.via,
+                    request_id=request_id(request),
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigDraftResponse,
+            max_age=0,
+            status_code=201,
+            no_store=True,
+        )
+
+    @router.post(
+        "/config/{kind}/drafts/{draft_id}/validate",
+        response_model=ConfigValidationResponse,
+    )
+    def validate_config_draft(
+        request: Request,
+        kind: ConfigKind,
+        draft_id: int,
+        auth_ctx: AuthContext = Depends(require_config_mutation),
+    ):
+        try:
+            with db_factory() as conn:
+                payload = config_repository.validate_draft(
+                    conn,
+                    kind=kind,
+                    draft_id=draft_id,
+                    actor=auth_ctx.principal,
+                    auth_via=auth_ctx.via,
+                    request_id=request_id(request),
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigValidationResponse,
+            max_age=0,
+            no_store=True,
         )
 
     return router

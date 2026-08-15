@@ -28,6 +28,7 @@ from triagewall.dashboard.api.auth import (
     DASHBOARD_WRITE_COOKIE,
     AuthState,
     issue_dashboard_write_cookie,
+    validate_config_write_settings,
 )
 from triagewall.dashboard.api.legacy import create_legacy_router
 from triagewall.dashboard.api.pseudonym import (
@@ -112,6 +113,10 @@ DASHBOARD_COOKIE_SECURE = parse_boolean(
     os.environ.get("TRIAGEWALL_DASHBOARD_COOKIE_SECURE", "false"),
     "TRIAGEWALL_DASHBOARD_COOKIE_SECURE",
 )
+CONFIG_WRITES_ENABLED = parse_boolean(
+    os.environ.get("TRIAGEWALL_CONFIG_WRITES_ENABLED", "false"),
+    "TRIAGEWALL_CONFIG_WRITES_ENABLED",
+)
 
 auth_state = AuthState()
 
@@ -132,6 +137,10 @@ _spc_cache = services._spc_cache
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Refuse to serve from a database that the migration owner did not prepare."""
+    validate_config_write_settings(
+        auth_state.keys,
+        writes_enabled=CONFIG_WRITES_ENABLED,
+    )
     verify_db_initialized(DB_PATH)
     yield
 
@@ -294,6 +303,10 @@ def _get_ip_secret() -> bytes | None:
     return API_IP_HASH_SECRET
 
 
+def _config_writes_enabled() -> bool:
+    return CONFIG_WRITES_ENABLED
+
+
 _router_kwargs = dict(
     auth=auth_state,
     db_factory=db,
@@ -306,7 +319,12 @@ _router_kwargs = dict(
     get_ip_secret=_get_ip_secret,
 )
 
-app.include_router(create_v1_router(**_router_kwargs))
+app.include_router(
+    create_v1_router(
+        **_router_kwargs,
+        config_writes_enabled=_config_writes_enabled,
+    )
+)
 app.include_router(create_legacy_router(**_router_kwargs))
 app.add_api_route(
     "/metrics",
@@ -337,7 +355,7 @@ def custom_openapi():
         "name": API_KEY_HEADER_NAME,
         "description": (
             "PBKDF2-hashed keys configured via TRIAGEWALL_API_KEYS. "
-            "Scopes: read, feedback:write. Unversioned /api/* aliases are "
+            "Scopes: read, feedback:write, config:write. Unversioned /api/* aliases are "
             "deprecated and scheduled for removal on 2026-12-31."
         ),
     }

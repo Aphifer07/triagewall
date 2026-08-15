@@ -32,12 +32,19 @@ API_KEY_HEADER_NAME = "X-API-Key"
 DASHBOARD_WRITE_COOKIE = "tw_dash_write"
 SCOPE_READ = "read"
 SCOPE_FEEDBACK_WRITE = "feedback:write"
-_VALID_SCOPES = frozenset({SCOPE_READ, SCOPE_FEEDBACK_WRITE})
+SCOPE_CONFIG_WRITE = "config:write"
+_VALID_SCOPES = frozenset(
+    {SCOPE_READ, SCOPE_FEEDBACK_WRITE, SCOPE_CONFIG_WRITE}
+)
 _PBKDF2_PREFIX = "pbkdf2_sha256$"
 _DEFAULT_PBKDF2_ITERATIONS = 210_000
 _SALT_BYTES = 16
 
-api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+api_key_header = APIKeyHeader(
+    name=API_KEY_HEADER_NAME,
+    auto_error=False,
+    scheme_name="ApiKeyAuth",
+)
 
 
 @dataclass(frozen=True)
@@ -250,6 +257,21 @@ def require_scopes(
         )
 
 
+def validate_config_write_settings(
+    keys: tuple[ApiKeyRecord, ...],
+    *,
+    writes_enabled: bool,
+) -> None:
+    """Fail startup if mutation is enabled without an attributable operator."""
+    if writes_enabled and not any(
+        SCOPE_CONFIG_WRITE in record.scopes for record in keys
+    ):
+        raise RuntimeError(
+            "TRIAGEWALL_CONFIG_WRITES_ENABLED requires at least one API key "
+            "with config:write scope"
+        )
+
+
 class AuthState:
     """Process-wide auth configuration bound into FastAPI dependencies."""
 
@@ -323,5 +345,19 @@ class AuthState:
             raise HTTPException(
                 status_code=401,
                 detail="API key with feedback:write scope required",
+            )
+        return ctx
+
+    def require_config_write(
+        self,
+        request: Request,
+        api_key: str | None = Security(api_key_header),
+    ) -> AuthContext:
+        """Require an attributable API key for all configuration access."""
+        ctx = self.resolve(request, api_key)
+        if ctx.via != "api_key" or SCOPE_CONFIG_WRITE not in ctx.scopes:
+            raise HTTPException(
+                status_code=401,
+                detail="API key with config:write scope required",
             )
         return ctx

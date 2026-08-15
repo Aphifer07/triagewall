@@ -8,7 +8,10 @@ import json
 from pathlib import Path
 import re
 
-from asset_inventory import is_valid_asset_snapshot
+try:
+    from .asset_inventory import is_valid_asset_snapshot
+except ImportError:  # Direct script-style imports used by ingest entrypoints.
+    from asset_inventory import is_valid_asset_snapshot
 
 
 MAX_CONFIG_BYTES = 1024 * 1024

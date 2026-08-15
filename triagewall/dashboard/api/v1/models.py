@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from triagewall.config_repository import MAX_NOTE_LENGTH
 from triagewall.dashboard.api.services import MAX_FEEDBACK_NOTES_LENGTH
 
 # Typed filter vocabularies. Declaring them here keeps the OpenAPI schema, the
@@ -16,6 +17,10 @@ ModelFilter = Literal["llm", "prefilter"]
 SourceFilter = Literal["suricata", "wazuh"]
 ReviewFilter = Literal["unreviewed", "agreed", "corrected"]
 TimelineInterval = Literal["1h"]
+ConfigKind = Literal["prefilter_policy", "asset_inventory"]
+ConfigRevisionState = Literal[
+    "draft", "validated", "active", "superseded", "rejected"
+]
 
 
 class StatsModel(BaseModel):
@@ -323,6 +328,112 @@ class FeedbackResponse(BaseModel):
 
     ok: bool
     agreed: bool
+
+
+class ConfigRevisionMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    kind: ConfigKind
+    revision: str
+    source: Literal["shipped", "operator_import", "operator"]
+    parent_revision_id: int | None = None
+    shipped_base_revision: str | None = None
+    state: ConfigRevisionState
+    validation: dict[str, Any]
+    created_at: str
+    created_by: str
+    note: str | None = None
+
+
+class ConfigReloadStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    supported: bool
+    desired_generation: int
+
+
+class ConfigSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    mode: Literal["legacy", "database"]
+    generation: int
+    updated_at: str
+    writes_enabled: bool
+    reload: ConfigReloadStatus
+    active: dict[ConfigKind, ConfigRevisionMetadata]
+    revision_counts: dict[ConfigKind, dict[str, int]]
+
+
+class ActiveConfigResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    mode: Literal["legacy", "database"]
+    generation: int
+    revision: ConfigRevisionMetadata
+    document: dict[str, Any]
+
+
+class ConfigRevisionResponse(ActiveConfigResponse):
+    """One authorized immutable revision, active or inactive."""
+
+
+class ConfigRevisionsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    kind: ConfigKind
+    revisions: list[ConfigRevisionMetadata]
+    next_cursor: str | None = None
+
+
+class ConfigDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document: dict[str, Any]
+    parent_revision_id: int = Field(gt=0, strict=True)
+    expected_generation: int = Field(gt=0, strict=True)
+    note: str | None = Field(default=None, max_length=MAX_NOTE_LENGTH)
+
+
+class ConfigDraftResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draft: ConfigRevisionMetadata
+
+
+class ConfigValidationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draft_id: int
+    validation: dict[str, Any]
+    revision: ConfigRevisionMetadata
+
+
+class ConfigAuditEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    occurred_at: str
+    kind: ConfigKind | None = None
+    revision_id: int | None = None
+    from_revision_id: int | None = None
+    to_revision_id: int | None = None
+    actor: str
+    auth_via: str
+    request_id: str | None = None
+    action: str
+    detail: dict[str, Any]
+
+
+class ConfigAuditResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    entries: list[ConfigAuditEntry]
+    next_cursor: str | None = None
 
 
 class LegacyHealthResponse(BaseModel):

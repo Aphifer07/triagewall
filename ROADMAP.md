@@ -249,7 +249,7 @@ workbench without weakening the production boundary.
   impact preview, atomic activation, optimistic locking, last-known-good
   recovery, rollback, and audit history. See
   [Operator configuration foundation](docs/operator-configuration-foundation.md).
-- [ ] **Dedicated configuration authorization.** Keep mutation disabled by
+- [x] **Dedicated configuration authorization.** Keep mutation disabled by
   default and require an attributable API key with `config:write`; the
   dashboard feedback cookie is not administrator authentication.
 - [ ] **Prefilter rule editor.** Draft scoped rules from an alert, preview the

@@ -15,9 +15,10 @@ scheduled for removal on **2026-12-31**. Prefer `/api/v1/*` and the field
 | Header | `X-API-Key: <plaintext>` |
 | Storage | Keys are configured as **PBKDF2-HMAC-SHA256** digests only
   (`TRIAGEWALL_API_KEYS`). Plaintext keys are never stored or logged. |
-| Scopes | `read`, `feedback:write` |
+| Scopes | `read`, `feedback:write`, `config:write` |
 | Reads | Allowed without a key when `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true` (**default**). Set to `false` to require a key with `read` (or `feedback:write`) for read endpoints and `/metrics`. |
-| Writes | **Always** require a credential: an API key with `feedback:write`, or the same-origin dashboard write cookie. |
+| Feedback writes | **Always** require a credential: an API key with `feedback:write`, or the same-origin dashboard write cookie. |
+| Configuration | Every configuration endpoint requires an attributable API key with `config:write`; anonymous reads, `read`, `feedback:write`, the dashboard cookie, and demo mode never grant access. Draft mutations also require `TRIAGEWALL_CONFIG_WRITES_ENABLED=true`. |
 | Dashboard cookie | Serving `GET /` sets HttpOnly `SameSite=Strict` cookie `tw_dash_write` derived from `TRIAGEWALL_DASHBOARD_WRITE_SECRET`. The built-in UI does not need JS changes. External clients must use `X-API-Key`. |
 | Health | `GET /api/v1/health` is always unauthenticated and omits storage metrics. |
 
@@ -45,9 +46,10 @@ python -c "from triagewall.dashboard.api.auth import hash_api_key; import secret
 ```
 
 ```env
-TRIAGEWALL_API_KEYS=kiosk:pbkdf2_sha256$210000$<salt>$<digest>:read,operator:pbkdf2_sha256$210000$<salt>$<digest>:read|feedback:write
+TRIAGEWALL_API_KEYS=kiosk:pbkdf2_sha256$210000$<salt>$<digest>:read,operator:pbkdf2_sha256$210000$<salt>$<digest>:read|feedback:write,config-admin:pbkdf2_sha256$210000$<salt>$<digest>:config:write
 TRIAGEWALL_DASHBOARD_WRITE_SECRET=<long-random-string>
 TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true
+TRIAGEWALL_CONFIG_WRITES_ENABLED=false
 ```
 
 ### Recommended production settings
@@ -241,6 +243,51 @@ curl -sS -X POST -H 'Host: localhost' -H "X-API-Key: $KEY" \
   http://127.0.0.1:8084/api/v1/feedback/1
 ```
 
+### Operator configuration
+
+Configuration documents may contain private asset inventory and suppression
+policy, so every endpoint below requires an `X-API-Key` carrying
+`config:write`. That requirement is independent of ordinary API read settings.
+Demo mode rejects configuration access even when such a key is supplied.
+
+`GET /api/v1/config` returns the active revision metadata for both kinds,
+bundle generation, compatibility mode, revision counts, and truthful reload
+support. `GET /api/v1/config/{kind}` returns the active canonical document for
+`prefilter_policy` or `asset_inventory`. `GET /api/v1/config/{kind}/revisions`
+lists newest-first revision metadata without documents; it accepts `state`,
+`limit` (1–100), and an opaque `cursor`. The per-revision endpoint,
+`GET /api/v1/config/{kind}/revisions/{id}`, retrieves one immutable document.
+
+Draft mutation is disabled unless:
+
+```env
+TRIAGEWALL_CONFIG_WRITES_ENABLED=true
+```
+
+Enabling this without at least one configured `config:write` key fails process
+startup. Draft creation requires the current active revision and generation:
+
+```bash
+curl -sS -X POST -H 'Host: localhost' -H "X-API-Key: $CONFIG_KEY" \
+  -H 'X-Request-ID: change-2026-08-15-01' \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"version":1,"internal_cidrs":[],"auto_false_positive":[]},"parent_revision_id":1,"expected_generation":1,"note":"candidate"}' \
+  http://127.0.0.1:8084/api/v1/config/prefilter_policy/drafts
+```
+
+`POST /api/v1/config/{kind}/drafts/{id}/validate` applies the production
+validator. An invalid candidate becomes an immutable `rejected` revision with
+a structured validation result. When normalization changes the effective
+document, validation preserves the submitted draft and creates a canonical
+`validated` child. Neither operation activates configuration or changes the
+bundle generation.
+
+`GET /api/v1/config/audit` returns newest-first audit records with `limit`
+(1–100, default 50), optional `kind`, and an opaque `cursor`. Audit details are
+bounded lifecycle metadata and never contain configuration documents or API
+keys. All configuration responses use `Cache-Control: private, no-store` and
+emit no ETag.
+
 ### `GET /api/v1/timeline`
 
 Hourly buckets. Query: `hours` (1–168, default 24), `interval` (typed enum;
@@ -291,10 +338,12 @@ so it always matches the bytes actually served. Send `If-None-Match` to receive
 HTTP 304 when unchanged. Stats/timeline/SPC results also use short in-process
 TTL caches. Payloads include `generated_at` (UTC).
 
-The verdict endpoints are the exception. `GET /api/v1/verdicts`,
+The verdict and configuration endpoints are the exception. `GET /api/v1/verdicts`,
 `GET /api/v1/verdicts/{event_id}` and
 `GET /api/v1/verdicts/{event_id}/investigation` emit
 `Cache-Control: private, no-store` and **no** `ETag`, and never answer 304.
+The `/api/v1/config*` family uses the same no-store policy because its private
+documents and lifecycle state must not be retained by intermediaries.
 Saving operator feedback rewrites the underlying row, so a stored or
 revalidated copy would report a reviewed alert as unreviewed. Stats, timeline,
 SPC and health keep their existing caching, as does the deprecated

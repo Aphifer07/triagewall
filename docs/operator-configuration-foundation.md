@@ -86,8 +86,8 @@ One immutable canonical document:
 |---|---|
 | `id` | Integer primary key |
 | `kind` | `prefilter_policy` or `asset_inventory` |
-| `revision` | SHA-256 of the canonical effective document |
-| `document_json` | Canonical validated JSON; maximum 1 MiB |
+| `revision` | SHA-256 of the immutable stored JSON document |
+| `document_json` | Canonically encoded JSON; validated/active rows are normalized effective documents; maximum 1 MiB |
 | `source` | `shipped`, `operator_import`, or `operator` |
 | `parent_revision_id` | Revision from which an operator draft was created |
 | `shipped_base_revision` | Digest of the repository default used as its base |
@@ -133,6 +133,7 @@ never configuration content or audit detail.
 stateDiagram-v2
     [*] --> Draft
     Draft --> Validated: validate current document
+    Draft --> Superseded: normalization creates validated child
     Draft --> Rejected: validation fails
     Rejected --> Draft: create corrected revision
     Validated --> Active: explicit activation
@@ -150,8 +151,10 @@ stateDiagram-v2
 2. **Draft.** An attributable operator submits a complete candidate based on a
    named active revision and generation.
 3. **Validate.** Core runs the existing strict parser, canonicalization, size,
-   item-count, duplicate, CIDR, asset, and prompt-context limits. Validation
-   creates no active behaviour.
+   item-count, duplicate, CIDR, asset, and prompt-context limits. A candidate
+   already in canonical form transitions in place. If normalization changes
+   the document, Core preserves the submitted draft and creates a canonical
+   validated child. Validation creates no active behaviour.
 4. **Preview.** Core compares the validated candidate with the active document
    over a bounded recent sample. Preview is read-only and never calls the model.
 5. **Activate.** The operator supplies the expected generation and explicitly
@@ -281,6 +284,8 @@ The initial API is deliberately lifecycle-oriented:
 
 - `GET /api/v1/config` — active kinds, revisions, generation, and reload health
 - `GET /api/v1/config/{kind}` — active canonical document and metadata
+- `GET /api/v1/config/{kind}/revisions` — bounded metadata-only revision list
+- `GET /api/v1/config/{kind}/revisions/{id}` — one immutable revision document
 - `POST /api/v1/config/{kind}/drafts` — create an immutable draft
 - `POST /api/v1/config/{kind}/drafts/{id}/validate` — validate and canonicalize
 - `POST /api/v1/config/{kind}/drafts/{id}/preview` — bounded impact comparison
@@ -318,6 +323,8 @@ full-history completeness when truncated.
 
 ### Slice 1 — persistence and bootstrap
 
+Status: implemented.
+
 - Add the three configuration tables and fail-closed migration verification.
 - Add the serialized one-shot bootstrap owner and its read-only legacy mounts.
 - Canonicalize/import packaged, legacy prefilter, and private asset documents
@@ -327,6 +334,8 @@ full-history completeness when truncated.
 - Add unit coverage for immutable revisions, digests, and bootstrap idempotency.
 
 ### Slice 2 — authorization and draft lifecycle
+
+Status: implemented.
 
 - Add `config:write` and the default-off mutation flag.
 - Add create, validate, list, and audit endpoints.
