@@ -992,19 +992,28 @@ def _sample_rows(
     sensor are excluded from a prefilter preview.
 
     The row cap alone does not bound memory, because one retained alert may be
-    as large as the document limit. Rows are therefore consumed one at a time
-    and the sample stops at whichever bound is reached first, reporting the
-    truncation to the operator rather than silently narrowing the comparison.
+    arbitrarily large. The scan therefore reads only each candidate's metadata
+    and its alert body *size*, measured in UTF-8 bytes by SQLite, and fetches a
+    body only once it is known to fit the remaining budget. No oversized body is
+    ever transferred into this process, so no oversized body can be retained or
+    decoded -- including the first one. The sample stops at whichever bound is
+    reached first and reports the truncation to the operator rather than
+    silently narrowing the comparison.
     """
     source_clause = (
         "AND (sensor.source_type IS NULL OR sensor.source_type = 'suricata')"
         if kind == PREFILTER_KIND
         else ""
     )
-    # An asset preview compares addresses only, so it never reads alert bodies.
-    alert_column = "events.raw_alert" if kind == PREFILTER_KIND else "NULL"
+    # An asset preview compares addresses only, so it never reads alert bodies
+    # and never spends the byte budget.
+    reads_alerts = kind == PREFILTER_KIND
+    # length() over a BLOB cast counts stored UTF-8 bytes, not characters.
+    size_column = (
+        "length(CAST(events.raw_alert AS BLOB))" if reads_alerts else "0"
+    )
     cursor = conn.execute(
-        f"""SELECT events.id, {alert_column}, events.signature_id,
+        f"""SELECT events.id, {size_column}, events.signature_id,
                    events.src_ip, events.dest_ip
             FROM triage_events AS events
             LEFT JOIN sensor_event_context AS sensor
@@ -1017,24 +1026,43 @@ def _sample_rows(
         (window_start, candidate_limit + 1),
     )
     rows = []
-    sampled_bytes = 0
+    remaining_bytes = MAX_PREVIEW_SAMPLE_BYTES
     truncated_by_rows = False
     truncated_by_bytes = False
-    for row in cursor:
+    for event_id, alert_bytes, signature_id, src_ip, dest_ip in cursor:
         if len(rows) >= candidate_limit:
             truncated_by_rows = True
             break
-        alert = row[1]
-        if alert is not None:
-            sampled_bytes += len(str(alert).encode("utf-8"))
-            if sampled_bytes > MAX_PREVIEW_SAMPLE_BYTES and rows:
+        alert = None
+        if reads_alerts:
+            size = int(alert_bytes or 0)
+            if size > remaining_bytes:
                 truncated_by_bytes = True
                 break
-        rows.append(row)
-        if sampled_bytes > MAX_PREVIEW_SAMPLE_BYTES:
-            truncated_by_bytes = True
-            break
+            alert = _bounded_alert_body(conn, int(event_id), remaining_bytes)
+            if alert is None:
+                # The row changed or vanished between the two reads; skipping it
+                # keeps the guarantee that nothing oversized is ever decoded.
+                continue
+            remaining_bytes -= size
+        rows.append((int(event_id), alert, signature_id, src_ip, dest_ip))
     return rows, truncated_by_rows or truncated_by_bytes, truncated_by_bytes
+
+
+def _bounded_alert_body(
+    conn: sqlite3.Connection,
+    event_id: int,
+    remaining_bytes: int,
+) -> str | None:
+    """Fetch one retained alert body only while it still fits the budget."""
+    row = conn.execute(
+        """SELECT raw_alert FROM triage_events
+           WHERE id = ? AND length(CAST(raw_alert AS BLOB)) <= ?""",
+        (event_id, remaining_bytes),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0])
 
 
 def _prefilter_preview(

@@ -8,6 +8,8 @@
   let initialized = false;
   let loaded = false;
   let loading = false;
+  // Which load currently owns the `loading` flag and the header status.
+  let loadingEpoch = null;
   let summary = null;
   let selectedKind = "prefilter_policy";
   let activeDocuments = {};
@@ -21,6 +23,9 @@
   let pendingSeed = null;
   let editingRule = null;
   let editingRuleForm = null;
+  // Unapplied input sitting in the rule or asset form. It is not a document
+  // change, but it is operator work that a background reload must not discard.
+  let formDirty = false;
   // Monotonic epoch for everything an in-flight response could overwrite. A
   // response may only publish when the epoch it started under is still current,
   // so a slow reload can never resurrect stale bytes over a newer load, a local
@@ -34,6 +39,15 @@
   function invalidateInFlightResponses() {
     stateEpoch += 1;
     return stateEpoch;
+  }
+
+  function noteFormActivity() {
+    // Opening or typing in an editor form is newer state than any reload
+    // already in flight, so that reload may no longer reset these fields. This
+    // deliberately does not mark the candidate document dirty: unapplied form
+    // input has not changed the document yet.
+    formDirty = true;
+    invalidateInFlightResponses();
   }
 
   function element(id) {
@@ -70,10 +84,12 @@
     host.classList.toggle("error", isError);
   }
 
-  async function configRequest(path, options = {}) {
-    if (!apiKey) throw new Error("Enter a configuration API key first.");
+  async function configRequest(path, options = {}, credential = apiKey) {
+    // The credential is passed per request, never read from a mutable global at
+    // send time: a load that started under one key must never send another.
+    if (!credential) throw new Error("Enter a configuration API key first.");
     const headers = new Headers(options.headers || {});
-    headers.set("X-API-Key", apiKey);
+    headers.set("X-API-Key", credential);
     if (options.body != null) headers.set("Content-Type", "application/json");
     const response = await global.fetch(path, {
       ...options,
@@ -147,6 +163,27 @@
     ["source_cidrs", "configRuleSourceCidrs"],
     ["destination_cidrs", "configRuleDestinationCidrs"],
   ];
+  // Every control whose unapplied input a background reload must not discard.
+  const RULE_FORM_INPUT_IDS = [
+    "configRuleSignatures",
+    "configRuleReason",
+    "configRuleProtocol",
+    "configRuleNetworkDirection",
+    "configRuleFlowDirection",
+    "configRuleSourcePorts",
+    "configRuleDestinationPorts",
+    "configRuleSourceCidrs",
+    "configRuleDestinationCidrs",
+  ];
+  const ASSET_FORM_INPUT_IDS = [
+    "configAssetHostname",
+    "configAssetRole",
+    "configAssetIps",
+    "configAssetCriticality",
+    "configAssetInternetFacing",
+    "configAssetPorts",
+    "configChangeNote",
+  ];
   const RULE_FORM_MATCH_KEYS = [
     ...RULE_SELECT_FIELDS.map(([key]) => key),
     ...RULE_NUMBER_LIST_FIELDS.map(([key]) => key),
@@ -156,6 +193,7 @@
   function resetRuleForm() {
     editingRule = null;
     editingRuleForm = null;
+    formDirty = false;
     element("configRuleIndex").value = "";
     element("configRuleSignatures").value = "";
     element("configRuleReason").value = "";
@@ -184,6 +222,7 @@
   }
 
   function resetAssetForm() {
+    formDirty = false;
     element("configAssetIndex").value = "";
     element("configAssetHostname").value = "";
     element("configAssetRole").value = "";
@@ -334,6 +373,7 @@
     const match = rule.match ?? {};
     // The rule being edited is retained whole. The form represents only part of
     // a match, so applying it must narrow nothing the operator did not touch.
+    noteFormActivity();
     editingRule = clone(rule);
     element("configRuleIndex").value = String(index);
     element("configRuleSignatures").value = (rule.signature_ids ?? []).join(", ");
@@ -411,6 +451,7 @@
   function editAsset(index) {
     const asset = workingDocuments.asset_inventory?.assets?.[index];
     if (!asset) return;
+    noteFormActivity();
     element("configAssetIndex").value = String(index);
     element("configAssetHostname").value = asset.hostname ?? "";
     element("configAssetRole").value = asset.role ?? "";
@@ -610,8 +651,10 @@
     renderHistory();
   }
 
-  function applyPendingSeed() {
-    if (!pendingSeed || !loaded) return;
+  function applyPendingSeed({ fromLoad = false } = {}) {
+    // While another load is in flight the cache is about to be replaced, so the
+    // seed waits: that load applies it against the snapshot it publishes.
+    if (!pendingSeed || !loaded || (loading && !fromLoad)) return;
     const seed = pendingSeed;
     pendingSeed = null;
     if (seed.action === "prefilter") {
@@ -632,10 +675,16 @@
       // by an asset in the freshly loaded inventory is edited in place, with
       // every current field and every other address preserved; only an unknown
       // address opens Add.
+      const staleWarning = seed.resolvedAgainstCandidate
+        ? " Unsaved changes were kept, so this used your local candidate, which may be older than the active configuration."
+        : "";
       const existingIndex = assetIndexForAddress(seed.ip);
       if (existingIndex >= 0) {
         editAsset(existingIndex);
-        setMessage(`Editing the existing asset that already owns ${seed.ip}. Its other addresses are preserved.`);
+        setMessage(
+          `Editing the existing asset that already owns ${seed.ip}. Its other addresses are preserved.${staleWarning}`,
+          Boolean(staleWarning),
+        );
         return;
       }
       element("configAssetHostname").value = seed.asset?.hostname ?? "new-asset";
@@ -644,7 +693,10 @@
       element("configAssetCriticality").value = seed.asset?.criticality ?? "medium";
       element("configAssetInternetFacing").checked = Boolean(seed.asset?.internet_facing);
       element("configAssetPorts").value = (seed.asset?.exposed_ports ?? []).map((port) => `${port.protocol}/${port.port}`).join(", ");
-      setMessage("Alert evidence populated the asset form. Review it before applying it to the candidate.");
+      setMessage(
+        `Alert evidence populated the asset form. Review it before applying it to the candidate.${staleWarning}`,
+        Boolean(staleWarning),
+      );
       element("configAssetHostname").focus();
     }
   }
@@ -663,7 +715,7 @@
     );
   }
 
-  function seedFromAlert(verdict, action) {
+  async function seedFromAlert(verdict, action) {
     const side = action === "asset-source" ? "source" : "destination";
     pendingSeed = action === "prefilter" ? {
       action,
@@ -678,7 +730,23 @@
       ip: side === "source" ? verdict?.src_ip : verdict?.dest_ip,
       asset: clone(verdict?.asset_context?.[side] ?? null),
     };
-    applyPendingSeed();
+    // Whether this address is already owned decides Add versus Edit, so that
+    // question has to be asked of a current, coherent inventory. A cached one
+    // can be older than the active generation and would open Add for an
+    // address the active inventory already owns.
+    const decidesOwnership = action !== "prefilter";
+    const hasLocalWork = dirtyKinds.size > 0 || formDirty;
+    if (decidesOwnership && loaded && !hasLocalWork) {
+      // Nothing local to lose: refresh, then decide. The load applies the seed.
+      return load(true);
+    }
+    if (decidesOwnership && hasLocalWork) {
+      // Unsaved work is never silently discarded, so the decision is made
+      // against the working candidate and the operator is told it may be older
+      // than the active configuration.
+      pendingSeed.resolvedAgainstCandidate = true;
+    }
+    return applyPendingSeed();
   }
 
   async function load(force = false) {
@@ -687,16 +755,25 @@
       renderConnection(false);
       return;
     }
-    if (loading || (loaded && !force)) {
+    if (!force && (loading || loaded)) {
       applyPendingSeed();
       return;
     }
-    loading = true;
+    // A forced load always starts, even while an older one is in flight: a new
+    // credential submission must never be dropped because the previous key is
+    // still loading. Ownership of `loading` and of the header status moves to
+    // the newest load, so the older one's completion cannot clear or overwrite
+    // what the newer one is doing.
     const epoch = invalidateInFlightResponses();
+    const credential = apiKey;
+    loading = true;
+    loadingEpoch = epoch;
+    let published = false;
     setConnectionStatus("Loading configuration…");
     try {
-      const snapshot = await readConsistentSnapshot(epoch);
+      const snapshot = await readConsistentSnapshot(epoch, credential);
       if (snapshot === null) return;
+      published = true;
       summary = snapshot.summary;
       activeDocuments = {
         prefilter_policy: snapshot.prefilter.document,
@@ -719,16 +796,26 @@
       resetAssetForm();
       renderEditor();
       setMessage("");
-      applyPendingSeed();
+      applyPendingSeed({ fromLoad: true });
     } catch (error) {
+      // A superseded load reports nothing: its failure belongs to a credential
+      // or a snapshot the operator has already replaced.
       if (epoch !== stateEpoch) return;
+      published = true;
       loaded = false;
       renderConnection(false);
       setConnectionStatus([401, 403].includes(error.status) ? "Key rejected" : "Configuration unavailable", "error");
       element("configCredentialPanel").classList.remove("hidden");
       element("configCredentialHelp").textContent = error.message;
     } finally {
-      loading = false;
+      if (loadingEpoch === epoch) {
+        loading = false;
+        loadingEpoch = null;
+        // This load owned the "Loading…" status and published nothing, so it
+        // must hand the header back to the state that is actually current
+        // rather than leaving it stuck.
+        if (!published) renderConnection(Boolean(apiKey) && loaded);
+      }
     }
   }
 
@@ -748,14 +835,14 @@
     );
   }
 
-  async function readConsistentSnapshot(epoch, attempt = 0) {
+  async function readConsistentSnapshot(epoch, credential, attempt = 0) {
     const [summaryPayload, prefilter, assets, prefilterHistory, assetHistory, audit] = await Promise.all([
-      configRequest("/api/v1/config"),
-      configRequest("/api/v1/config/prefilter_policy"),
-      configRequest("/api/v1/config/asset_inventory"),
-      configRequest("/api/v1/config/prefilter_policy/revisions?limit=25"),
-      configRequest("/api/v1/config/asset_inventory/revisions?limit=25"),
-      configRequest("/api/v1/config/audit?limit=25"),
+      configRequest("/api/v1/config", {}, credential),
+      configRequest("/api/v1/config/prefilter_policy", {}, credential),
+      configRequest("/api/v1/config/asset_inventory", {}, credential),
+      configRequest("/api/v1/config/prefilter_policy/revisions?limit=25", {}, credential),
+      configRequest("/api/v1/config/asset_inventory/revisions?limit=25", {}, credential),
+      configRequest("/api/v1/config/audit?limit=25", {}, credential),
     ]);
     if (epoch !== stateEpoch) return null;
     if (!snapshotIsConsistent(summaryPayload, prefilter, assets)) {
@@ -764,7 +851,7 @@
           "Active configuration changed while loading. Reload active configuration to continue.",
         );
       }
-      return readConsistentSnapshot(epoch, attempt + 1);
+      return readConsistentSnapshot(epoch, credential, attempt + 1);
     }
     return {
       summary: summaryPayload,
@@ -787,9 +874,13 @@
     revisions = {};
     auditEntries = [];
     dirtyKinds = new Set();
+    formDirty = false;
     lifecycle = emptyLifecycle();
     clearRollbackSelection();
     loaded = false;
+    // No load owns the header any more; the disconnected state does.
+    loading = false;
+    loadingEpoch = null;
     element("configApiKey").value = "";
     element("configCredentialHelp").textContent = CREDENTIAL_HELP;
     renderConnection(false);
@@ -825,8 +916,15 @@
     initialized = true;
     element("configCredentialForm").addEventListener("submit", (event) => {
       event.preventDefault();
-      apiKey = element("configApiKey").value.trim();
+      const submitted = element("configApiKey").value.trim();
+      // The field is cleared immediately and the key lives only in this
+      // closure's memory for the life of the session it starts.
       element("configApiKey").value = "";
+      if (!submitted) return undefined;
+      // Every submission starts its own session: nothing already in flight may
+      // publish under it, and this key always gets its own attempt even when an
+      // earlier load has not finished.
+      apiKey = submitted;
       loaded = false;
       return load(true);
     });
@@ -842,8 +940,17 @@
     element("configAssetCancel").addEventListener("click", resetAssetForm);
     element("configForgetButton").addEventListener("click", forget);
     element("configReloadButton").addEventListener("click", () => {
-      if (dirtyKinds.size && !global.confirm("Discard unsaved candidate changes and reload active configuration?")) return;
-      load(true);
+      // An explicitly confirmed reload is allowed to discard both an edited
+      // candidate and unapplied form input; nothing else is.
+      if (
+        (dirtyKinds.size || formDirty)
+        && !global.confirm("Discard unsaved candidate changes and reload active configuration?")
+      ) return undefined;
+      return load(true);
+    });
+    RULE_FORM_INPUT_IDS.concat(ASSET_FORM_INPUT_IDS).forEach((id) => {
+      element(id).addEventListener("input", noteFormActivity);
+      element(id).addEventListener("change", noteFormActivity);
     });
     element("configCreateDraft").addEventListener("click", createDraft);
     element("configValidateDraft").addEventListener("click", validateDraft);

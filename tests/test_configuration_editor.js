@@ -235,6 +235,8 @@ function runEditor({
     document,
     calls,
     summary,
+    prefilter,
+    assets,
     activeGeneration,
     activeRevisionIds,
     // Drain deferred requests repeatedly: the chain that reaches them may need
@@ -654,6 +656,269 @@ test("a stale load response cannot overwrite an edit, a kind change, or a discon
   }
 });
 
+test("a superseded load hands the header status back instead of leaving it loading", async () => {
+  const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+  const connecting = connect(harness);
+  await harness.release();
+  await connecting;
+
+  const reload = harness.editor.load(true);
+  // An edit supersedes the reload, and no newer load exists to own the header.
+  harness.document.getElementById("configInternalCidrs").value = "10.9.9.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  await harness.release();
+  await reload;
+
+  assert.equal(
+    harness.document.getElementById("configConnectionStatus").textContent,
+    "Connected for this page only",
+  );
+  assert.equal(harness.editor.state().loaded, true);
+  // The superseded load released the flag it owned, so a later load can run.
+  const again = harness.editor.load(true);
+  await harness.release();
+  await again;
+  assert.equal(
+    harness.document.getElementById("configConnectionStatus").textContent,
+    "Connected for this page only",
+  );
+});
+
+test("a superseded load leaves a disconnect showing the disconnected status", async () => {
+  const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+  const connecting = connect(harness);
+  await harness.release();
+  await connecting;
+
+  const reload = harness.editor.load(true);
+  await harness.document.getElementById("configForgetButton").dispatch("click");
+  await harness.release();
+  await reload;
+
+  assert.equal(
+    harness.document.getElementById("configConnectionStatus").textContent,
+    "Credential required",
+  );
+  assert.equal(harness.editor.state().connected, false);
+});
+
+test("a second credential submission wins and the first publishes nothing", async () => {
+  const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+  await harness.editor.load();
+
+  harness.document.getElementById("configApiKey").value = "key-a";
+  const first = harness.document.getElementById("configCredentialForm").dispatch("submit");
+  // Key B is submitted while key A's load is still in flight.
+  harness.document.getElementById("configApiKey").value = "key-b";
+  const second = harness.document.getElementById("configCredentialForm").dispatch("submit");
+  await harness.release();
+  await Promise.all([first, second]);
+
+  const keysUsed = harness.calls.map((call) => call.options.headers.get("X-API-Key"));
+  assert.ok(keysUsed.includes("key-b"), "key B was never attempted");
+  // Requests started under key A never carry key B, and vice versa.
+  assert.ok(keysUsed.includes("key-a"));
+  assert.equal(harness.editor.state().connected, true);
+  assert.equal(harness.editor.state().loaded, true);
+  assert.equal(
+    harness.document.getElementById("configConnectionStatus").textContent,
+    "Connected for this page only",
+  );
+  assert.equal(harness.document.getElementById("configApiKey").value, "");
+  // The last load to publish is B's, and only its requests may follow.
+  const lastSummaryCall = harness.calls.filter((call) => call.url === "/api/v1/config").pop();
+  assert.equal(lastSummaryCall.options.headers.get("X-API-Key"), "key-b");
+});
+
+test("a failure from a superseded credential never reports over the newer one", async () => {
+  const harness = runEditor({
+    defer: (url) => url === "/api/v1/config/audit?limit=25",
+    fail: (url, options) => options?.headers?.get("X-API-Key") === "key-a",
+  });
+  await harness.editor.load();
+
+  harness.document.getElementById("configApiKey").value = "key-a";
+  const first = harness.document.getElementById("configCredentialForm").dispatch("submit");
+  harness.document.getElementById("configApiKey").value = "key-b";
+  const second = harness.document.getElementById("configCredentialForm").dispatch("submit");
+  await harness.release();
+  await Promise.all([first, second]);
+
+  // Key A's rejection belongs to a credential the operator already replaced.
+  assert.equal(harness.editor.state().loaded, true);
+  assert.equal(
+    harness.document.getElementById("configConnectionStatus").textContent,
+    "Connected for this page only",
+  );
+  assert.doesNotMatch(
+    harness.document.getElementById("configCredentialHelp").textContent,
+    /stale/,
+  );
+});
+
+test("an older reload does not discard unfinished rule form input", async () => {
+  const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+  const connecting = connect(harness);
+  await harness.release();
+  await connecting;
+
+  const reload = harness.editor.load(true);
+  await harness.document.getElementById("configWorkspace").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-config-rule-edit]"
+          ? { dataset: { configRuleEdit: "0" } }
+          : null,
+    },
+  });
+  harness.document.getElementById("configRuleReason").value = "Half-typed reason";
+  await harness.document.getElementById("configRuleReason").dispatch("input");
+  harness.document.getElementById("configRuleSourcePorts").value = "8443";
+  await harness.document.getElementById("configRuleSourcePorts").dispatch("input");
+  await harness.release();
+  await reload;
+
+  assert.equal(harness.document.getElementById("configRuleReason").value, "Half-typed reason");
+  assert.equal(harness.document.getElementById("configRuleSourcePorts").value, "8443");
+  assert.equal(harness.document.getElementById("configRuleIndex").value, "0");
+  // Opening and typing in a form is not a document change.
+  assert.equal(harness.editor.state().dirtyKinds.join(","), "");
+});
+
+test("an older reload does not discard unfinished asset form input", async () => {
+  const harness = runEditor({
+    defer: (url) => url === "/api/v1/config/audit?limit=25",
+    assetRows: [
+      {
+        hostname: "server",
+        role: "application",
+        ips: ["10.0.0.8"],
+        criticality: "low",
+        internet_facing: false,
+        exposed_ports: [],
+      },
+    ],
+  });
+  const connecting = connect(harness);
+  await harness.release();
+  await connecting;
+
+  const reload = harness.editor.load(true);
+  harness.document.getElementById("configAssetHostname").value = "new-host";
+  await harness.document.getElementById("configAssetHostname").dispatch("input");
+  harness.document.getElementById("configAssetCriticality").value = "critical";
+  await harness.document.getElementById("configAssetCriticality").dispatch("change");
+  harness.document.getElementById("configAssetInternetFacing").checked = true;
+  await harness.document.getElementById("configAssetInternetFacing").dispatch("change");
+  harness.document.getElementById("configAssetIps").value = "10.0.0.8, 10.0.0.9";
+  await harness.document.getElementById("configAssetIps").dispatch("input");
+  await harness.release();
+  await reload;
+
+  assert.equal(harness.document.getElementById("configAssetHostname").value, "new-host");
+  assert.equal(harness.document.getElementById("configAssetCriticality").value, "critical");
+  assert.equal(harness.document.getElementById("configAssetInternetFacing").checked, true);
+  assert.equal(harness.document.getElementById("configAssetIps").value, "10.0.0.8, 10.0.0.9");
+  assert.equal(harness.editor.state().dirtyKinds.join(","), "");
+});
+
+test("cancelling an edited form restores the add-mode editor state", async () => {
+  const harness = runEditor({ prefilterRules: [structuredClone(RICH_RULE)] });
+  await connect(harness);
+
+  await editFirstRule(harness);
+  harness.document.getElementById("configRuleReason").value = "Half-typed reason";
+  await harness.document.getElementById("configRuleReason").dispatch("input");
+  await harness.document.getElementById("configRuleCancel").dispatch("click");
+
+  assert.equal(harness.document.getElementById("configRuleReason").value, "");
+  assert.equal(harness.document.getElementById("configRuleIndex").value, "");
+  assert.equal(harness.document.getElementById("configRuleFormTitle").textContent, "Add scoped rule");
+  assert.equal(harness.document.getElementById("configRulePreserved").textContent, "");
+  assert.equal(harness.editor.state().dirtyKinds.join(","), "");
+});
+
+test("an explicitly confirmed reload discards unfinished form input", async () => {
+  const harness = runEditor();
+  await connect(harness);
+
+  await editFirstRule(harness);
+  harness.document.getElementById("configRuleReason").value = "Half-typed reason";
+  await harness.document.getElementById("configRuleReason").dispatch("input");
+  await harness.document.getElementById("configReloadButton").dispatch("click");
+
+  // window.confirm answers true in this harness, so the operator accepted it.
+  assert.equal(harness.document.getElementById("configRuleReason").value, "");
+  assert.equal(harness.document.getElementById("configRuleIndex").value, "");
+});
+
+test("alert handoff refreshes before deciding add versus edit", async () => {
+  const harness = runEditor();
+  await connect(harness);
+  // The address is added to the active inventory after this editor cached it.
+  harness.summary.generation = 2;
+  harness.activeGeneration.prefilter = 2;
+  harness.activeGeneration.assets = 2;
+  harness.assets.assets.push({
+    hostname: "late-server",
+    role: "application",
+    ips: ["10.0.0.42", "10.0.0.43"],
+    criticality: "high",
+    internet_facing: false,
+    exposed_ports: [{ protocol: "tcp", port: 8443 }],
+  });
+
+  await harness.editor.seedFromAlert({ src_ip: "10.0.0.43", asset_context: {} }, "asset-source");
+
+  assert.equal(harness.editor.state().generation, 2);
+  assert.equal(harness.document.getElementById("configAssetIndex").value, "0");
+  assert.equal(harness.document.getElementById("configAssetHostname").value, "late-server");
+  assert.equal(harness.document.getElementById("configAssetIps").value, "10.0.0.42, 10.0.0.43");
+  assert.equal(harness.document.getElementById("configAssetPorts").value, "tcp/8443");
+});
+
+test("alert handoff never silently discards a dirty asset candidate", async () => {
+  const harness = runEditor({
+    assetRows: [
+      {
+        hostname: "server",
+        role: "application",
+        ips: ["10.0.0.8"],
+        criticality: "low",
+        internet_facing: false,
+        exposed_ports: [],
+      },
+    ],
+  });
+  await connect(harness);
+  // A local, unactivated asset change is present.
+  await harness.document.getElementById("configWorkspace").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-config-asset-remove]"
+          ? { dataset: { configAssetRemove: "0" } }
+          : null,
+    },
+  });
+  assert.equal(harness.editor.state().dirtyKinds.join(","), "asset_inventory");
+  const callsBefore = harness.calls.length;
+
+  await harness.editor.seedFromAlert({ src_ip: "10.0.0.8", asset_context: {} }, "asset-source");
+
+  // No refresh was issued, so the candidate survives, and the operator is told
+  // the decision used their possibly older local candidate.
+  assert.equal(harness.calls.length, callsBefore);
+  assert.equal(harness.editor.state().dirtyKinds.join(","), "asset_inventory");
+  assert.equal(
+    JSON.parse(harness.document.getElementById("configExactDocument").textContent).assets.length,
+    0,
+  );
+  assert.match(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    /may be older than the active configuration/,
+  );
+});
+
 test("alert handoff edits the existing asset that already owns the address", async () => {
   const harness = runEditor({
     assetRows: [
@@ -669,7 +934,7 @@ test("alert handoff edits the existing asset that already owns the address", asy
   });
   await connect(harness);
 
-  harness.editor.seedFromAlert({ src_ip: "10.0.0.9", asset_context: {} }, "asset-source");
+  await harness.editor.seedFromAlert({ src_ip: "10.0.0.9", asset_context: {} }, "asset-source");
 
   assert.equal(harness.document.getElementById("configAssetIndex").value, "0");
   assert.equal(harness.document.getElementById("configAssetHostname").value, "server");
@@ -702,7 +967,7 @@ test("an unknown alert address still opens the asset form in add mode", async ()
   });
   await connect(harness);
 
-  harness.editor.seedFromAlert({ src_ip: "203.0.113.7", asset_context: {} }, "asset-source");
+  await harness.editor.seedFromAlert({ src_ip: "203.0.113.7", asset_context: {} }, "asset-source");
 
   assert.equal(harness.document.getElementById("configAssetIndex").value, "");
   assert.equal(harness.document.getElementById("configAssetIps").value, "203.0.113.7");
@@ -745,7 +1010,7 @@ test("alert handoff populates scoped rule and exact-IP asset forms without URL s
   assert.equal(harness.document.getElementById("configRuleDestinationPorts").value, 443);
   assert.ok(harness.calls.every((call) => !call.url.includes("2024")));
 
-  harness.editor.seedFromAlert({
+  await harness.editor.seedFromAlert({
     src_ip: "10.0.0.8",
     asset_context: { source: { hostname: "workstation", role: "endpoint", criticality: "medium", internet_facing: false, exposed_ports: [] } },
   }, "asset-source");

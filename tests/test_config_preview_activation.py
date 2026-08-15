@@ -163,6 +163,7 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         *,
         source="suricata",
         padding=0,
+        padding_char="x",
     ):
         raw = {
             "event_type": "alert",
@@ -173,7 +174,7 @@ class ConfigPreviewActivationTests(unittest.TestCase):
             "alert": {"signature_id": signature_id, "signature": f"SID {signature_id}"},
         }
         if padding:
-            raw["payload_printable"] = "x" * padding
+            raw["payload_printable"] = padding_char * padding
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(
@@ -337,8 +338,7 @@ class ConfigPreviewActivationTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
-        self.assertLess(payload["candidates_examined"], 4)
-        self.assertGreaterEqual(payload["candidates_examined"], 1)
+        self.assertEqual(payload["candidates_examined"], 1)
         self.assertTrue(payload["truncated"])
         self.assertIn(
             "preview sample reached its byte budget before its row limit",
@@ -351,6 +351,141 @@ class ConfigPreviewActivationTests(unittest.TestCase):
             )[0][0]
         )
         self.assertTrue(detail["truncated_by_bytes"])
+        self.assertEqual(detail["candidates_examined"], 1)
+
+    def sampled_alert_bodies(self, evaluator):
+        """Capture exactly what the preview evaluator was handed."""
+        captured = []
+        original = getattr(config_repository, evaluator)
+
+        def spy(*args, **kwargs):
+            captured.append(list(args[-1]))
+            return original(*args, **kwargs)
+
+        return captured, patch.object(config_repository, evaluator, spy)
+
+    def test_a_single_oversized_alert_is_never_read_or_examined(self):
+        oversized = self.add_event(
+            1, 1001, "10.0.0.1", "198.51.100.1", padding=4096
+        )
+        draft_id, _, summary = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+        captured, spy = self.sampled_alert_bodies("_prefilter_preview")
+
+        with patch.object(config_repository, "MAX_PREVIEW_SAMPLE_BYTES", 16), spy:
+            response = self.client.post(
+                f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+                headers=self.headers,
+                json={"expected_generation": summary["generation"], "candidate_limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        # The only candidate does not fit, so nothing is examined and the result
+        # says so instead of admitting one unbounded body.
+        self.assertEqual(payload["candidates_examined"], 0)
+        self.assertTrue(payload["truncated"])
+        self.assertIn(
+            "preview sample reached its byte budget before its row limit",
+            payload["warnings"],
+        )
+        self.assertEqual(payload["summary"]["counts"]["skipped_invalid_records"], 0)
+        self.assertEqual(payload["summary"]["affected_event_ids"], [])
+        # The oversized body never reached the evaluator, so it was never parsed.
+        self.assertEqual(captured, [[]])
+        self.assertNotIn(
+            "xxxx",
+            json.dumps(payload),
+        )
+        detail = json.loads(
+            self.db_rows(
+                """SELECT detail_json FROM operator_config_audit
+                   WHERE action = 'draft_previewed' ORDER BY id DESC LIMIT 1"""
+            )[0][0]
+        )
+        self.assertTrue(detail["truncated_by_bytes"])
+        self.assertEqual(detail["candidates_examined"], 0)
+        self.assertTrue(oversized)
+
+    def test_the_evaluator_never_receives_more_than_the_byte_budget(self):
+        for index in range(3):
+            self.add_event(
+                index + 1,
+                1001,
+                f"10.0.0.{index + 1}",
+                "198.51.100.5",
+                padding=2048,
+            )
+        draft_id, _, summary = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+        captured, spy = self.sampled_alert_bodies("_prefilter_preview")
+        budget = 5_000
+
+        with patch.object(config_repository, "MAX_PREVIEW_SAMPLE_BYTES", budget), spy:
+            response = self.client.post(
+                f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+                headers=self.headers,
+                json={"expected_generation": summary["generation"], "candidate_limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        rows = captured[0]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(response.json()["candidates_examined"], 2)
+        self.assertTrue(response.json()["truncated"])
+        total = sum(len(str(row[1]).encode("utf-8")) for row in rows)
+        self.assertLessEqual(total, budget)
+
+    def test_the_byte_budget_counts_utf8_bytes_not_characters(self):
+        # 300 multibyte characters are 600 stored bytes: a character-count
+        # budget would admit this row, a byte budget must not.
+        self.add_event(
+            1, 1001, "10.0.0.1", "198.51.100.1", padding=300, padding_char="é"
+        )
+        draft_id, _, summary = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+        captured, spy = self.sampled_alert_bodies("_prefilter_preview")
+
+        with patch.object(config_repository, "MAX_PREVIEW_SAMPLE_BYTES", 500), spy:
+            response = self.client.post(
+                f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+                headers=self.headers,
+                json={"expected_generation": summary["generation"], "candidate_limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["candidates_examined"], 0)
+        self.assertTrue(response.json()["truncated"])
+        self.assertEqual(captured, [[]])
+
+    def test_asset_preview_hands_the_evaluator_no_alert_bodies(self):
+        self.add_event(1, 5001, "10.0.0.1", "10.0.0.2", padding=4096)
+        draft_id, _, summary = self.create_validate(
+            "asset_inventory",
+            asset_document(asset("firewall", "10.0.0.1")),
+        )
+        captured, spy = self.sampled_alert_bodies("_asset_preview")
+
+        with patch.object(config_repository, "MAX_PREVIEW_SAMPLE_BYTES", 16), spy:
+            response = self.client.post(
+                f"/api/v1/config/asset_inventory/drafts/{draft_id}/preview",
+                headers=self.headers,
+                json={"expected_generation": summary["generation"], "candidate_limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        # Address-only comparison: the byte budget is irrelevant because no
+        # alert body is selected at all.
+        self.assertEqual(payload["candidates_examined"], 1)
+        self.assertFalse(payload["truncated"])
+        self.assertEqual([row[1] for row in captured[0]], [None])
 
     def test_preview_refuses_a_candidate_whose_parent_is_no_longer_active(self):
         draft_id, _, summary = self.create_validate(
