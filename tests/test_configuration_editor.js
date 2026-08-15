@@ -56,7 +56,12 @@ function createElement(id) {
   };
 }
 
-function runEditor({ prefilterReason = "Known benign traffic", fail = () => false } = {}) {
+function runEditor({
+  prefilterReason = "Known benign traffic",
+  fail = () => false,
+  draftResponse = null,
+  validateResponse = null,
+} = {}) {
   const elements = new Map();
   const calls = [];
   const document = {
@@ -116,15 +121,19 @@ function runEditor({ prefilterReason = "Known benign traffic", fail = () => fals
       return { entries: [{ action: "bootstrap_activated", actor: "system", occurred_at: "2026-08-15T00:00:00Z" }] };
     }
     if (url === "/api/v1/config/prefilter_policy/drafts" && method === "POST") {
-      return { draft: revision(3, "prefilter_policy", "draft") };
+      return draftResponse ?? { draft: revision(3, "prefilter_policy", "draft"), resumed: false };
     }
     if (url === "/api/v1/config/prefilter_policy/drafts/3/validate" && method === "POST") {
-      return { revision: revision(4, "prefilter_policy", "validated"), validation: { status: "valid" } };
+      return validateResponse ?? {
+        revision: revision(4, "prefilter_policy", "validated"),
+        validation: { status: "valid" },
+        candidate_parent_revision_id: 1,
+      };
     }
     if (url === "/api/v1/config/prefilter_policy/revisions/4") {
       return { document: { ...prefilter, internal_cidrs: ["10.0.1.0/24"] } };
     }
-    if (url === "/api/v1/config/prefilter_policy/drafts/4/preview" && method === "POST") {
+    if (url === "/api/v1/config/prefilter_policy/drafts/3/preview" && method === "POST") {
       return {
         window_hours: 24,
         candidates_examined: 12,
@@ -133,8 +142,17 @@ function runEditor({ prefilterReason = "Known benign traffic", fail = () => fals
         summary: { counts: { newly_suppressed: 1 } },
       };
     }
-    if (url === "/api/v1/config/prefilter_policy/drafts/4/activate" && method === "POST") {
+    if (url === "/api/v1/config/prefilter_policy/drafts/3/activate" && method === "POST") {
       return { generation: 2 };
+    }
+    if (url === "/api/v1/config/prefilter_policy/drafts/9/preview" && method === "POST") {
+      return {
+        window_hours: 24,
+        candidates_examined: 4,
+        truncated: false,
+        warnings: [],
+        summary: { counts: { newly_suppressed: 0 } },
+      };
     }
     if (url === "/api/v1/config/prefilter_policy/revisions/9/rollback" && method === "POST") {
       return { generation: 2 };
@@ -229,6 +247,106 @@ test("requires draft, validation, bounded preview, and explicit confirmation bef
     harness.calls.filter((call) => call.url.endsWith("/activate")).length,
     1,
   );
+});
+
+test("drives preview and activation from the submitted draft handle", async () => {
+  const harness = runEditor();
+  await connect(harness);
+  harness.document.getElementById("configInternalCidrs").value = "10.0.1.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+
+  await harness.document.getElementById("configCreateDraft").dispatch("click");
+  await harness.document.getElementById("configValidateDraft").dispatch("click");
+  await harness.document.getElementById("configPreviewDraft").dispatch("click");
+  assert.equal(harness.editor.state().lifecycle.draftId, 3);
+  assert.equal(harness.editor.state().lifecycle.validatedId, 4);
+
+  harness.document.getElementById("configConfirmActivate").checked = true;
+  await harness.document.getElementById("configConfirmActivate").dispatch("change");
+  await harness.document.getElementById("configActivateDraft").dispatch("click");
+
+  for (const suffix of ["/preview", "/activate"]) {
+    const call = harness.calls.find((entry) => entry.url.endsWith(suffix));
+    assert.ok(call, `expected a ${suffix} call`);
+    assert.match(call.url, /\/drafts\/3\//);
+  }
+});
+
+test("accepts a valid candidate normalized onto an existing immutable revision", async () => {
+  const harness = runEditor({
+    validateResponse: {
+      // Canonicalization reused a superseded revision; the submitted draft
+      // still carries the current active parent forward.
+      revision: {
+        id: 9,
+        kind: "prefilter_policy",
+        revision: `sha256:${"9".padStart(64, "0")}`,
+        source: "operator",
+        parent_revision_id: 7,
+        shipped_base_revision: null,
+        state: "superseded",
+        validation: { status: "valid" },
+        created_at: "2026-08-15T00:00:00Z",
+        created_by: "operator",
+        note: null,
+      },
+      validation: { status: "valid" },
+      candidate_parent_revision_id: 1,
+    },
+  });
+  await connect(harness);
+  harness.document.getElementById("configInternalCidrs").value = "10.0.1.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+
+  await harness.document.getElementById("configCreateDraft").dispatch("click");
+  await harness.document.getElementById("configValidateDraft").dispatch("click");
+
+  assert.equal(harness.editor.state().lifecycle.validatedId, 9);
+  assert.doesNotMatch(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    /rejected/,
+  );
+  assert.equal(harness.document.getElementById("configPreviewDraft").disabled, false);
+
+  await harness.document.getElementById("configPreviewDraft").dispatch("click");
+  assert.ok(harness.calls.find((entry) => entry.url === "/api/v1/config/prefilter_policy/drafts/3/preview"));
+});
+
+test("resumes a validated revision returned for an identical candidate", async () => {
+  const harness = runEditor({
+    draftResponse: {
+      resumed: true,
+      draft: {
+        id: 9,
+        kind: "prefilter_policy",
+        revision: `sha256:${"9".padStart(64, "0")}`,
+        source: "operator",
+        parent_revision_id: 1,
+        shipped_base_revision: null,
+        state: "validated",
+        validation: { status: "valid" },
+        created_at: "2026-08-15T00:00:00Z",
+        created_by: "operator",
+        note: null,
+      },
+    },
+  });
+  await connect(harness);
+  harness.document.getElementById("configInternalCidrs").value = "10.0.1.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+
+  await harness.document.getElementById("configCreateDraft").dispatch("click");
+
+  assert.deepEqual(
+    { ...harness.editor.state().lifecycle, preview: null },
+    { kind: "prefilter_policy", draftId: 9, validatedId: 9, preview: null },
+  );
+  assert.match(harness.document.getElementById("configLifecycleMessage").textContent, /Resumed validated revision #9/);
+  assert.equal(harness.document.getElementById("configPreviewDraft").disabled, false);
+
+  await harness.document.getElementById("configPreviewDraft").dispatch("click");
+
+  assert.ok(harness.calls.find((entry) => entry.url === "/api/v1/config/prefilter_policy/drafts/9/preview"));
 });
 
 test("a polling load does not replace an already loaded candidate", async () => {

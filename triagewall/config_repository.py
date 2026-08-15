@@ -414,9 +414,34 @@ def create_draft(
                 ),
             )
         except sqlite3.IntegrityError as exc:
-            raise ConfigConflictError(
-                "an identical configuration revision already exists"
-            ) from exc
+            resumed = _resumable_revision(
+                conn,
+                kind=kind,
+                revision=revision,
+                document_json=document_json,
+                parent_revision_id=parent_revision_id,
+            )
+            if resumed is None:
+                raise ConfigConflictError(
+                    "an identical configuration revision already exists"
+                ) from exc
+            _insert_audit(
+                conn,
+                occurred_at=timestamp,
+                actor=actor,
+                auth_via=auth_via,
+                request_id=request_id,
+                action="draft_resumed",
+                kind=kind,
+                revision_id=int(resumed[0]),
+                from_revision_id=parent_revision_id,
+                detail={
+                    "expected_generation": expected_generation,
+                    "state": str(resumed[7]),
+                },
+            )
+            conn.commit()
+            return {"draft": _revision_metadata(resumed), "resumed": True}
         draft_id = int(cursor.lastrowid)
         _insert_audit(
             conn,
@@ -432,10 +457,50 @@ def create_draft(
         )
         row = _revision_row(conn, draft_id)
         conn.commit()
-        return {"draft": _revision_metadata(row)}
+        return {"draft": _revision_metadata(row), "resumed": False}
     except Exception:
         conn.rollback()
         raise
+
+
+def _resumable_revision(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    revision: str,
+    document_json: str,
+    parent_revision_id: int,
+):
+    """Return an existing candidate this request may safely resume.
+
+    Content digests are unique per kind, so an operator who loses editor state
+    (reload, disconnect, new browser session) and resubmits the identical
+    document cannot create a second row. Returning the existing candidate is
+    safe only when it is still an unactivated candidate off the very parent the
+    caller named -- which the caller has already proven to be the active
+    revision under the expected generation. Every other state (a historical,
+    active, or rejected revision, or one raised from a different parent) stays a
+    conflict.
+    """
+    row = conn.execute(
+        """SELECT id, kind, revision, document_json, source,
+                  parent_revision_id, shipped_base_revision, state,
+                  validation_json, created_at, created_by, note
+           FROM operator_config_revisions
+           WHERE kind = ? AND revision = ?""",
+        (kind, revision),
+    ).fetchone()
+    if row is None:
+        return None
+    if str(row[3]) != document_json:
+        raise ConfigIntegrityError(
+            "stored configuration revision content does not match its digest"
+        )
+    if str(row[7]) not in {"draft", "validated"}:
+        return None
+    if row[5] is None or int(row[5]) != parent_revision_id:
+        return None
+    return row
 
 
 def validate_draft(
@@ -455,7 +520,10 @@ def validate_draft(
         draft = _revision_row(conn, draft_id)
         if draft is None or draft[1] != kind:
             raise ConfigNotFoundError("configuration draft not found")
-        if draft[7] != "draft":
+        # Revalidating an already validated candidate is idempotent: revision
+        # content is immutable, so a resumed candidate re-derives the identical
+        # result instead of forcing the operator to mutate the document.
+        if draft[7] not in {"draft", "validated"}:
             raise ConfigConflictError("configuration revision is not a draft")
         try:
             decoded = json.loads(str(draft[3]))
@@ -489,6 +557,9 @@ def validate_draft(
                 "draft_id": draft_id,
                 "validation": validation,
                 "revision": _revision_metadata(rejected),
+                "candidate_parent_revision_id": (
+                    int(draft[5]) if draft[5] is not None else None
+                ),
             }
 
         canonical_document_json = canonical_json(canonical_document)
@@ -505,7 +576,16 @@ def validate_draft(
             )
             validated_id = draft_id
             normalized = False
+            reused = False
         else:
+            if draft[7] == "validated":
+                raise ConfigIntegrityError(
+                    "stored configuration revision content is not canonical"
+                )
+            # Canonical content that already exists is reused rather than
+            # rewritten, so the immutable revision keeps its original content,
+            # digest, and lineage. The submitted draft carries this candidate's
+            # parent relationship forward for preview and activation.
             existing = conn.execute(
                 """SELECT id FROM operator_config_revisions
                    WHERE kind = ? AND revision = ?""",
@@ -559,6 +639,7 @@ def validate_draft(
                 ),
             )
             normalized = True
+            reused = existing is not None
 
         _insert_audit(
             conn,
@@ -570,7 +651,11 @@ def validate_draft(
             kind=kind,
             revision_id=draft_id,
             to_revision_id=validated_id,
-            detail={"status": "valid", "normalized": normalized},
+            detail={
+                "status": "valid",
+                "normalized": normalized,
+                "reused_existing_revision": reused,
+            },
         )
         validated = _revision_row(conn, validated_id)
         conn.commit()
@@ -578,6 +663,9 @@ def validate_draft(
             "draft_id": draft_id,
             "validation": validation,
             "revision": _revision_metadata(validated),
+            "candidate_parent_revision_id": (
+                int(draft[5]) if draft[5] is not None else None
+            ),
         }
     except Exception:
         conn.rollback()
@@ -585,30 +673,39 @@ def validate_draft(
 
 
 def _validated_candidate(conn: sqlite3.Connection, kind: str, draft_id: int):
+    """Resolve one lifecycle handle to its content row and its live lineage.
+
+    Canonicalization can normalize a submitted draft onto an existing immutable
+    revision, including an older superseded one. Revision content and digests
+    never change, so the reused row keeps the lineage of whenever it was first
+    written. The submitted draft is what was raised against the current active
+    revision, so its parent -- not the reused row's historical parent -- is the
+    relationship the rest of the lifecycle must enforce.
+    """
     row = _revision_row(conn, draft_id)
     if row is None or row[1] != kind:
         raise ConfigNotFoundError("configuration draft not found")
     if row[7] == "validated":
-        return row
+        return row, (int(row[5]) if row[5] is not None else None)
     if row[7] == "superseded":
         validation = _decode_object(row[8], "validation result")
         normalized_id = validation.get("normalized_revision_id")
         if isinstance(normalized_id, int) and not isinstance(normalized_id, bool):
             normalized = _revision_row(conn, normalized_id)
             if normalized is not None and normalized[1] == kind:
-                return normalized
+                return normalized, (int(row[5]) if row[5] is not None else None)
     raise ConfigConflictError("configuration draft has not produced a validated revision")
 
 
 def _validated_document(conn: sqlite3.Connection, kind: str, draft_id: int):
-    candidate = _validated_candidate(conn, kind, draft_id)
+    candidate, parent_revision_id = _validated_candidate(conn, kind, draft_id)
     document_json = str(candidate[3])
     try:
         validate_stored_revision(kind, document_json, str(candidate[2]))
         document = json.loads(document_json)
     except (OperatorConfigError, json.JSONDecodeError) as exc:
         raise ConfigIntegrityError(str(exc)) from exc
-    return candidate, document
+    return candidate, document, parent_revision_id
 
 
 def _active_document(conn: sqlite3.Connection, kind: str, state):
@@ -804,7 +901,7 @@ def preview_draft(
     state = _state_row(conn)
     if int(state[1]) != expected_generation:
         raise ConfigConflictError("configuration generation is stale")
-    candidate, candidate_document = _validated_document(conn, kind, draft_id)
+    candidate, candidate_document, _ = _validated_document(conn, kind, draft_id)
     active, active_document = _active_document(conn, kind, state)
     now = utc_now()
     window_start = format_utc_timestamp(now - timedelta(hours=hours))
@@ -897,13 +994,17 @@ def activate_draft(
         state = _state_row(conn)
         if int(state[1]) != expected_generation:
             raise ConfigConflictError("configuration generation is stale")
-        candidate, document = _validated_document(conn, kind, draft_id)
+        candidate, document, parent_revision_id = _validated_document(
+            conn,
+            kind,
+            draft_id,
+        )
         active_id = int(state[3] if kind == PREFILTER_KIND else state[4])
         active = _revision_row(conn, active_id)
         _validate_active_row(active, kind)
         if int(candidate[0]) == active_id:
             raise ConfigConflictError("configuration revision is already active")
-        if candidate[5] != active_id:
+        if parent_revision_id != active_id:
             raise ConfigConflictError("configuration draft parent is no longer active")
         payload = _activate_revision_locked(
             conn,

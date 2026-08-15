@@ -28,6 +28,9 @@ services:
       WAZUH_START_MODE: ${WAZUH_START_MODE:-end}
     volumes:
       - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+      # Both consumers must read the identical mounted legacy documents: each
+      # start mirrors them into the durable bundle while authority is `legacy`.
+      - ./triagewall/config/prefilter.json:/app/triagewall/config/prefilter.json:ro
       - ${HOST_ASSET_INVENTORY:-./triagewall/config/assets.example.json}:/app/triagewall/config/assets.json:ro
       - type: volume
         source: wazuh_logs

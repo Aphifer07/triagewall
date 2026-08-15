@@ -4,20 +4,25 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "triagewall"))
 
 import config_repository
+import ingest
 import migrations
 import operator_config
 import triage
+import wazuh_ingest
 from asset_inventory import AssetInventory
 from database import connect_database
 from prefilter import PrefilterPolicy
@@ -265,6 +270,194 @@ class RuntimeConfigurationTests(unittest.TestCase):
             ).fetchone(),
             ("ok", None),
         )
+
+
+class ConsumerStartupSynchronizationTests(unittest.TestCase):
+    """A consumer restart must mirror valid legacy mounts before it starts."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.db_path = self.root / "triage.db"
+        self.packaged = self.root / "packaged.json"
+        self.legacy = self.root / "legacy.json"
+        self.assets = self.root / "assets.json"
+        self.packaged.write_text(json.dumps(prefilter_document()), encoding="utf-8")
+        self.legacy.write_text(self.packaged.read_text(), encoding="utf-8")
+        self.assets.write_text(json.dumps(asset_document()), encoding="utf-8")
+        migrations.ensure_db_initialized(self.db_path)
+        operator_config.bootstrap_operator_configuration(
+            self.db_path,
+            packaged_prefilter_path=self.packaged,
+            legacy_prefilter_path=self.legacy,
+            asset_inventory_path=self.assets,
+        )
+        self.conn = connect_database(self.db_path)
+
+    def tearDown(self):
+        triage.set_configuration_bundle_owner(None)
+        self.conn.close()
+        self.temp.cleanup()
+
+    def start_consumer(self, consumer="suricata"):
+        """Run the exact startup path both ingest daemons use."""
+        with patch.object(
+            ingest, "packaged_prefilter_path", lambda: str(self.packaged)
+        ), patch.object(
+            ingest, "configured_inventory_path", lambda: self.assets
+        ), patch.object(
+            ingest, "PREFILTER_CONFIG_PATH", self.legacy
+        ):
+            return ingest.start_configuration_owner(
+                self.conn,
+                consumer=consumer,
+                db_path=self.db_path,
+            )
+
+    def durable_state(self):
+        return self.conn.execute(
+            """SELECT generation, mode, active_prefilter_revision_id
+               FROM operator_config_state WHERE id = 1"""
+        ).fetchone()
+
+    def test_restarted_consumer_mirrors_an_edited_legacy_mount(self):
+        self.legacy.write_text(
+            json.dumps(prefilter_document(2002)), encoding="utf-8"
+        )
+
+        owner = self.start_consumer()
+
+        self.assertEqual(owner.bundle.generation, 2)
+        self.assertEqual(owner.bundle.mode, "legacy")
+        self.assertEqual(owner.bundle.prefilter_policy.signature_ids, {2002})
+        self.assertEqual(self.durable_state()[0], 2)
+        self.assertEqual(
+            self.conn.execute(
+                """SELECT revision FROM operator_config_revisions WHERE id = ?""",
+                (self.durable_state()[2],),
+            ).fetchone()[0],
+            owner.bundle.prefilter_revision,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """SELECT loaded_generation, status, last_error
+                   FROM operator_config_consumers WHERE consumer = 'suricata'"""
+            ).fetchone(),
+            (2, "ok", None),
+        )
+
+    def test_both_consumers_share_one_synchronized_startup_path(self):
+        self.assertIs(
+            wazuh_ingest.start_configuration_owner,
+            ingest.start_configuration_owner,
+        )
+        self.assets.write_text(
+            json.dumps(asset_document("firewall")), encoding="utf-8"
+        )
+
+        owner = self.start_consumer(consumer="wazuh")
+
+        self.assertEqual(owner.bundle.generation, 2)
+        self.assertEqual(
+            owner.bundle.asset_inventory.assets[0]["hostname"], "firewall"
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """SELECT loaded_generation, status FROM operator_config_consumers
+                   WHERE consumer = 'wazuh'"""
+            ).fetchone(),
+            (2, "ok"),
+        )
+
+    def test_repeated_consumer_starts_do_not_churn_the_generation(self):
+        self.legacy.write_text(
+            json.dumps(prefilter_document(2002)), encoding="utf-8"
+        )
+
+        first = self.start_consumer()
+        second = self.start_consumer()
+
+        self.assertEqual(first.bundle.generation, 2)
+        self.assertEqual(second.bundle.generation, 2)
+        self.assertEqual(self.durable_state()[0], 2)
+
+    def test_invalid_legacy_mount_still_fails_the_consumer_closed(self):
+        self.legacy.write_text("not json", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            operator_config.OperatorConfigError,
+            "must be valid UTF-8 JSON",
+        ):
+            self.start_consumer()
+
+        self.assertEqual(self.durable_state()[0], 1)
+
+    def test_database_authority_consumer_start_never_reads_legacy_mounts(self):
+        generation, parent = 1, self.durable_state()[2]
+        created = config_repository.create_draft(
+            self.conn,
+            kind="prefilter_policy",
+            document=prefilter_document(2002),
+            parent_revision_id=parent,
+            expected_generation=generation,
+            note=None,
+            actor="operator",
+            auth_via="api_key",
+            request_id="startup-test",
+        )
+        config_repository.validate_draft(
+            self.conn,
+            kind="prefilter_policy",
+            draft_id=created["draft"]["id"],
+            actor="operator",
+            auth_via="api_key",
+            request_id="startup-test",
+        )
+        config_repository.activate_draft(
+            self.conn,
+            kind="prefilter_policy",
+            draft_id=created["draft"]["id"],
+            expected_generation=generation,
+            acknowledge_broad_rules=False,
+            acknowledge_shipped_base_change=False,
+            actor="operator",
+            auth_via="api_key",
+            request_id="startup-test",
+        )
+        self.legacy.unlink()
+        self.assets.unlink()
+
+        owner = self.start_consumer()
+
+        self.assertEqual(owner.bundle.mode, "database")
+        self.assertEqual(owner.bundle.generation, 2)
+        self.assertEqual(owner.bundle.prefilter_policy.signature_ids, {2002})
+        self.assertIsNone(owner.legacy_prefilter_policy)
+        self.assertIsNone(owner.legacy_asset_inventory)
+
+    def test_ingest_modules_import_without_reading_legacy_mounts(self):
+        environment = {
+            **os.environ,
+            "ASSET_INVENTORY_PATH": str(self.root / "missing-assets.json"),
+            "PYTHONPATH": str(PROJECT_ROOT / "triagewall"),
+            "PYTHONIOENCODING": "utf-8",
+        }
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import triage, ingest, wazuh_ingest; print('imported')",
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+            cwd=str(PROJECT_ROOT),
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("imported", completed.stdout)
+        self.assertNotIn("asset inventory", completed.stdout)
 
 
 if __name__ == "__main__":

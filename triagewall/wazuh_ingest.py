@@ -24,13 +24,12 @@ from ingest import (
     RETRY_LINE,
     insert_with_retry,
     quarantine_line,
+    start_configuration_owner,
 )
 from migrations import verify_db_initialized
-from operator_config import ConfigurationBundleOwner, OperatorConfigError
+from operator_config import OperatorConfigError
 from triage import (
-    ASSET_INVENTORY,
     MODEL,
-    PREFILTER_POLICY,
     call_ollama_wazuh,
     get_asset_context,
     set_configuration_bundle_owner,
@@ -576,15 +575,14 @@ def tail_wazuh() -> int:
     conn = connect_database(DB_PATH)
     try:
         try:
-            RUNTIME_CONFIG_OWNER = ConfigurationBundleOwner(
+            RUNTIME_CONFIG_OWNER = start_configuration_owner(
+                conn,
                 consumer="wazuh",
-                legacy_prefilter_policy=PREFILTER_POLICY,
-                legacy_asset_inventory=ASSET_INVENTORY,
+                db_path=DB_PATH,
                 reload_interval_seconds=CONFIG_RELOAD_INTERVAL_SECONDS,
             )
-            RUNTIME_CONFIG_OWNER.start(conn)
             set_configuration_bundle_owner(RUNTIME_CONFIG_OWNER)
-        except (OperatorConfigError, sqlite3.Error) as exc:
+        except (OperatorConfigError, OSError, sqlite3.Error) as exc:
             log.critical("Wazuh ingest configuration startup failed: %s", exc)
             return 1
         while not _stop:

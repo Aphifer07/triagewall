@@ -153,9 +153,13 @@ stateDiagram-v2
    validates the packaged default, the legacy mounted prefilter, and the mounted
    private inventory. It imports the packaged default as `shipped` and the
    current effective legacy documents as `operator_import` revisions. It does
-   not copy private inventory content into logs. Until runtime cutover, each
-   later startup validates and mirrors changed mounted inputs as a new active
-   generation so database state cannot diverge from actual ingest behaviour.
+   not copy private inventory content into logs. Until runtime cutover, every
+   later startup -- the one-shot bootstrap and each ingest consumer start, which
+   restart independently -- validates and mirrors changed mounted inputs as a
+   new active generation through the same serialized transaction, so database
+   state cannot diverge from actual ingest behaviour. Each consumer publishes
+   the exact objects that synchronization validated, so one read of each mount
+   backs both the durable revision and the runtime bundle.
 2. **Draft.** An attributable operator submits a complete candidate based on a
    named active revision and generation.
 3. **Validate.** Core runs the existing strict parser, canonicalization, size,
@@ -235,8 +239,9 @@ phase after schema migration and before dashboard or ingest startup:
 - import a differing legacy prefilter and the private inventory as
   `operator_import`;
 - create the singleton active bundle and generation atomically;
-- initialize it in `legacy` mode and, on later starts, atomically mirror any
-  valid change to either mounted effective document;
+- initialize it in `legacy` mode and, on every later start of the bootstrap
+  owner or of either ingest consumer, atomically mirror any valid change to
+  either mounted effective document;
 - make dashboard, Suricata ingest, and optional Wazuh ingest depend on successful
   bootstrap completion.
 

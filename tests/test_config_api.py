@@ -148,6 +148,28 @@ class ConfigApiTests(unittest.TestCase):
             },
         )
 
+    def activate(self, document):
+        """Run one full prefilter lifecycle and return the activated id."""
+        summary = self.summary()
+        created = self.create_draft(document)
+        self.assertEqual(created.status_code, 201, created.text)
+        draft_id = created.json()["draft"]["id"]
+        validated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        self.assertEqual(validated.status_code, 200, validated.text)
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.config_headers,
+            json={
+                "expected_generation": summary["generation"],
+                "acknowledge_shipped_base_change": True,
+            },
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        return activated.json()["revision"]["id"]
+
     def test_config_scope_is_api_key_only(self):
         cases = [
             ("anonymous", self.host),
@@ -391,7 +413,7 @@ class ConfigApiTests(unittest.TestCase):
             [(0,)],
         )
 
-    def test_stale_generation_and_duplicate_drafts_conflict(self):
+    def test_stale_generation_conflicts_and_identical_draft_resumes(self):
         summary = self.summary()
         parent = summary["active"]["prefilter_policy"]["id"]
         stale = self.client.post(
@@ -408,7 +430,187 @@ class ConfigApiTests(unittest.TestCase):
         first = self.create_draft(prefilter_document(signature_id=2002))
         duplicate = self.create_draft(prefilter_document(signature_id=2002))
         self.assertEqual(first.status_code, 201)
-        self.assertEqual(duplicate.status_code, 409)
+        self.assertFalse(first.json()["resumed"])
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertTrue(duplicate.json()["resumed"])
+        self.assertEqual(
+            duplicate.json()["draft"]["id"], first.json()["draft"]["id"]
+        )
+        self.assertEqual(
+            self.db_rows(
+                """SELECT COUNT(*) FROM operator_config_revisions
+                   WHERE kind = 'prefilter_policy' AND source = 'operator'"""
+            ),
+            [(1,)],
+        )
+
+    def test_validated_revision_resumes_after_editor_state_is_lost(self):
+        document = prefilter_document(signature_id=2002)
+        created = self.create_draft(document)
+        draft_id = created.json()["draft"]["id"]
+        validated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        self.assertEqual(validated.status_code, 200, validated.text)
+        validated_id = validated.json()["revision"]["id"]
+
+        # The editor lost its lifecycle state; the operator resubmits the very
+        # same document, which cannot create a second row for that digest.
+        resumed = self.create_draft(document)
+
+        self.assertEqual(resumed.status_code, 200, resumed.text)
+        self.assertTrue(resumed.json()["resumed"])
+        self.assertEqual(resumed.json()["draft"]["id"], validated_id)
+        self.assertEqual(resumed.json()["draft"]["state"], "validated")
+
+        revalidated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{validated_id}/validate",
+            headers=self.config_headers,
+        )
+        self.assertEqual(revalidated.status_code, 200, revalidated.text)
+        self.assertEqual(revalidated.json()["revision"]["id"], validated_id)
+
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{validated_id}/activate",
+            headers=self.config_headers,
+            json={"expected_generation": 1},
+        )
+
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(activated.json()["generation"], 2)
+        self.assertEqual(self.summary()["generation"], 2)
+        self.assertEqual(
+            self.summary()["active"]["prefilter_policy"]["id"], validated_id
+        )
+        self.assertIn(
+            ("draft_resumed",),
+            self.db_rows("SELECT action FROM operator_config_audit"),
+        )
+
+    def test_resume_is_refused_for_a_revision_off_a_different_parent(self):
+        document = prefilter_document(signature_id=2002)
+        created = self.create_draft(document)
+        draft_id = created.json()["draft"]["id"]
+        self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.config_headers,
+            json={"expected_generation": 1},
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+
+        # The identical content is now the active revision, raised against a
+        # parent that is no longer active. It must never be resumed as a draft.
+        conflict = self.create_draft(document)
+
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertIn("identical configuration revision", conflict.text)
+        self.assertEqual(self.summary()["generation"], 2)
+
+    def test_canonicalized_candidate_keeps_the_submitted_draft_parent(self):
+        first_id = self.summary()["active"]["prefilter_policy"]["id"]
+        superseded_id = self.activate(prefilter_document(signature_id=2002))
+        self.activate(prefilter_document(signature_id=3003))
+        summary = self.summary()
+        self.assertEqual(summary["generation"], 3)
+        self.assertNotEqual(
+            summary["active"]["prefilter_policy"]["id"], superseded_id
+        )
+
+        # This noncanonical draft normalizes onto the superseded SID 2002 row,
+        # whose recorded parent is the long-replaced original revision.
+        created = self.client.post(
+            "/api/v1/config/prefilter_policy/drafts",
+            headers=self.config_headers,
+            json={
+                "document": prefilter_document(signature_id=2002, protocol="TCP"),
+                "parent_revision_id": summary["active"]["prefilter_policy"]["id"],
+                "expected_generation": summary["generation"],
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        draft_id = created.json()["draft"]["id"]
+        validated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+
+        self.assertEqual(validated.status_code, 200, validated.text)
+        payload = validated.json()
+        self.assertEqual(payload["validation"]["status"], "valid")
+        self.assertEqual(payload["revision"]["id"], superseded_id)
+        self.assertEqual(payload["revision"]["parent_revision_id"], first_id)
+        self.assertEqual(
+            payload["candidate_parent_revision_id"],
+            summary["active"]["prefilter_policy"]["id"],
+        )
+
+        previewed = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+            headers=self.config_headers,
+            json={"expected_generation": summary["generation"]},
+        )
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.config_headers,
+            json={"expected_generation": summary["generation"]},
+        )
+
+        self.assertEqual(previewed.status_code, 200, previewed.text)
+        self.assertEqual(previewed.json()["candidate_revision_id"], superseded_id)
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(activated.json()["generation"], 4)
+        self.assertEqual(activated.json()["revision"]["id"], superseded_id)
+        self.assertEqual(
+            self.summary()["active"]["prefilter_policy"]["id"], superseded_id
+        )
+        self.assertEqual(
+            self.db_rows(
+                "SELECT document_json FROM operator_config_revisions WHERE id = ?",
+                (superseded_id,),
+            ),
+            [(json.dumps(
+                prefilter_document(signature_id=2002),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),)],
+        )
+
+    def test_canonicalized_candidate_off_a_stale_parent_cannot_activate(self):
+        superseded_id = self.activate(prefilter_document(signature_id=2002))
+        summary = self.summary()
+        created = self.client.post(
+            "/api/v1/config/prefilter_policy/drafts",
+            headers=self.config_headers,
+            json={
+                "document": prefilter_document(signature_id=4004, protocol="TCP"),
+                "parent_revision_id": summary["active"]["prefilter_policy"]["id"],
+                "expected_generation": summary["generation"],
+            },
+        )
+        draft_id = created.json()["draft"]["id"]
+        self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        # Another activation moves the active pointer under the candidate.
+        self.activate(prefilter_document(signature_id=3003))
+
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.config_headers,
+            json={"expected_generation": self.summary()["generation"]},
+        )
+
+        self.assertEqual(activated.status_code, 409, activated.text)
+        self.assertIn("parent is no longer active", activated.text)
+        self.assertNotEqual(
+            self.summary()["active"]["prefilter_policy"]["id"], superseded_id
+        )
 
     def test_audit_is_attributable_bounded_and_cursor_paginated(self):
         created = self.create_draft(prefilter_document(signature_id=2002))

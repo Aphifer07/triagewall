@@ -25,10 +25,16 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from asset_inventory import configured_inventory_path
+from config_bootstrap import packaged_prefilter_path
 from database import connect_database
 from environment import parse_boolean
 from migrations import verify_db_initialized
-from operator_config import ConfigurationBundleOwner
+from operator_config import (
+    ConfigurationBundleOwner,
+    OperatorConfigError,
+    synchronize_legacy_configuration,
+)
 from time_utils import format_utc_timestamp, utc_now_iso
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,9 +69,8 @@ _load_dotenv(override=False)
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
 from triage import (
-    ASSET_INVENTORY,
     MODEL,
-    PREFILTER_POLICY,
+    PREFILTER_CONFIG_PATH,
     call_ollama,
     get_asset_context,
     insert_triage_row,
@@ -169,6 +174,50 @@ if not 1 <= CONFIG_RELOAD_INTERVAL_SECONDS <= 300:
     raise RuntimeError(
         "TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS must be from 1 to 300"
     )
+
+
+def start_configuration_owner(
+    conn,
+    *,
+    consumer,
+    db_path=None,
+    reload_interval_seconds=None,
+):
+    """Synchronize legacy mounts, then publish one verified immutable bundle.
+
+    The one-shot bootstrap container runs before the first consumer start, but
+    it does not rerun when a single consumer restarts, so a valid host-side edit
+    to a mounted document would otherwise leave the durable active revision
+    stale and fail this consumer's start closed on every restart. Mirroring the
+    mounts here -- through the same serialized, fail-closed transaction -- keeps
+    the durable record truthful for every consumer start, and publishing the
+    exact objects that synchronization validated means one read of each mount
+    backs both the durable revision and the runtime bundle. Under `database`
+    authority no mount is read at all.
+    """
+    snapshot = synchronize_legacy_configuration(
+        db_path or DB_PATH,
+        packaged_prefilter_path=packaged_prefilter_path(),
+        legacy_prefilter_path=PREFILTER_CONFIG_PATH,
+        asset_inventory_path=configured_inventory_path(),
+    )
+    log.info(
+        "Configuration authority: mode=%s generation=%s",
+        snapshot.mode,
+        snapshot.generation,
+    )
+    owner = ConfigurationBundleOwner(
+        consumer=consumer,
+        legacy_prefilter_policy=snapshot.prefilter_policy,
+        legacy_asset_inventory=snapshot.asset_inventory,
+        reload_interval_seconds=(
+            reload_interval_seconds
+            if reload_interval_seconds is not None
+            else CONFIG_RELOAD_INTERVAL_SECONDS
+        ),
+    )
+    owner.start(conn)
+    return owner
 
 
 def _handle_signal(signum, frame):
@@ -751,13 +800,14 @@ def demo_loop():
     conn = connect_database(DB_PATH)
 
     try:
-        RUNTIME_CONFIG_OWNER = ConfigurationBundleOwner(
-            consumer="suricata",
-            legacy_prefilter_policy=PREFILTER_POLICY,
-            legacy_asset_inventory=ASSET_INVENTORY,
-            reload_interval_seconds=CONFIG_RELOAD_INTERVAL_SECONDS,
-        )
-        RUNTIME_CONFIG_OWNER.start(conn)
+        try:
+            RUNTIME_CONFIG_OWNER = start_configuration_owner(
+                conn,
+                consumer="suricata",
+            )
+        except OperatorConfigError as exc:
+            log.critical(f"Ingest configuration startup failed: {exc}")
+            sys.exit(1)
         set_configuration_bundle_owner(RUNTIME_CONFIG_OWNER)
         while not _stop:
             for line in demo_lines:
@@ -802,13 +852,14 @@ def tail_file():
             return None
 
     try:
-        RUNTIME_CONFIG_OWNER = ConfigurationBundleOwner(
-            consumer="suricata",
-            legacy_prefilter_policy=PREFILTER_POLICY,
-            legacy_asset_inventory=ASSET_INVENTORY,
-            reload_interval_seconds=CONFIG_RELOAD_INTERVAL_SECONDS,
-        )
-        RUNTIME_CONFIG_OWNER.start(conn)
+        try:
+            RUNTIME_CONFIG_OWNER = start_configuration_owner(
+                conn,
+                consumer="suricata",
+            )
+        except OperatorConfigError as exc:
+            log.critical(f"Ingest configuration startup failed: {exc}")
+            sys.exit(1)
         set_configuration_bundle_owner(RUNTIME_CONFIG_OWNER)
         while not _stop:
             try:

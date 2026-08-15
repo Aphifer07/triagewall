@@ -55,6 +55,29 @@ class BootstrapResult:
 
 
 @dataclass(frozen=True)
+class LegacyStartupSnapshot:
+    """One serialized legacy synchronization performed before a consumer starts.
+
+    The runtime objects are built from the exact revisions the synchronization
+    mirrored, so a single read of each mounted document backs both the durable
+    active revision and the bundle the consumer publishes. Under ``database``
+    authority no mount is read and both objects are ``None``.
+    """
+
+    result: BootstrapResult
+    prefilter_policy: PrefilterPolicy | None
+    asset_inventory: AssetInventory | None
+
+    @property
+    def mode(self) -> str:
+        return self.result.mode
+
+    @property
+    def generation(self) -> int:
+        return self.result.generation
+
+
+@dataclass(frozen=True)
 class ActiveState:
     generation: int
     mode: str
@@ -327,11 +350,16 @@ def _runtime_revision_row(
 def load_configuration_bundle(
     conn: sqlite3.Connection,
     *,
-    legacy_prefilter_policy: PrefilterPolicy,
-    legacy_asset_inventory: AssetInventory,
+    legacy_prefilter_policy: PrefilterPolicy | None,
+    legacy_asset_inventory: AssetInventory | None,
     loaded_at: str | None = None,
 ) -> ConfigurationBundle:
-    """Read, validate, and construct both active documents from one snapshot."""
+    """Read, validate, and construct both active documents from one snapshot.
+
+    The legacy objects are required only while authority remains ``legacy``.
+    Under ``database`` authority they are never dereferenced, so a consumer
+    that never read a mounted document may pass ``None``.
+    """
     if conn.in_transaction:
         raise OperatorConfigError(
             "runtime configuration must be loaded between database transactions"
@@ -359,6 +387,10 @@ def load_configuration_bundle(
             ASSET_KIND,
         )
         if mode == "legacy":
+            if legacy_prefilter_policy is None or legacy_asset_inventory is None:
+                raise OperatorConfigError(
+                    "legacy mounted configuration was not loaded before start"
+                )
             effective_prefilter = _revision(
                 PREFILTER_KIND,
                 "operator",
@@ -462,8 +494,8 @@ class ConfigurationBundleOwner:
         self,
         *,
         consumer: str,
-        legacy_prefilter_policy: PrefilterPolicy,
-        legacy_asset_inventory: AssetInventory,
+        legacy_prefilter_policy: PrefilterPolicy | None = None,
+        legacy_asset_inventory: AssetInventory | None = None,
         reload_interval_seconds: float = DEFAULT_RELOAD_INTERVAL_SECONDS,
         clock=time.monotonic,
     ):
@@ -620,6 +652,28 @@ class ConfigurationBundleOwner:
         return True
 
 
+def _startup_snapshot(
+    result: BootstrapResult,
+    legacy: CanonicalRevision | None,
+    assets: CanonicalRevision | None,
+) -> LegacyStartupSnapshot:
+    """Build the runtime objects a consumer must publish for this generation."""
+    if result.mode != "legacy":
+        return LegacyStartupSnapshot(result, None, None)
+    if legacy is None or assets is None:
+        raise OperatorConfigError(
+            "legacy synchronization completed without validated mounted documents"
+        )
+    try:
+        policy = PrefilterPolicy.from_document(json.loads(legacy.document_json))
+        inventory = AssetInventory.from_document(json.loads(assets.document_json))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise OperatorConfigError(
+            "mirrored legacy configuration could not be constructed"
+        ) from exc
+    return LegacyStartupSnapshot(result, policy, inventory)
+
+
 def bootstrap_operator_configuration(
     db_path: Path | str,
     *,
@@ -628,12 +682,31 @@ def bootstrap_operator_configuration(
     asset_inventory_path: Path | str,
     occurred_at: str | None = None,
 ) -> BootstrapResult:
-    """Initialize or synchronize the durable operator-configuration bundle.
+    """Initialize or synchronize the durable operator-configuration bundle."""
+    return synchronize_legacy_configuration(
+        db_path,
+        packaged_prefilter_path=packaged_prefilter_path,
+        legacy_prefilter_path=legacy_prefilter_path,
+        asset_inventory_path=asset_inventory_path,
+        occurred_at=occurred_at,
+    ).result
+
+
+def synchronize_legacy_configuration(
+    db_path: Path | str,
+    *,
+    packaged_prefilter_path: Path | str,
+    legacy_prefilter_path: Path | str,
+    asset_inventory_path: Path | str,
+    occurred_at: str | None = None,
+) -> LegacyStartupSnapshot:
+    """Initialize or synchronize the durable bundle before a consumer starts.
 
     In ``legacy`` mode, the mounted files remain the runtime authority, so each
-    startup mirrors their validated effective documents into the database. In
-    ``database`` mode, durable active pointers are authoritative and mounted
-    legacy files are ignored.
+    startup -- the one-shot bootstrap and every consumer start -- validates and
+    mirrors their effective documents into the database under one immediate
+    transaction. Invalid mounts still fail closed. In ``database`` mode, durable
+    active pointers are authoritative and no mounted legacy file is read.
     """
     verify_db_initialized(db_path)
     probe = connect_database(db_path, readonly=True)
@@ -687,13 +760,17 @@ def bootstrap_operator_configuration(
 
         if existing is not None and existing.mode == "database":
             conn.commit()
-            return BootstrapResult(
-                generation=existing.generation,
-                mode=existing.mode,
-                active_prefilter_revision=existing.active_prefilter_revision,
-                active_asset_revision=existing.active_asset_revision,
-                initialized=False,
-                discovered_shipped_revision=shipped_discovered,
+            return _startup_snapshot(
+                BootstrapResult(
+                    generation=existing.generation,
+                    mode=existing.mode,
+                    active_prefilter_revision=existing.active_prefilter_revision,
+                    active_asset_revision=existing.active_asset_revision,
+                    initialized=False,
+                    discovered_shipped_revision=shipped_discovered,
+                ),
+                legacy,
+                assets,
             )
 
         if legacy is None or assets is None:
@@ -725,13 +802,17 @@ def bootstrap_operator_configuration(
             )
             if not changed:
                 conn.commit()
-                return BootstrapResult(
-                    generation=existing.generation,
-                    mode=existing.mode,
-                    active_prefilter_revision=existing.active_prefilter_revision,
-                    active_asset_revision=existing.active_asset_revision,
-                    initialized=False,
-                    discovered_shipped_revision=shipped_discovered,
+                return _startup_snapshot(
+                    BootstrapResult(
+                        generation=existing.generation,
+                        mode=existing.mode,
+                        active_prefilter_revision=existing.active_prefilter_revision,
+                        active_asset_revision=existing.active_asset_revision,
+                        initialized=False,
+                        discovered_shipped_revision=shipped_discovered,
+                    ),
+                    legacy,
+                    assets,
                 )
 
             old_ids = {
@@ -784,13 +865,17 @@ def bootstrap_operator_configuration(
                 },
             )
             conn.commit()
-            return BootstrapResult(
-                generation=next_generation,
-                mode="legacy",
-                active_prefilter_revision=legacy.revision,
-                active_asset_revision=assets.revision,
-                initialized=False,
-                discovered_shipped_revision=shipped_discovered,
+            return _startup_snapshot(
+                BootstrapResult(
+                    generation=next_generation,
+                    mode="legacy",
+                    active_prefilter_revision=legacy.revision,
+                    active_asset_revision=assets.revision,
+                    initialized=False,
+                    discovered_shipped_revision=shipped_discovered,
+                ),
+                legacy,
+                assets,
             )
 
         active_prefilter_id = desired_prefilter_id
@@ -824,15 +909,19 @@ def bootstrap_operator_configuration(
             },
         )
         conn.commit()
-        return BootstrapResult(
-            generation=1,
-            mode="legacy",
-            active_prefilter_revision=legacy.revision
-            if legacy.revision != packaged.revision
-            else packaged.revision,
-            active_asset_revision=assets.revision,
-            initialized=True,
-            discovered_shipped_revision=shipped_discovered,
+        return _startup_snapshot(
+            BootstrapResult(
+                generation=1,
+                mode="legacy",
+                active_prefilter_revision=legacy.revision
+                if legacy.revision != packaged.revision
+                else packaged.revision,
+                active_asset_revision=assets.revision,
+                initialized=True,
+                discovered_shipped_revision=shipped_discovered,
+            ),
+            legacy,
+            assets,
         )
     except Exception:
         conn.rollback()

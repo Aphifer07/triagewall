@@ -481,6 +481,7 @@ def create_v1_router(
         "/config/{kind}/drafts",
         response_model=ConfigDraftResponse,
         status_code=201,
+        responses={200: {"model": ConfigDraftResponse}},
     )
     def create_config_draft(
         request: Request,
@@ -508,7 +509,8 @@ def create_v1_router(
             payload,
             model=ConfigDraftResponse,
             max_age=0,
-            status_code=201,
+            # A resumed candidate already existed; only a new row is a 201.
+            status_code=200 if payload.get("resumed") else 201,
             no_store=True,
         )
 

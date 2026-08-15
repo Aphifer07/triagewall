@@ -289,12 +289,23 @@ curl -sS -X POST -H 'Host: localhost' -H "X-API-Key: $CONFIG_KEY" \
   http://127.0.0.1:8084/api/v1/config/prefilter_policy/drafts
 ```
 
+Revision content is unique per kind, so an identical resubmission cannot create
+a second row. When the existing revision is still an unactivated `draft` or
+`validated` candidate off the very parent named in the request, creation returns
+that revision with `"resumed": true` and `200` instead of `201`, which lets an
+operator who lost editor state resume it. Any other existing state, or a
+candidate raised against a different parent, stays a `409`.
+
 `POST /api/v1/config/{kind}/drafts/{id}/validate` applies the production
 validator. An invalid candidate becomes an immutable `rejected` revision with
 a structured validation result. When normalization changes the effective
 document, validation preserves the submitted draft and creates a canonical
-`validated` child. Neither operation activates configuration or changes the
-bundle generation.
+`validated` child, or reuses the existing revision that already holds that exact
+canonical content. Because content and digests are immutable, a reused revision
+keeps its own lineage and state; the response reports the submitted draft's
+`candidate_parent_revision_id`, and preview and activation are addressed by the
+submitted draft id, which carries that parent relationship forward. Neither
+operation activates configuration or changes the bundle generation.
 
 `POST /api/v1/config/{kind}/drafts/{id}/preview` accepts
 `expected_generation`, a capped time window, and a candidate limit up to
@@ -328,8 +339,11 @@ emit no ETag.
 
 New verdict rows also store `config_generation`, `prefilter_revision`, and
 `asset_revision`. Both ingest adapters load both documents as one immutable
-bundle and verify legacy mounts while authority remains `legacy`. In `database`
-mode, mounts are ignored. Startup fails closed without a valid complete bundle;
+bundle. While authority remains `legacy`, each consumer start mirrors the
+mounted documents into the durable bundle through the same serialized,
+fail-closed transaction the one-shot bootstrap uses, then publishes exactly what
+it mirrored. In `database` mode, no mounted legacy file is read at all, so a
+missing or malformed mount cannot block a start from a valid durable bundle. Startup fails closed without a valid complete bundle;
 a later reload failure retains the last-known-good bundle, reports degraded
 health, records bounded audit evidence, and retries with bounded backoff.
 

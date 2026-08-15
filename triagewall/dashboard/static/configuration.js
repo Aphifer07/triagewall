@@ -389,8 +389,20 @@
           note: element("configChangeNote").value.trim() || null,
         }),
       });
-      lifecycle = { kind: selectedKind, draftId: payload.draft.id, validatedId: null, preview: null };
-      setMessage(`Immutable draft #${payload.draft.id} created. Validate it next.`);
+      // An identical candidate may already exist when editor state was lost.
+      // The server returns it only when it is still resumable against the
+      // current active parent and generation, so the lifecycle continues from
+      // that immutable revision instead of demanding a changed document.
+      const resumedValidated = payload.resumed && payload.draft.state === "validated";
+      lifecycle = {
+        kind: selectedKind,
+        draftId: payload.draft.id,
+        validatedId: resumedValidated ? payload.draft.id : null,
+        preview: null,
+      };
+      setMessage(payload.resumed
+        ? `Resumed ${payload.draft.state} revision #${payload.draft.id}. ${resumedValidated ? "Review its bounded impact next." : "Validate it next."}`
+        : `Immutable draft #${payload.draft.id} created. Validate it next.`);
       renderLifecycle();
     } catch (error) {
       setMessage(error.status === 409 ? `${error.message} Reload active configuration before retrying.` : error.message, true);
@@ -400,7 +412,10 @@
   async function validateDraft() {
     try {
       const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.draftId}/validate`, { method: "POST" });
-      if (payload.revision.state !== "validated") {
+      // Validation status is the verdict. Canonical content can normalize onto
+      // an existing immutable revision whose own state is historical; that is a
+      // valid candidate, and the submitted draft still carries its lineage.
+      if (payload.validation?.status !== "valid") {
         lifecycle = emptyLifecycle();
         setMessage(`Validation rejected the candidate: ${JSON.stringify(payload.validation)}`, true);
         renderLifecycle();
@@ -418,7 +433,7 @@
 
   async function previewDraft() {
     try {
-      const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.validatedId}/preview`, {
+      const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.draftId}/preview`, {
         method: "POST",
         body: JSON.stringify({ expected_generation: summary.generation }),
       });
@@ -442,7 +457,7 @@
   async function activateDraft() {
     if (!element("configConfirmActivate").checked || !lifecycle.preview) return;
     try {
-      const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.validatedId}/activate`, {
+      const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.draftId}/activate`, {
         method: "POST",
         body: JSON.stringify({
           expected_generation: summary.generation,

@@ -11,19 +11,40 @@ from operator_config import bootstrap_operator_configuration
 
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = os.environ.get("DB_PATH", "/var/lib/triagewall/triage.db")
-PACKAGED_PREFILTER_PATH = os.environ.get(
-    "PACKAGED_PREFILTER_PATH",
-    str(ROOT / "defaults" / "prefilter.json"),
-)
-LEGACY_PREFILTER_PATH = os.environ.get(
-    "LEGACY_PREFILTER_PATH",
-    str(ROOT / "config" / "prefilter.json"),
-)
-ASSET_INVENTORY_PATH = os.environ.get(
-    "ASSET_INVENTORY_PATH",
-    str(ROOT / "config" / "assets.example.json"),
-)
+
+
+def packaged_prefilter_path() -> str:
+    """Resolve the immutable shipped baseline for this deployment.
+
+    The container image keeps a copy under ``defaults`` that no operator mount
+    can cover. A source checkout has no such copy, so the unmodified shipped
+    file under ``config`` is the packaged baseline there.
+    """
+    configured = os.environ.get("PACKAGED_PREFILTER_PATH")
+    if configured:
+        return configured
+    packaged = ROOT / "defaults" / "prefilter.json"
+    if packaged.exists():
+        return str(packaged)
+    return str(ROOT / "config" / "prefilter.json")
+
+
+def legacy_prefilter_path() -> str:
+    return os.environ.get(
+        "LEGACY_PREFILTER_PATH",
+        str(ROOT / "config" / "prefilter.json"),
+    )
+
+
+def asset_inventory_path() -> str:
+    return os.environ.get(
+        "ASSET_INVENTORY_PATH",
+        str(ROOT / "config" / "assets.example.json"),
+    )
+
+
+def database_path() -> str:
+    return os.environ.get("DB_PATH", "/var/lib/triagewall/triage.db")
 
 
 def main() -> int:
@@ -34,10 +55,10 @@ def main() -> int:
     log = logging.getLogger("triagewall.config_bootstrap")
     log.info("Operator configuration bootstrap starting")
     result = bootstrap_operator_configuration(
-        DB_PATH,
-        packaged_prefilter_path=PACKAGED_PREFILTER_PATH,
-        legacy_prefilter_path=LEGACY_PREFILTER_PATH,
-        asset_inventory_path=ASSET_INVENTORY_PATH,
+        database_path(),
+        packaged_prefilter_path=packaged_prefilter_path(),
+        legacy_prefilter_path=legacy_prefilter_path(),
+        asset_inventory_path=asset_inventory_path(),
     )
     log.info(
         "Operator configuration bootstrap complete: generation=%s mode=%s initialized=%s "

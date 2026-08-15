@@ -241,6 +241,56 @@ class OperatorConfigBootstrapTests(unittest.TestCase):
             [("bootstrap_activated",), ("legacy_sync_activated",)],
         )
 
+    def test_synchronization_returns_the_documents_it_mirrored(self):
+        self.bootstrap()
+        self.write(self.legacy, prefilter_document(signature_id=2002))
+        self.write(self.assets, asset_document(hostname="firewall"))
+
+        snapshot = operator_config.synchronize_legacy_configuration(
+            self.db_path,
+            packaged_prefilter_path=self.packaged,
+            legacy_prefilter_path=self.legacy,
+            asset_inventory_path=self.assets,
+            occurred_at=NOW,
+        )
+
+        self.assertEqual(snapshot.mode, "legacy")
+        self.assertEqual(snapshot.generation, 2)
+        self.assertEqual(snapshot.prefilter_policy.signature_ids, {2002})
+        self.assertEqual(snapshot.asset_inventory.assets[0]["hostname"], "firewall")
+        self.assertEqual(
+            snapshot.asset_inventory.revision,
+            snapshot.result.active_asset_revision,
+        )
+        # The mirrored objects are exactly what the durable revision records,
+        # so a consumer publishing them cannot mismatch its own active bundle.
+        self.assertEqual(
+            self.rows(
+                """SELECT revision FROM operator_config_revisions
+                   WHERE kind = 'prefilter_policy' AND state = 'active'"""
+            ),
+            [(snapshot.result.active_prefilter_revision,)],
+        )
+
+    def test_database_mode_synchronization_reads_no_mounted_document(self):
+        self.bootstrap()
+        self.execute("UPDATE operator_config_state SET mode = 'database' WHERE id = 1")
+        self.legacy.unlink()
+        self.assets.unlink()
+
+        snapshot = operator_config.synchronize_legacy_configuration(
+            self.db_path,
+            packaged_prefilter_path=self.packaged,
+            legacy_prefilter_path=self.legacy,
+            asset_inventory_path=self.assets,
+            occurred_at=NOW,
+        )
+
+        self.assertEqual(snapshot.mode, "database")
+        self.assertIsNone(snapshot.prefilter_policy)
+        self.assertIsNone(snapshot.asset_inventory)
+        self.assertEqual(self.rows("SELECT generation FROM operator_config_state"), [(1,)])
+
     def test_upgrade_discovers_shipped_default_without_replacing_legacy_bundle(self):
         first = self.bootstrap()
         self.write(self.packaged, prefilter_document(signature_id=3003))

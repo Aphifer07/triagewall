@@ -419,6 +419,7 @@ class ConfigDraftResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     draft: ConfigRevisionMetadata
+    resumed: bool = False
 
 
 class ConfigValidationResponse(BaseModel):
@@ -427,6 +428,7 @@ class ConfigValidationResponse(BaseModel):
     draft_id: int
     validation: dict[str, Any]
     revision: ConfigRevisionMetadata
+    candidate_parent_revision_id: int | None = None
 
 
 class ConfigPreviewRequest(BaseModel):
