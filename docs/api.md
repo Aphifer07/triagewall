@@ -290,11 +290,15 @@ curl -sS -X POST -H 'Host: localhost' -H "X-API-Key: $CONFIG_KEY" \
 ```
 
 Revision content is unique per kind, so an identical resubmission cannot create
-a second row. When the existing revision is still an unactivated `draft` or
-`validated` candidate off the very parent named in the request, creation returns
-that revision with `"resumed": true` and `200` instead of `201`, which lets an
-operator who lost editor state resume it. Any other existing state, or a
-candidate raised against a different parent, stays a `409`.
+a second row. When the existing revision is still an unactivated candidate off
+the very parent named in the request, creation returns that revision with
+`"resumed": true` and `200` instead of `201`, which lets an operator who lost
+editor state resume it. That covers a `draft`, a `validated` revision, and a
+draft that validation normalized; resubmitting the canonical form of a
+normalized candidate returns the same submitted handle. `validated_revision_id`
+names the validated result when there already is one, so a resumed candidate
+continues at preview. Any other existing state, and any candidate raised against
+a different parent, stay a `409`.
 
 `POST /api/v1/config/{kind}/drafts/{id}/validate` applies the production
 validator. An invalid candidate becomes an immutable `rejected` revision with
@@ -309,11 +313,17 @@ operation activates configuration or changes the bundle generation.
 
 `POST /api/v1/config/{kind}/drafts/{id}/preview` accepts
 `expected_generation`, a capped time window, and a candidate limit up to
-2,000. It compares only the newest eligible events, reports the examined count
+2,000. It refuses a candidate whose parent is no longer active before sampling
+anything. It compares only the newest eligible events, reports the examined count
 and whether the sample was truncated, never calls Ollama, and never changes
-verdicts or checkpoints. Prefilter previews report suppression deltas,
-bounded event/signature examples, unmatched rules, and unscoped-rule warnings.
-Asset previews report exact-IP match and context changes with bounded examples.
+verdicts or checkpoints. The sample is bounded by rows and by aggregate alert
+bytes, and reaching the byte budget is reported as truncation with a warning.
+Events retained before sensor context existed are included; only records
+positively identified as another sensor are excluded from a prefilter preview.
+Prefilter previews report suppression deltas, bounded event/signature examples,
+unmatched rules, and unscoped-rule warnings. Asset previews compare addresses
+only, never reading retained alert bodies, and report exact-IP match and context
+changes with bounded examples.
 
 `POST /api/v1/config/{kind}/drafts/{id}/activate` requires the current
 `expected_generation`. Prefilter candidates containing signature-only rules
@@ -326,10 +336,18 @@ authority to `database`; both ingest processes observe the new complete bundle
 between records. A candidate based on an older packaged prefilter baseline also
 requires `acknowledge_shipped_base_change=true`.
 
-`POST /api/v1/config/{kind}/revisions/{id}/rollback` reactivates a superseded
-revision through the same validation, acknowledgement, optimistic-generation,
-transaction, audit, and runtime-reload path. Rollback creates a new bundle
-generation; it never rewrites revision content or restores files.
+`POST /api/v1/config/{kind}/revisions/{id}/rollback` reactivates a previously
+active superseded revision through the same validation, acknowledgement,
+optimistic-generation, transaction, audit, and runtime-reload path. Rollback
+creates a new bundle generation; it never rewrites revision content or restores
+files. A superseded draft that validation normalized was never active and is
+refused with `409`; the editor does not offer it as a rollback target.
+
+Refused mutations are themselves evidence. A stale generation, a parent that is
+no longer active, a missing acknowledgement, and a refused rollback each append
+one bounded, attributable audit record naming the reason, which survives the
+rollback of the refused change. These records never contain document content,
+notes, or credentials.
 
 `GET /api/v1/config/audit` returns newest-first audit records with `limit`
 (1–100, default 50), optional `kind`, and an opaque `cursor`. Audit details are
@@ -342,10 +360,17 @@ New verdict rows also store `config_generation`, `prefilter_revision`, and
 bundle. While authority remains `legacy`, each consumer start mirrors the
 mounted documents into the durable bundle through the same serialized,
 fail-closed transaction the one-shot bootstrap uses, then publishes exactly what
-it mirrored. In `database` mode, no mounted legacy file is read at all, so a
-missing or malformed mount cannot block a start from a valid durable bundle. Startup fails closed without a valid complete bundle;
-a later reload failure retains the last-known-good bundle, reports degraded
-health, records bounded audit evidence, and retries with bounded backoff.
+it mirrored. Every authoritative read happens inside that transaction, so two
+consumers starting at once cannot commit mount snapshots out of order. When a
+peer has already mirrored a newer generation, the other consumer adopts those
+durable documents rather than classifying on its obsolete start-time snapshot,
+and records one bounded audit event naming the adopted generation, so both
+consumers converge on one immutable bundle. In `database` mode, no file is read
+at all, so a missing or malformed mount, or a host with no packaged default,
+cannot block a start from a valid durable bundle. Startup fails closed without a
+valid complete bundle; a later reload failure retains the last-known-good bundle,
+reports degraded health, records bounded audit evidence, and retries with
+bounded backoff.
 
 ### `GET /api/v1/timeline`
 

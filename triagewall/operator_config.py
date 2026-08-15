@@ -100,6 +100,9 @@ class ConfigurationBundle:
     asset_revision: str
     asset_shipped_base_revision: str | None
     loaded_at: str
+    # True when a legacy-authority consumer adopted the durable documents a peer
+    # had already mirrored, instead of its own start-time mount snapshot.
+    adopted_durable_legacy: bool = False
 
 
 RUNTIME_CONSUMERS = frozenset({"suricata", "wazuh"})
@@ -347,11 +350,37 @@ def _runtime_revision_row(
     return row
 
 
+def _legacy_snapshot_mismatch(
+    legacy_prefilter_policy: PrefilterPolicy | None,
+    legacy_asset_inventory: AssetInventory | None,
+    prefilter_row,
+    asset_row,
+) -> str | None:
+    """Report why a mounted snapshot does not describe the active revisions."""
+    if legacy_prefilter_policy is None or legacy_asset_inventory is None:
+        return "legacy mounted configuration was not loaded before start"
+    effective_prefilter = _revision(
+        PREFILTER_KIND,
+        "operator",
+        legacy_prefilter_policy.to_document(),
+        canonicalize_document(
+            PREFILTER_KIND,
+            legacy_prefilter_policy.to_document(),
+        )[1],
+    ).revision
+    if effective_prefilter != prefilter_row[2]:
+        return "loaded prefilter policy does not match the active durable revision"
+    if legacy_asset_inventory.revision != asset_row[2]:
+        return "loaded asset inventory does not match the active durable revision"
+    return None
+
+
 def load_configuration_bundle(
     conn: sqlite3.Connection,
     *,
     legacy_prefilter_policy: PrefilterPolicy | None,
     legacy_asset_inventory: AssetInventory | None,
+    adopt_durable_legacy: bool = False,
     loaded_at: str | None = None,
 ) -> ConfigurationBundle:
     """Read, validate, and construct both active documents from one snapshot.
@@ -359,6 +388,16 @@ def load_configuration_bundle(
     The legacy objects are required only while authority remains ``legacy``.
     Under ``database`` authority they are never dereferenced, so a consumer
     that never read a mounted document may pass ``None``.
+
+    While authority is ``legacy``, the mounted documents are the authority and a
+    caller that supplies them is checked against the durable active revision.
+    ``adopt_durable_legacy`` additionally lets a long-running consumer converge:
+    when a peer has already mirrored its mounts into a newer generation under
+    the serialized synchronization lock, this consumer adopts those durable
+    documents instead of failing its own start-time snapshot closed and
+    classifying on an obsolete bundle. The adopted content is still validated as
+    canonical and digest-matched before use, and the caller is told that it
+    happened so the event is recorded.
     """
     if conn.in_transaction:
         raise OperatorConfigError(
@@ -386,28 +425,18 @@ def load_configuration_bundle(
             int(state[3]),
             ASSET_KIND,
         )
+        adopted_durable = False
         if mode == "legacy":
-            if legacy_prefilter_policy is None or legacy_asset_inventory is None:
-                raise OperatorConfigError(
-                    "legacy mounted configuration was not loaded before start"
-                )
-            effective_prefilter = _revision(
-                PREFILTER_KIND,
-                "operator",
-                legacy_prefilter_policy.to_document(),
-                canonicalize_document(
-                    PREFILTER_KIND,
-                    legacy_prefilter_policy.to_document(),
-                )[1],
-            ).revision
-            if effective_prefilter != prefilter_row[2]:
-                raise OperatorConfigError(
-                    "loaded prefilter policy does not match the active durable revision"
-                )
-            if legacy_asset_inventory.revision != asset_row[2]:
-                raise OperatorConfigError(
-                    "loaded asset inventory does not match the active durable revision"
-                )
+            mismatch = _legacy_snapshot_mismatch(
+                legacy_prefilter_policy,
+                legacy_asset_inventory,
+                prefilter_row,
+                asset_row,
+            )
+            if mismatch is not None and not adopt_durable_legacy:
+                raise OperatorConfigError(mismatch)
+            adopted_durable = mismatch is not None
+        if mode == "legacy" and not adopted_durable:
             policy = legacy_prefilter_policy
             inventory = legacy_asset_inventory
         else:
@@ -420,7 +449,7 @@ def load_configuration_bundle(
                 )
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 raise OperatorConfigError(
-                    "active database configuration could not be constructed"
+                    f"active {mode} configuration could not be constructed"
                 ) from exc
         bundle = ConfigurationBundle(
             generation=int(state[1]),
@@ -436,6 +465,7 @@ def load_configuration_bundle(
                 str(asset_row[4]) if asset_row[4] is not None else None
             ),
             loaded_at=loaded_at or utc_now_iso(),
+            adopted_durable_legacy=adopted_durable,
         )
         conn.commit()
         return bundle
@@ -519,11 +549,28 @@ class ConfigurationBundleOwner:
             raise OperatorConfigError("runtime configuration owner has not started")
         return self._bundle
 
+    def _adopt(self, bundle: ConfigurationBundle) -> None:
+        """Publish one bundle and keep the legacy snapshot consistent with it.
+
+        After adopting a peer-synchronized generation, the consumer's start-time
+        mount snapshot no longer describes the active revisions. Replacing it
+        keeps every later comparison, including the next reload, honest.
+        """
+        if bundle.adopted_durable_legacy:
+            self.legacy_prefilter_policy = bundle.prefilter_policy
+            self.legacy_asset_inventory = bundle.asset_inventory
+        self._bundle = bundle
+
     def start(self, conn: sqlite3.Connection) -> ConfigurationBundle:
+        # A peer may commit its own synchronized generation between this
+        # consumer's synchronization and its start. Converging on the durable
+        # generation is what keeps both consumers on one immutable bundle;
+        # failing closed here would only restart into the same race.
         replacement = load_configuration_bundle(
             conn,
             legacy_prefilter_policy=self.legacy_prefilter_policy,
             legacy_asset_inventory=self.legacy_asset_inventory,
+            adopt_durable_legacy=True,
         )
         checked_at = utc_now_iso()
         try:
@@ -536,13 +583,37 @@ class ConfigurationBundleOwner:
                 checked_at=checked_at,
                 last_error=None,
             )
+            self._audit_adoption(conn, replacement, checked_at, "start")
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        self._bundle = replacement
+        self._adopt(replacement)
         self._next_check = self.clock() + self.reload_interval_seconds
         return replacement
+
+    def _audit_adoption(
+        self,
+        conn: sqlite3.Connection,
+        bundle: ConfigurationBundle,
+        occurred_at: str,
+        phase: str,
+    ) -> None:
+        if not bundle.adopted_durable_legacy:
+            return
+        _audit(
+            conn,
+            occurred_at=occurred_at,
+            action="runtime_adopted_durable_legacy",
+            detail={
+                "consumer": self.consumer,
+                "phase": phase,
+                "generation": bundle.generation,
+                "prefilter_revision": bundle.prefilter_revision,
+                "asset_revision": bundle.asset_revision,
+            },
+            actor=f"system:{self.consumer}-ingest",
+        )
 
     def maybe_reload(
         self,
@@ -579,10 +650,16 @@ class ConfigurationBundleOwner:
                     conn.rollback()
                 self._backoff = self.reload_interval_seconds
                 return False
+            # The durable generation moved. Under legacy authority that means a
+            # peer consumer or the bootstrap owner mirrored the mounts under the
+            # serialized lock, so this owner's frozen start-time snapshot is the
+            # stale one: adopt the durable documents rather than classifying on
+            # an obsolete bundle while reporting a reload error forever.
             replacement = load_configuration_bundle(
                 conn,
                 legacy_prefilter_policy=self.legacy_prefilter_policy,
                 legacy_asset_inventory=self.legacy_asset_inventory,
+                adopt_durable_legacy=True,
             )
         except Exception as exc:
             error = _bounded_reload_error(exc)
@@ -641,11 +718,12 @@ class ConfigurationBundleOwner:
                 },
                 actor=f"system:{self.consumer}-ingest",
             )
+            self._audit_adoption(conn, replacement, checked_at, "reload")
             conn.commit()
         except Exception:
             conn.rollback()
             return False
-        self._bundle = replacement
+        self._adopt(replacement)
         self._last_audited_failure_generation = None
         self._backoff = self.reload_interval_seconds
         self._next_check = now + self.reload_interval_seconds
@@ -688,6 +766,7 @@ def bootstrap_operator_configuration(
         packaged_prefilter_path=packaged_prefilter_path,
         legacy_prefilter_path=legacy_prefilter_path,
         asset_inventory_path=asset_inventory_path,
+        discover_shipped_baseline=True,
         occurred_at=occurred_at,
     ).result
 
@@ -698,43 +777,67 @@ def synchronize_legacy_configuration(
     packaged_prefilter_path: Path | str,
     legacy_prefilter_path: Path | str,
     asset_inventory_path: Path | str,
+    discover_shipped_baseline: bool = False,
     occurred_at: str | None = None,
 ) -> LegacyStartupSnapshot:
     """Initialize or synchronize the durable bundle before a consumer starts.
 
     In ``legacy`` mode, the mounted files remain the runtime authority, so each
     startup -- the one-shot bootstrap and every consumer start -- validates and
-    mirrors their effective documents into the database under one immediate
-    transaction. Invalid mounts still fail closed. In ``database`` mode, durable
-    active pointers are authoritative and no mounted legacy file is read.
+    mirrors their effective documents into the database. Invalid mounts still
+    fail closed. In ``database`` mode, durable active pointers are authoritative.
+
+    Every authoritative read happens *inside* the immediate transaction. Reading
+    the mounts first and committing afterwards let two starting consumers observe
+    two different snapshots and commit them in the opposite order, which could
+    reactivate the older mount content; holding the write lock across the read
+    makes the mirrored generation the one that was last observed under the lock.
+
+    ``discover_shipped_baseline`` is for the one-shot bootstrap, which owns
+    recording a changed packaged default. A consumer start leaves it off, so
+    under ``database`` authority a consumer reads no file at all and starts from
+    its valid durable bundle even where no packaged default is installed.
     """
     verify_db_initialized(db_path)
-    probe = connect_database(db_path, readonly=True)
-    try:
-        probed_state = _read_existing_state(probe)
-    finally:
-        probe.close()
-
-    packaged = load_revision(PREFILTER_KIND, packaged_prefilter_path, "shipped")
-    legacy = None
-    assets = None
-    if probed_state is None or probed_state.mode == "legacy":
-        legacy = load_revision(
-            PREFILTER_KIND,
-            legacy_prefilter_path,
-            "operator_import",
-        )
-        assets = load_revision(
-            ASSET_KIND,
-            asset_inventory_path,
-            "operator_import",
-        )
     timestamp = occurred_at or utc_now_iso()
 
     conn = connect_database(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         existing = _read_existing_state(conn)
+        if (
+            existing is not None
+            and existing.mode == "database"
+            and not discover_shipped_baseline
+        ):
+            conn.commit()
+            return _startup_snapshot(
+                BootstrapResult(
+                    generation=existing.generation,
+                    mode=existing.mode,
+                    active_prefilter_revision=existing.active_prefilter_revision,
+                    active_asset_revision=existing.active_asset_revision,
+                    initialized=False,
+                    discovered_shipped_revision=False,
+                ),
+                None,
+                None,
+            )
+
+        packaged = load_revision(PREFILTER_KIND, packaged_prefilter_path, "shipped")
+        legacy = None
+        assets = None
+        if existing is None or existing.mode == "legacy":
+            legacy = load_revision(
+                PREFILTER_KIND,
+                legacy_prefilter_path,
+                "operator_import",
+            )
+            assets = load_revision(
+                ASSET_KIND,
+                asset_inventory_path,
+                "operator_import",
+            )
         shipped_id, shipped_inserted = _insert_revision(
             conn,
             packaged,

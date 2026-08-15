@@ -374,6 +374,7 @@
                     <label class="config-field" for="configRuleDestinationPorts">Destination ports<input id="configRuleDestinationPorts" type="text" inputmode="numeric" placeholder="53, 443"></label>
                     <label class="config-field" for="configRuleSourceCidrs">Source CIDRs<input id="configRuleSourceCidrs" type="text" spellcheck="false"></label>
                     <label class="config-field" for="configRuleDestinationCidrs">Destination CIDRs<input id="configRuleDestinationCidrs" type="text" spellcheck="false"></label>
+                    <p id="configRulePreserved" class="config-message config-span-2" role="status"></p>
                     <button class="action-btn action-primary config-span-2" type="submit">Apply rule to candidate</button>
                   </form>
                 </div>
@@ -426,10 +427,11 @@
                 <div id="configRollbackGuard" class="config-rollback-guard hidden">
                   <strong id="configRollbackTitle">Confirm rollback</strong>
                   <p>Rollback creates a new generation for future records; it never rewrites history.</p>
+                  <pre id="configRollbackDocument" class="config-document" aria-label="Exact rollback target JSON"></pre>
                   <label class="config-check"><input id="configRollbackAcknowledgeBroad" type="checkbox"> I acknowledge any unscoped signature-only rules.</label>
                   <label class="config-check"><input id="configRollbackAcknowledgeBase" type="checkbox"> I reviewed this revision against the newest shipped baseline.</label>
                   <div class="config-inline-actions">
-                    <button id="configConfirmRollback" class="action-btn action-primary" type="button">Confirm rollback</button>
+                    <button id="configConfirmRollback" class="action-btn action-primary" type="button" disabled>Confirm rollback</button>
                     <button id="configCancelRollback" class="text-button" type="button">Cancel</button>
                   </div>
                 </div>

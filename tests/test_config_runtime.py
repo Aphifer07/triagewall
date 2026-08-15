@@ -392,6 +392,95 @@ class ConsumerStartupSynchronizationTests(unittest.TestCase):
 
         self.assertEqual(self.durable_state()[0], 1)
 
+    def test_peer_generation_is_adopted_by_a_long_running_legacy_consumer(self):
+        first = self.start_consumer(consumer="suricata")
+        self.assertEqual(first.bundle.generation, 1)
+        self.assertEqual(first.bundle.prefilter_policy.signature_ids, {1001})
+
+        self.legacy.write_text(
+            json.dumps(prefilter_document(2002)), encoding="utf-8"
+        )
+        second = self.start_consumer(consumer="wazuh")
+        self.assertEqual(second.bundle.generation, 2)
+
+        self.assertTrue(first.maybe_reload(self.conn, force=True))
+
+        self.assertEqual(first.bundle.generation, second.bundle.generation)
+        self.assertEqual(first.bundle.prefilter_revision, second.bundle.prefilter_revision)
+        self.assertEqual(first.bundle.asset_revision, second.bundle.asset_revision)
+        self.assertEqual(first.bundle.prefilter_policy.signature_ids, {2002})
+        self.assertEqual(
+            self.conn.execute(
+                """SELECT loaded_generation, status, last_error
+                   FROM operator_config_consumers WHERE consumer = 'suricata'"""
+            ).fetchone(),
+            (2, "ok", None),
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """SELECT COUNT(*) FROM operator_config_audit
+                   WHERE action = 'runtime_adopted_durable_legacy'"""
+            ).fetchone()[0],
+            1,
+        )
+        # The adopted snapshot is now this owner's own, so a further reload at
+        # the same generation stays quiet instead of erroring every interval.
+        self.assertFalse(first.maybe_reload(self.conn, force=True))
+        self.assertEqual(
+            self.conn.execute(
+                """SELECT status, last_error FROM operator_config_consumers
+                   WHERE consumer = 'suricata'"""
+            ).fetchone(),
+            ("ok", None),
+        )
+
+    def test_peer_commit_between_synchronization_and_start_converges(self):
+        peer = self.start_consumer(consumer="wazuh")
+
+        with patch.object(
+            ingest, "packaged_prefilter_path", lambda: str(self.packaged)
+        ), patch.object(
+            ingest, "configured_inventory_path", lambda: self.assets
+        ), patch.object(
+            ingest, "PREFILTER_CONFIG_PATH", self.legacy
+        ):
+            snapshot = operator_config.synchronize_legacy_configuration(
+                self.db_path,
+                packaged_prefilter_path=self.packaged,
+                legacy_prefilter_path=self.legacy,
+                asset_inventory_path=self.assets,
+            )
+            # A peer mirrors a newer mount between this consumer's
+            # synchronization and its own publication.
+            self.legacy.write_text(
+                json.dumps(prefilter_document(2002)), encoding="utf-8"
+            )
+            peer_snapshot = operator_config.synchronize_legacy_configuration(
+                self.db_path,
+                packaged_prefilter_path=self.packaged,
+                legacy_prefilter_path=self.legacy,
+                asset_inventory_path=self.assets,
+            )
+            owner = operator_config.ConfigurationBundleOwner(
+                consumer="suricata",
+                legacy_prefilter_policy=snapshot.prefilter_policy,
+                legacy_asset_inventory=snapshot.asset_inventory,
+            )
+            bundle = owner.start(self.conn)
+
+        self.assertEqual(peer_snapshot.generation, 2)
+        self.assertEqual(bundle.generation, 2)
+        self.assertTrue(bundle.adopted_durable_legacy)
+        self.assertEqual(bundle.prefilter_policy.signature_ids, {2002})
+        self.assertEqual(
+            self.conn.execute(
+                """SELECT loaded_generation, status FROM operator_config_consumers
+                   WHERE consumer = 'suricata'"""
+            ).fetchone(),
+            (2, "ok"),
+        )
+        self.assertEqual(peer.bundle.generation, 1)
+
     def test_database_authority_consumer_start_never_reads_legacy_mounts(self):
         generation, parent = 1, self.durable_state()[2]
         created = config_repository.create_draft(
@@ -424,8 +513,11 @@ class ConsumerStartupSynchronizationTests(unittest.TestCase):
             auth_via="api_key",
             request_id="startup-test",
         )
+        # A source checkout installs no immutable packaged default either, so a
+        # database-authority start must read none of these three files.
         self.legacy.unlink()
         self.assets.unlink()
+        self.packaged.unlink()
 
         owner = self.start_consumer()
 

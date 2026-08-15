@@ -2,6 +2,7 @@
   "use strict";
 
   const KINDS = ["prefilter_policy", "asset_inventory"];
+  const MAX_SNAPSHOT_ATTEMPTS = 2;
   const CREDENTIAL_HELP = "The key must carry config:write. It is kept only in this page's memory and is cleared on reload or disconnect.";
   let apiKey = "";
   let initialized = false;
@@ -16,10 +17,23 @@
   let dirtyKinds = new Set();
   let lifecycle = emptyLifecycle();
   let pendingRollbackId = null;
+  let rollbackTarget = null;
   let pendingSeed = null;
+  let editingRule = null;
+  let editingRuleForm = null;
+  // Monotonic epoch for everything an in-flight response could overwrite. A
+  // response may only publish when the epoch it started under is still current,
+  // so a slow reload can never resurrect stale bytes over a newer load, a local
+  // edit, a kind change, or a disconnect.
+  let stateEpoch = 0;
 
   function emptyLifecycle() {
     return { kind: null, draftId: null, validatedId: null, preview: null };
+  }
+
+  function invalidateInFlightResponses() {
+    stateEpoch += 1;
+    return stateEpoch;
   }
 
   function element(id) {
@@ -120,7 +134,28 @@
     }
   }
 
+  const RULE_SELECT_FIELDS = [
+    ["protocols", "configRuleProtocol"],
+    ["network_directions", "configRuleNetworkDirection"],
+    ["flow_directions", "configRuleFlowDirection"],
+  ];
+  const RULE_NUMBER_LIST_FIELDS = [
+    ["source_ports", "configRuleSourcePorts", "Source ports"],
+    ["destination_ports", "configRuleDestinationPorts", "Destination ports"],
+  ];
+  const RULE_TEXT_LIST_FIELDS = [
+    ["source_cidrs", "configRuleSourceCidrs"],
+    ["destination_cidrs", "configRuleDestinationCidrs"],
+  ];
+  const RULE_FORM_MATCH_KEYS = [
+    ...RULE_SELECT_FIELDS.map(([key]) => key),
+    ...RULE_NUMBER_LIST_FIELDS.map(([key]) => key),
+    ...RULE_TEXT_LIST_FIELDS.map(([key]) => key),
+  ];
+
   function resetRuleForm() {
+    editingRule = null;
+    editingRuleForm = null;
     element("configRuleIndex").value = "";
     element("configRuleSignatures").value = "";
     element("configRuleReason").value = "";
@@ -133,6 +168,19 @@
     element("configRuleDestinationCidrs").value = "";
     element("configRuleFormTitle").textContent = "Add scoped rule";
     element("configRuleCancel").classList.add("hidden");
+    element("configRulePreserved").textContent = "";
+  }
+
+  function describePreservedConstraints(rule) {
+    const match = rule?.match ?? {};
+    const notes = Object.keys(match).sort().filter((key) => {
+      if (!RULE_FORM_MATCH_KEYS.includes(key)) return true;
+      const value = match[key];
+      return Array.isArray(value) && value.length > 1;
+    }).map((key) => `${key}: ${JSON.stringify(match[key])}`);
+    return notes.length
+      ? `Preserved as-is (not editable in this form): ${notes.join(" · ")}`
+      : "";
   }
 
   function resetAssetForm() {
@@ -198,10 +246,19 @@
     }
   }
 
+  function isRollbackTarget(revision) {
+    // A superseded row is not necessarily a previously active revision: a draft
+    // that validation normalized keeps the operator's pre-canonical bytes and
+    // records the canonical revision it produced. It was never active, so it is
+    // never offered as a rollback target.
+    return revision.state === "superseded"
+      && revision.validation?.normalized_revision_id == null;
+  }
+
   function renderHistory() {
     const rows = revisions[selectedKind] ?? [];
     element("configRevisionList").innerHTML = rows.length ? rows.map((revision) => {
-      const rollback = revision.state === "superseded" && summary?.writes_enabled
+      const rollback = isRollbackTarget(revision) && summary?.writes_enabled
         ? `<button class="text-button" type="button" data-config-rollback="${Number(revision.id)}">Rollback</button>`
         : "";
       return `<article class="config-history-row"><div><strong>${escapeHtml(revision.state)} · #${Number(revision.id)}</strong><small>${escapeHtml(revision.created_by)} · ${escapeHtml(revision.created_at)}</small></div>${rollback}</article>`;
@@ -213,6 +270,20 @@
     element("configRollbackTitle").textContent = pendingRollbackId == null
       ? "Confirm rollback"
       : `Confirm rollback to revision #${pendingRollbackId}`;
+    const target = rollbackTarget && rollbackTarget.id === pendingRollbackId
+      ? rollbackTarget
+      : null;
+    // Operator-controlled document text is written as text, never as markup.
+    element("configRollbackDocument").textContent = target
+      ? JSON.stringify(target.document, null, 2)
+      : "";
+    // Nothing may be confirmed until the exact target document is on screen.
+    element("configConfirmRollback").disabled = target == null;
+  }
+
+  function clearRollbackSelection() {
+    pendingRollbackId = null;
+    rollbackTarget = null;
   }
 
   function renderEditor() {
@@ -230,7 +301,7 @@
 
   function invalidateLifecycle(message = "Candidate changed. Create a new immutable draft.") {
     lifecycle = emptyLifecycle();
-    pendingRollbackId = null;
+    clearRollbackSelection();
     element("configConfirmActivate").checked = false;
     element("configAcknowledgeBroad").checked = false;
     element("configAcknowledgeBase").checked = false;
@@ -238,6 +309,8 @@
   }
 
   function markDirty() {
+    // A local edit is newer than any load still in flight.
+    invalidateInFlightResponses();
     dirtyKinds.add(selectedKind);
     invalidateLifecycle();
     renderEditor();
@@ -246,9 +319,10 @@
   function selectKind(kind) {
     if (!KINDS.includes(kind)) return;
     if (selectedKind !== kind) {
+      invalidateInFlightResponses();
       selectedKind = kind;
       lifecycle = emptyLifecycle();
-      pendingRollbackId = null;
+      clearRollbackSelection();
       setMessage("");
     }
     renderEditor();
@@ -258,6 +332,9 @@
     const rule = workingDocuments.prefilter_policy?.auto_false_positive?.[index];
     if (!rule) return;
     const match = rule.match ?? {};
+    // The rule being edited is retained whole. The form represents only part of
+    // a match, so applying it must narrow nothing the operator did not touch.
+    editingRule = clone(rule);
     element("configRuleIndex").value = String(index);
     element("configRuleSignatures").value = (rule.signature_ids ?? []).join(", ");
     element("configRuleReason").value = rule.reason ?? "";
@@ -268,8 +345,13 @@
     element("configRuleDestinationPorts").value = (match.destination_ports ?? []).join(", ");
     element("configRuleSourceCidrs").value = (match.source_cidrs ?? []).join(", ");
     element("configRuleDestinationCidrs").value = (match.destination_cidrs ?? []).join(", ");
+    editingRuleForm = RULE_SELECT_FIELDS.reduce((snapshot, [, id]) => {
+      snapshot[id] = element(id).value;
+      return snapshot;
+    }, {});
     element("configRuleFormTitle").textContent = `Edit rule ${index + 1}`;
     element("configRuleCancel").classList.remove("hidden");
+    element("configRulePreserved").textContent = describePreservedConstraints(rule);
     element("configRuleReason").focus();
   }
 
@@ -278,34 +360,33 @@
     if (!signatures.length) throw new Error("At least one signature ID is required.");
     const reason = element("configRuleReason").value.trim();
     if (!reason) throw new Error("A review reason is required.");
-    const match = {};
-    const scalarLists = [
-      ["protocols", "configRuleProtocol"],
-      ["network_directions", "configRuleNetworkDirection"],
-      ["flow_directions", "configRuleFlowDirection"],
-    ];
-    scalarLists.forEach(([key, id]) => {
+    // Start from the retained rule so selectors the form cannot express, such
+    // as source_asset and destination_asset, survive any edit untouched.
+    const rule = editingRule ? clone(editingRule) : {};
+    const match = rule.match ? clone(rule.match) : {};
+    RULE_SELECT_FIELDS.forEach(([key, id]) => {
       const value = element(id).value;
+      // A single-value control shows only the first entry of a list. Leaving it
+      // alone must keep every entry; changing it is an explicit narrowing, and
+      // clearing it is an explicit removal.
+      if (editingRuleForm && editingRuleForm[id] === value) return;
       if (value) match[key] = [value];
+      else delete match[key];
     });
-    const numericLists = [
-      ["source_ports", "configRuleSourcePorts", "Source ports"],
-      ["destination_ports", "configRuleDestinationPorts", "Destination ports"],
-    ];
-    numericLists.forEach(([key, id, label]) => {
+    RULE_NUMBER_LIST_FIELDS.forEach(([key, id, label]) => {
       const values = csvIntegers(element(id).value, label);
       if (values.length) match[key] = values;
+      else delete match[key];
     });
-    const textLists = [
-      ["source_cidrs", "configRuleSourceCidrs"],
-      ["destination_cidrs", "configRuleDestinationCidrs"],
-    ];
-    textLists.forEach(([key, id]) => {
+    RULE_TEXT_LIST_FIELDS.forEach(([key, id]) => {
       const values = csvStrings(element(id).value);
       if (values.length) match[key] = values;
+      else delete match[key];
     });
-    const rule = { signature_ids: signatures, reason };
+    rule.signature_ids = signatures;
+    rule.reason = reason;
     if (Object.keys(match).length) rule.match = match;
+    else delete rule.match;
     return rule;
   }
 
@@ -392,16 +473,20 @@
       // An identical candidate may already exist when editor state was lost.
       // The server returns it only when it is still resumable against the
       // current active parent and generation, so the lifecycle continues from
-      // that immutable revision instead of demanding a changed document.
-      const resumedValidated = payload.resumed && payload.draft.state === "validated";
+      // that immutable revision instead of demanding a changed document. A
+      // resumed handle that already validated -- in place or by normalizing
+      // onto canonical content -- resumes directly at preview.
+      const validatedRevisionId = payload.resumed
+        ? payload.validated_revision_id ?? null
+        : null;
       lifecycle = {
         kind: selectedKind,
         draftId: payload.draft.id,
-        validatedId: resumedValidated ? payload.draft.id : null,
+        validatedId: validatedRevisionId,
         preview: null,
       };
       setMessage(payload.resumed
-        ? `Resumed ${payload.draft.state} revision #${payload.draft.id}. ${resumedValidated ? "Review its bounded impact next." : "Validate it next."}`
+        ? `Resumed ${payload.draft.state} revision #${payload.draft.id}. ${validatedRevisionId ? "Review its bounded impact next." : "Validate it next."}`
         : `Immutable draft #${payload.draft.id} created. Validate it next.`);
       renderLifecycle();
     } catch (error) {
@@ -473,6 +558,12 @@
   }
 
   async function rollbackRevision(revisionId) {
+    // The disabled control is the visible guard; this is the real one. Rollback
+    // is never sent for a revision whose exact document was not displayed.
+    if (rollbackTarget?.id !== revisionId) {
+      setMessage(`Load revision #${revisionId} before confirming rollback.`, true);
+      return;
+    }
     try {
       const payload = await configRequest(`/api/v1/config/${selectedKind}/revisions/${revisionId}/rollback`, {
         method: "POST",
@@ -489,16 +580,33 @@
     }
   }
 
-  function selectRollbackRevision(revisionId) {
+  async function selectRollbackRevision(revisionId) {
+    const epoch = stateEpoch;
     pendingRollbackId = revisionId;
+    rollbackTarget = null;
     element("configRollbackAcknowledgeBroad").checked = false;
     element("configRollbackAcknowledgeBase").checked = false;
     renderHistory();
-    setMessage(`Review revision #${revisionId} and confirm rollback below.`);
+    setMessage(`Loading revision #${revisionId} for review…`);
+    try {
+      const payload = await configRequest(
+        `/api/v1/config/${selectedKind}/revisions/${revisionId}`,
+      );
+      if (epoch !== stateEpoch || pendingRollbackId !== revisionId) return;
+      rollbackTarget = { id: revisionId, document: payload.document };
+      renderHistory();
+      setMessage(`Review the exact revision #${revisionId} below, then confirm rollback.`);
+    } catch (error) {
+      if (epoch !== stateEpoch || pendingRollbackId !== revisionId) return;
+      // Never leave confirmation available against an unseen document.
+      rollbackTarget = null;
+      renderHistory();
+      setMessage(`Revision #${revisionId} could not be loaded: ${error.message}`, true);
+    }
   }
 
   function cancelRollback() {
-    pendingRollbackId = null;
+    clearRollbackSelection();
     renderHistory();
   }
 
@@ -520,6 +628,16 @@
     } else {
       selectKind("asset_inventory");
       resetAssetForm();
+      // The retained alert address decides the mode. An address already owned
+      // by an asset in the freshly loaded inventory is edited in place, with
+      // every current field and every other address preserved; only an unknown
+      // address opens Add.
+      const existingIndex = assetIndexForAddress(seed.ip);
+      if (existingIndex >= 0) {
+        editAsset(existingIndex);
+        setMessage(`Editing the existing asset that already owns ${seed.ip}. Its other addresses are preserved.`);
+        return;
+      }
       element("configAssetHostname").value = seed.asset?.hostname ?? "new-asset";
       element("configAssetRole").value = seed.asset?.role ?? "endpoint";
       element("configAssetIps").value = seed.ip ?? "";
@@ -529,6 +647,20 @@
       setMessage("Alert evidence populated the asset form. Review it before applying it to the candidate.");
       element("configAssetHostname").focus();
     }
+  }
+
+  function normalizedAddress(value) {
+    return String(value ?? "").trim().toLowerCase();
+  }
+
+  function assetIndexForAddress(address) {
+    const wanted = normalizedAddress(address);
+    if (!wanted) return -1;
+    const assets = workingDocuments.asset_inventory?.assets;
+    if (!Array.isArray(assets)) return -1;
+    return assets.findIndex((asset) =>
+      (asset?.ips ?? []).some((ip) => normalizedAddress(ip) === wanted)
+    );
   }
 
   function seedFromAlert(verdict, action) {
@@ -560,30 +692,25 @@
       return;
     }
     loading = true;
+    const epoch = invalidateInFlightResponses();
     setConnectionStatus("Loading configuration…");
     try {
-      const [nextSummary, prefilter, assets, prefilterHistory, assetHistory, audit] = await Promise.all([
-        configRequest("/api/v1/config"),
-        configRequest("/api/v1/config/prefilter_policy"),
-        configRequest("/api/v1/config/asset_inventory"),
-        configRequest("/api/v1/config/prefilter_policy/revisions?limit=25"),
-        configRequest("/api/v1/config/asset_inventory/revisions?limit=25"),
-        configRequest("/api/v1/config/audit?limit=25"),
-      ]);
-      summary = nextSummary;
+      const snapshot = await readConsistentSnapshot(epoch);
+      if (snapshot === null) return;
+      summary = snapshot.summary;
       activeDocuments = {
-        prefilter_policy: prefilter.document,
-        asset_inventory: assets.document,
+        prefilter_policy: snapshot.prefilter.document,
+        asset_inventory: snapshot.assets.document,
       };
       workingDocuments = clone(activeDocuments);
       revisions = {
-        prefilter_policy: prefilterHistory.revisions,
-        asset_inventory: assetHistory.revisions,
+        prefilter_policy: snapshot.prefilterHistory.revisions,
+        asset_inventory: snapshot.assetHistory.revisions,
       };
-      auditEntries = audit.entries;
+      auditEntries = snapshot.audit.entries;
       dirtyKinds = new Set();
       lifecycle = emptyLifecycle();
-      pendingRollbackId = null;
+      clearRollbackSelection();
       loaded = true;
       element("configCredentialHelp").textContent = CREDENTIAL_HELP;
       renderConnection(true);
@@ -594,6 +721,7 @@
       setMessage("");
       applyPendingSeed();
     } catch (error) {
+      if (epoch !== stateEpoch) return;
       loaded = false;
       renderConnection(false);
       setConnectionStatus([401, 403].includes(error.status) ? "Key rejected" : "Configuration unavailable", "error");
@@ -604,7 +732,54 @@
     }
   }
 
+  function snapshotIsConsistent(summaryPayload, prefilter, assets) {
+    // Each document is fetched independently, so a generation that advances
+    // mid-load can pair one document's bytes with the other's parent. Editing
+    // that mixture would submit stale content against a newer parent, so the
+    // whole snapshot is discarded rather than published.
+    const pairs = [
+      [prefilter, summaryPayload?.active?.prefilter_policy],
+      [assets, summaryPayload?.active?.asset_inventory],
+    ];
+    return pairs.every(([document, active]) =>
+      document?.generation === summaryPayload?.generation
+      && active != null
+      && document?.revision?.id === active.id
+    );
+  }
+
+  async function readConsistentSnapshot(epoch, attempt = 0) {
+    const [summaryPayload, prefilter, assets, prefilterHistory, assetHistory, audit] = await Promise.all([
+      configRequest("/api/v1/config"),
+      configRequest("/api/v1/config/prefilter_policy"),
+      configRequest("/api/v1/config/asset_inventory"),
+      configRequest("/api/v1/config/prefilter_policy/revisions?limit=25"),
+      configRequest("/api/v1/config/asset_inventory/revisions?limit=25"),
+      configRequest("/api/v1/config/audit?limit=25"),
+    ]);
+    if (epoch !== stateEpoch) return null;
+    if (!snapshotIsConsistent(summaryPayload, prefilter, assets)) {
+      if (attempt >= MAX_SNAPSHOT_ATTEMPTS - 1) {
+        throw new Error(
+          "Active configuration changed while loading. Reload active configuration to continue.",
+        );
+      }
+      return readConsistentSnapshot(epoch, attempt + 1);
+    }
+    return {
+      summary: summaryPayload,
+      prefilter,
+      assets,
+      prefilterHistory,
+      assetHistory,
+      audit,
+    };
+  }
+
   function forget() {
+    // Disconnecting is newer than any load still in flight, so no response may
+    // publish configuration state after the credential is dropped.
+    invalidateInFlightResponses();
     apiKey = "";
     summary = null;
     activeDocuments = {};
@@ -613,7 +788,7 @@
     auditEntries = [];
     dirtyKinds = new Set();
     lifecycle = emptyLifecycle();
-    pendingRollbackId = null;
+    clearRollbackSelection();
     loaded = false;
     element("configApiKey").value = "";
     element("configCredentialHelp").textContent = CREDENTIAL_HELP;
@@ -641,7 +816,8 @@
       return markDirty();
     }
     const rollback = target.closest?.("[data-config-rollback]");
-    if (rollback) selectRollbackRevision(Number(rollback.dataset.configRollback));
+    if (rollback) return selectRollbackRevision(Number(rollback.dataset.configRollback));
+    return undefined;
   }
 
   function initialize() {

@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -54,6 +55,10 @@ DEFAULT_PREVIEW_CANDIDATES = 500
 MAX_PREVIEW_CANDIDATES = 2_000
 MAX_PREVIEW_EXAMPLES = 10
 MAX_PREVIEW_SIGNATURES = 100
+# Row and time bounds alone do not bound memory: one alert may be up to the
+# document limit, so the sample also stops at an aggregate byte budget.
+MAX_PREVIEW_SAMPLE_BYTES = 8 * 1024 * 1024
+MAX_RESUME_HANDLE_SCAN = 50
 
 
 class ConfigRepositoryError(RuntimeError):
@@ -349,6 +354,100 @@ def _raw_revision(kind: str, document_json: str) -> str:
     ).hexdigest()
 
 
+def _conflict(message: str, *, reason: str, **detail: Any) -> ConfigConflictError:
+    """Build a refusal that carries bounded, document-free audit evidence."""
+    error = ConfigConflictError(message)
+    error.audit_detail = {"reason": reason, **detail}
+    return error
+
+
+class _RejectionRecorder:
+    """Roll back a refused mutation, then record why it was refused.
+
+    Evidence of a refused configuration change is only useful if it survives the
+    rollback of that change, so the audit row is written afterwards in its own
+    immediate transaction. Only bounded lifecycle metadata is recorded: never
+    document content, note text, or credentials. A failure to record is not
+    swallowed -- unrecorded evidence is itself reportable.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        kind: str | None,
+        actor: str,
+        auth_via: str,
+        request_id: str | None,
+        action: str,
+        revision_id: int | None,
+        occurred_at: str | None,
+    ):
+        self.conn = conn
+        self.kind = kind
+        self.actor = actor
+        self.auth_via = auth_via
+        self.request_id = request_id
+        self.action = action
+        self.revision_id = revision_id
+        self.occurred_at = occurred_at
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if exc is None:
+            return False
+        if self.conn.in_transaction:
+            self.conn.rollback()
+        if isinstance(exc, ConfigConflictError):
+            self._record(exc)
+        return False
+
+    def _record(self, exc: ConfigConflictError) -> None:
+        detail = dict(getattr(exc, "audit_detail", None) or {"reason": "conflict"})
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            _insert_audit(
+                self.conn,
+                occurred_at=self.occurred_at or utc_now_iso(),
+                actor=self.actor,
+                auth_via=self.auth_via,
+                request_id=self.request_id,
+                action=self.action,
+                kind=self.kind,
+                revision_id=self.revision_id,
+                detail=detail,
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+
+def _rejection_recorder(
+    conn: sqlite3.Connection,
+    *,
+    kind: str | None,
+    actor: str,
+    auth_via: str,
+    request_id: str | None,
+    action: str,
+    revision_id: int | None = None,
+    occurred_at: str | None = None,
+) -> _RejectionRecorder:
+    return _RejectionRecorder(
+        conn,
+        kind=kind,
+        actor=actor,
+        auth_via=auth_via,
+        request_id=request_id,
+        action=action,
+        revision_id=revision_id,
+        occurred_at=occurred_at,
+    )
+
+
 def create_draft(
     conn: sqlite3.Connection,
     *,
@@ -384,14 +483,33 @@ def create_draft(
     revision = _raw_revision(kind, document_json)
     timestamp = occurred_at or utc_now_iso()
 
-    try:
+    with _rejection_recorder(
+        conn,
+        kind=kind,
+        actor=actor,
+        auth_via=auth_via,
+        request_id=request_id,
+        action="draft_creation_rejected",
+        occurred_at=timestamp,
+    ):
         conn.execute("BEGIN IMMEDIATE")
         state = _state_row(conn)
         active_id = int(state[3] if kind == PREFILTER_KIND else state[4])
         if int(state[1]) != expected_generation:
-            raise ConfigConflictError("configuration generation is stale")
+            raise _conflict(
+                "configuration generation is stale",
+                reason="stale_generation",
+                expected_generation=expected_generation,
+                generation=int(state[1]),
+            )
         if active_id != parent_revision_id:
-            raise ConfigConflictError("parent revision is not active")
+            raise _conflict(
+                "parent revision is not active",
+                reason="stale_parent",
+                expected_generation=expected_generation,
+                parent_revision_id=parent_revision_id,
+                active_revision_id=active_id,
+            )
         parent = _revision_row(conn, parent_revision_id)
         _validate_active_row(parent, kind)
         try:
@@ -422,9 +540,12 @@ def create_draft(
                 parent_revision_id=parent_revision_id,
             )
             if resumed is None:
-                raise ConfigConflictError(
-                    "an identical configuration revision already exists"
+                raise _conflict(
+                    "an identical configuration revision already exists",
+                    reason="duplicate_revision",
+                    expected_generation=expected_generation,
                 ) from exc
+            normalized_id = _normalized_revision_id(resumed)
             _insert_audit(
                 conn,
                 occurred_at=timestamp,
@@ -435,13 +556,26 @@ def create_draft(
                 kind=kind,
                 revision_id=int(resumed[0]),
                 from_revision_id=parent_revision_id,
+                to_revision_id=normalized_id,
                 detail={
                     "expected_generation": expected_generation,
                     "state": str(resumed[7]),
+                    "normalized": normalized_id is not None,
                 },
             )
             conn.commit()
-            return {"draft": _revision_metadata(resumed), "resumed": True}
+            return {
+                "draft": _revision_metadata(resumed),
+                "resumed": True,
+                # A resumed normalization input has already been validated: its
+                # canonical result is the revision the lifecycle will preview
+                # and activate through this same handle.
+                "validated_revision_id": (
+                    normalized_id
+                    if normalized_id is not None
+                    else (int(resumed[0]) if str(resumed[7]) == "validated" else None)
+                ),
+            }
         draft_id = int(cursor.lastrowid)
         _insert_audit(
             conn,
@@ -457,10 +591,36 @@ def create_draft(
         )
         row = _revision_row(conn, draft_id)
         conn.commit()
-        return {"draft": _revision_metadata(row), "resumed": False}
-    except Exception:
-        conn.rollback()
-        raise
+        return {
+            "draft": _revision_metadata(row),
+            "resumed": False,
+            "validated_revision_id": None,
+        }
+
+
+def _normalized_revision_id(row) -> int | None:
+    """Return the canonical revision one normalization input produced."""
+    if row is None or str(row[7]) != "superseded":
+        return None
+    validation = _decode_object(row[8], "validation result")
+    value = validation.get("normalized_revision_id")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _is_normalization_input(conn: sqlite3.Connection, row) -> bool:
+    """Report whether a superseded row is a draft that validation normalized.
+
+    Such a row was never active: it holds the operator's submitted bytes, which
+    canonicalization replaced. It remains a lifecycle handle, never a rollback
+    target, and its content need not be canonical.
+    """
+    normalized_id = _normalized_revision_id(row)
+    if normalized_id is None:
+        return False
+    normalized = _revision_row(conn, normalized_id)
+    return normalized is not None and normalized[1] == row[1]
 
 
 def _resumable_revision(
@@ -471,16 +631,23 @@ def _resumable_revision(
     document_json: str,
     parent_revision_id: int,
 ):
-    """Return an existing candidate this request may safely resume.
+    """Return an existing lifecycle handle this request may safely resume.
 
     Content digests are unique per kind, so an operator who loses editor state
     (reload, disconnect, new browser session) and resubmits the identical
-    document cannot create a second row. Returning the existing candidate is
-    safe only when it is still an unactivated candidate off the very parent the
-    caller named -- which the caller has already proven to be the active
-    revision under the expected generation. Every other state (a historical,
-    active, or rejected revision, or one raised from a different parent) stays a
-    conflict.
+    document cannot create a second row. Resuming is safe only for a handle that
+    is still unactivated and was raised against the very parent the caller named
+    -- which the caller has already proven to be the active revision under the
+    expected generation. Three shapes qualify:
+
+    * the `draft` or `validated` row itself;
+    * a `superseded` draft that validation normalized, whose canonical content
+      the preview and activation paths already resolve through its pointer;
+    * when the digest names canonical content that a normalized draft produced,
+      that draft, provided it hangs off the caller's parent.
+
+    A historical, active, or rejected revision, and any handle raised from a
+    different parent, stay conflicts.
     """
     row = conn.execute(
         """SELECT id, kind, revision, document_json, source,
@@ -496,11 +663,50 @@ def _resumable_revision(
         raise ConfigIntegrityError(
             "stored configuration revision content does not match its digest"
         )
-    if str(row[7]) not in {"draft", "validated"}:
-        return None
-    if row[5] is None or int(row[5]) != parent_revision_id:
-        return None
-    return row
+    own_parent = row[5] is not None and int(row[5]) == parent_revision_id
+    if own_parent:
+        if str(row[7]) in {"draft", "validated"}:
+            return row
+        if _is_normalization_input(conn, row):
+            return row
+    if str(row[7]) in {"validated", "superseded"}:
+        return _handle_for_canonical_revision(
+            conn,
+            kind=kind,
+            canonical_id=int(row[0]),
+            parent_revision_id=parent_revision_id,
+        )
+    return None
+
+
+def _handle_for_canonical_revision(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    canonical_id: int,
+    parent_revision_id: int,
+):
+    """Return the newest normalized draft off this parent naming that content.
+
+    Resubmitting the already canonical form of a normalized candidate collides
+    with the canonical row, whose own lineage may be historical. The submitted
+    draft that produced it is the handle that carries the caller's parent, so it
+    is the only safe thing to resume. The scan is bounded to the newest handles
+    raised against that parent.
+    """
+    rows = conn.execute(
+        """SELECT id, kind, revision, document_json, source,
+                  parent_revision_id, shipped_base_revision, state,
+                  validation_json, created_at, created_by, note
+           FROM operator_config_revisions
+           WHERE kind = ? AND parent_revision_id = ? AND state = 'superseded'
+           ORDER BY id DESC LIMIT ?""",
+        (kind, parent_revision_id, MAX_RESUME_HANDLE_SCAN),
+    ).fetchall()
+    for row in rows:
+        if _normalized_revision_id(row) == canonical_id:
+            return row
+    return None
 
 
 def validate_draft(
@@ -515,16 +721,43 @@ def validate_draft(
 ) -> dict[str, Any]:
     _require_kind(kind)
     timestamp = occurred_at or utc_now_iso()
-    try:
+    with _rejection_recorder(
+        conn,
+        kind=kind,
+        actor=actor,
+        auth_via=auth_via,
+        request_id=request_id,
+        action="draft_validation_refused",
+        revision_id=draft_id,
+        occurred_at=timestamp,
+    ):
         conn.execute("BEGIN IMMEDIATE")
         draft = _revision_row(conn, draft_id)
         if draft is None or draft[1] != kind:
             raise ConfigNotFoundError("configuration draft not found")
         # Revalidating an already validated candidate is idempotent: revision
         # content is immutable, so a resumed candidate re-derives the identical
-        # result instead of forcing the operator to mutate the document.
+        # result instead of forcing the operator to mutate the document. A draft
+        # that was already normalized is reported through its canonical result
+        # rather than revalidated, so a resumed handle stays usable.
+        if _is_normalization_input(conn, draft):
+            normalized = _revision_row(conn, _normalized_revision_id(draft))
+            payload = {
+                "draft_id": draft_id,
+                "validation": _decode_object(normalized[8], "validation result"),
+                "revision": _revision_metadata(normalized),
+                "candidate_parent_revision_id": (
+                    int(draft[5]) if draft[5] is not None else None
+                ),
+            }
+            conn.commit()
+            return payload
         if draft[7] not in {"draft", "validated"}:
-            raise ConfigConflictError("configuration revision is not a draft")
+            raise _conflict(
+                "configuration revision is not a draft",
+                reason="not_a_draft",
+                state=str(draft[7]),
+            )
         try:
             decoded = json.loads(str(draft[3]))
             canonical_document, validation = canonicalize_document(kind, decoded)
@@ -667,9 +900,20 @@ def validate_draft(
                 int(draft[5]) if draft[5] is not None else None
             ),
         }
-    except Exception:
-        conn.rollback()
-        raise
+
+
+@dataclass(frozen=True)
+class _CandidateLineage:
+    """What the submitted lifecycle handle was raised against.
+
+    Reused canonical content keeps its own immutable lineage, which may be
+    historical. Every guard that asks "what is this operator changing, and from
+    which shipped baseline" must read the submitted handle's lineage instead.
+    """
+
+    handle_revision_id: int
+    parent_revision_id: int | None
+    shipped_base_revision: str | None
 
 
 def _validated_candidate(conn: sqlite3.Connection, kind: str, draft_id: int):
@@ -679,33 +923,41 @@ def _validated_candidate(conn: sqlite3.Connection, kind: str, draft_id: int):
     revision, including an older superseded one. Revision content and digests
     never change, so the reused row keeps the lineage of whenever it was first
     written. The submitted draft is what was raised against the current active
-    revision, so its parent -- not the reused row's historical parent -- is the
-    relationship the rest of the lifecycle must enforce.
+    revision and the current shipped baseline, so its lineage -- not the reused
+    row's historical lineage -- is what the rest of the lifecycle must enforce.
     """
     row = _revision_row(conn, draft_id)
     if row is None or row[1] != kind:
         raise ConfigNotFoundError("configuration draft not found")
+    lineage = _CandidateLineage(
+        handle_revision_id=int(row[0]),
+        parent_revision_id=int(row[5]) if row[5] is not None else None,
+        shipped_base_revision=str(row[6]) if row[6] is not None else None,
+    )
     if row[7] == "validated":
-        return row, (int(row[5]) if row[5] is not None else None)
+        return row, lineage
     if row[7] == "superseded":
-        validation = _decode_object(row[8], "validation result")
-        normalized_id = validation.get("normalized_revision_id")
-        if isinstance(normalized_id, int) and not isinstance(normalized_id, bool):
+        normalized_id = _normalized_revision_id(row)
+        if normalized_id is not None:
             normalized = _revision_row(conn, normalized_id)
             if normalized is not None and normalized[1] == kind:
-                return normalized, (int(row[5]) if row[5] is not None else None)
-    raise ConfigConflictError("configuration draft has not produced a validated revision")
+                return normalized, lineage
+    raise _conflict(
+        "configuration draft has not produced a validated revision",
+        reason="unvalidated_candidate",
+        state=str(row[7]),
+    )
 
 
 def _validated_document(conn: sqlite3.Connection, kind: str, draft_id: int):
-    candidate, parent_revision_id = _validated_candidate(conn, kind, draft_id)
+    candidate, lineage = _validated_candidate(conn, kind, draft_id)
     document_json = str(candidate[3])
     try:
         validate_stored_revision(kind, document_json, str(candidate[2]))
         document = json.loads(document_json)
     except (OperatorConfigError, json.JSONDecodeError) as exc:
         raise ConfigIntegrityError(str(exc)) from exc
-    return candidate, document, parent_revision_id
+    return candidate, document, lineage
 
 
 def _active_document(conn: sqlite3.Connection, kind: str, state):
@@ -732,12 +984,30 @@ def _sample_rows(
     window_start: str,
     candidate_limit: int,
 ):
-    source_clause = "AND sensor.source_type = 'suricata'" if kind == PREFILTER_KIND else ""
-    return conn.execute(
-        f"""SELECT events.id, events.raw_alert, events.signature_id,
+    """Read one bounded preview sample: rows, window, and aggregate bytes.
+
+    Sensor context is joined outward on purpose. Rows retained before that table
+    existed have no companion row, and excluding them silently narrowed previews
+    to post-migration traffic; only records positively identified as another
+    sensor are excluded from a prefilter preview.
+
+    The row cap alone does not bound memory, because one retained alert may be
+    as large as the document limit. Rows are therefore consumed one at a time
+    and the sample stops at whichever bound is reached first, reporting the
+    truncation to the operator rather than silently narrowing the comparison.
+    """
+    source_clause = (
+        "AND (sensor.source_type IS NULL OR sensor.source_type = 'suricata')"
+        if kind == PREFILTER_KIND
+        else ""
+    )
+    # An asset preview compares addresses only, so it never reads alert bodies.
+    alert_column = "events.raw_alert" if kind == PREFILTER_KIND else "NULL"
+    cursor = conn.execute(
+        f"""SELECT events.id, {alert_column}, events.signature_id,
                    events.src_ip, events.dest_ip
             FROM triage_events AS events
-            JOIN sensor_event_context AS sensor
+            LEFT JOIN sensor_event_context AS sensor
               ON sensor.triage_event_id = events.id
             WHERE events.processed_at IS NOT NULL
               AND events.processed_at >= ?
@@ -745,7 +1015,26 @@ def _sample_rows(
             ORDER BY events.processed_at DESC, events.id DESC
             LIMIT ?""",
         (window_start, candidate_limit + 1),
-    ).fetchall()
+    )
+    rows = []
+    sampled_bytes = 0
+    truncated_by_rows = False
+    truncated_by_bytes = False
+    for row in cursor:
+        if len(rows) >= candidate_limit:
+            truncated_by_rows = True
+            break
+        alert = row[1]
+        if alert is not None:
+            sampled_bytes += len(str(alert).encode("utf-8"))
+            if sampled_bytes > MAX_PREVIEW_SAMPLE_BYTES and rows:
+                truncated_by_bytes = True
+                break
+        rows.append(row)
+        if sampled_bytes > MAX_PREVIEW_SAMPLE_BYTES:
+            truncated_by_bytes = True
+            break
+    return rows, truncated_by_rows or truncated_by_bytes, truncated_by_bytes
 
 
 def _prefilter_preview(
@@ -898,21 +1187,50 @@ def preview_draft(
     """Compare a validated candidate with active config over a bounded corpus."""
     _require_kind(kind)
     _preview_bounds(hours, candidate_limit)
-    state = _state_row(conn)
-    if int(state[1]) != expected_generation:
-        raise ConfigConflictError("configuration generation is stale")
-    candidate, candidate_document, _ = _validated_document(conn, kind, draft_id)
-    active, active_document = _active_document(conn, kind, state)
+    rejection = _rejection_recorder(
+        conn,
+        kind=kind,
+        actor=actor,
+        auth_via=auth_via,
+        request_id=request_id,
+        action="draft_preview_rejected",
+        revision_id=draft_id,
+        occurred_at=occurred_at,
+    )
+    with rejection:
+        state = _state_row(conn)
+        if int(state[1]) != expected_generation:
+            raise _conflict(
+                "configuration generation is stale",
+                reason="stale_generation",
+                expected_generation=expected_generation,
+                generation=int(state[1]),
+            )
+        candidate, candidate_document, lineage = _validated_document(
+            conn,
+            kind,
+            draft_id,
+        )
+        active, active_document = _active_document(conn, kind, state)
+        # Preview must describe the change the operator can actually activate.
+        # A candidate whose parent has been replaced is rejected before any
+        # sampling or audit, exactly as activation rejects it.
+        if lineage.parent_revision_id != int(active[0]):
+            raise _conflict(
+                "configuration draft parent is no longer active",
+                reason="stale_parent",
+                expected_generation=expected_generation,
+                parent_revision_id=lineage.parent_revision_id,
+                active_revision_id=int(active[0]),
+            )
     now = utc_now()
     window_start = format_utc_timestamp(now - timedelta(hours=hours))
-    sampled = _sample_rows(
+    sampled, truncated, truncated_by_bytes = _sample_rows(
         conn,
         kind=kind,
         window_start=window_start,
         candidate_limit=candidate_limit,
     )
-    truncated = len(sampled) > candidate_limit
-    sampled = sampled[:candidate_limit]
     if kind == PREFILTER_KIND:
         _, active_asset_document = _active_document(conn, ASSET_KIND, state)
         summary, warnings = _prefilter_preview(
@@ -927,12 +1245,19 @@ def preview_draft(
             candidate_document,
             sampled,
         )
+    if truncated_by_bytes:
+        warnings.append("preview sample reached its byte budget before its row limit")
     timestamp = occurred_at or utc_now_iso()
-    try:
+    with rejection:
         conn.execute("BEGIN IMMEDIATE")
         locked_state = _state_row(conn)
         if int(locked_state[1]) != expected_generation:
-            raise ConfigConflictError("configuration generation changed during preview")
+            raise _conflict(
+                "configuration generation changed during preview",
+                reason="stale_generation",
+                expected_generation=expected_generation,
+                generation=int(locked_state[1]),
+            )
         _insert_audit(
             conn,
             occurred_at=timestamp,
@@ -949,13 +1274,11 @@ def preview_draft(
                 "candidate_limit": candidate_limit,
                 "candidates_examined": len(sampled),
                 "truncated": truncated,
+                "truncated_by_bytes": truncated_by_bytes,
                 "warning_count": len(warnings),
             },
         )
         conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
     return {
         "generated_at": timestamp,
         "kind": kind,
@@ -989,29 +1312,51 @@ def activate_draft(
     """Atomically activate one validated draft and cut over legacy authority."""
     _require_kind(kind)
     timestamp = occurred_at or utc_now_iso()
-    try:
+    with _rejection_recorder(
+        conn,
+        kind=kind,
+        actor=actor,
+        auth_via=auth_via,
+        request_id=request_id,
+        action="revision_activation_rejected",
+        revision_id=draft_id,
+        occurred_at=timestamp,
+    ):
         conn.execute("BEGIN IMMEDIATE")
         state = _state_row(conn)
         if int(state[1]) != expected_generation:
-            raise ConfigConflictError("configuration generation is stale")
-        candidate, document, parent_revision_id = _validated_document(
-            conn,
-            kind,
-            draft_id,
-        )
+            raise _conflict(
+                "configuration generation is stale",
+                reason="stale_generation",
+                expected_generation=expected_generation,
+                generation=int(state[1]),
+            )
+        candidate, document, lineage = _validated_document(conn, kind, draft_id)
         active_id = int(state[3] if kind == PREFILTER_KIND else state[4])
         active = _revision_row(conn, active_id)
         _validate_active_row(active, kind)
         if int(candidate[0]) == active_id:
-            raise ConfigConflictError("configuration revision is already active")
-        if parent_revision_id != active_id:
-            raise ConfigConflictError("configuration draft parent is no longer active")
+            raise _conflict(
+                "configuration revision is already active",
+                reason="already_active",
+                expected_generation=expected_generation,
+                revision_id=active_id,
+            )
+        if lineage.parent_revision_id != active_id:
+            raise _conflict(
+                "configuration draft parent is no longer active",
+                reason="stale_parent",
+                expected_generation=expected_generation,
+                parent_revision_id=lineage.parent_revision_id,
+                active_revision_id=active_id,
+            )
         payload = _activate_revision_locked(
             conn,
             state=state,
             kind=kind,
             candidate=candidate,
             document=document,
+            shipped_base_revision=lineage.shipped_base_revision,
             expected_generation=expected_generation,
             acknowledge_broad_rules=acknowledge_broad_rules,
             acknowledge_shipped_base_change=acknowledge_shipped_base_change,
@@ -1023,9 +1368,6 @@ def activate_draft(
         )
         conn.commit()
         return payload
-    except Exception:
-        conn.rollback()
-        raise
 
 
 def _activate_revision_locked(
@@ -1035,6 +1377,7 @@ def _activate_revision_locked(
     kind: str,
     candidate,
     document: dict[str, Any],
+    shipped_base_revision: str | None,
     expected_generation: int,
     acknowledge_broad_rules: bool,
     acknowledge_shipped_base_change: bool,
@@ -1052,8 +1395,11 @@ def _activate_revision_locked(
         policy = PrefilterPolicy.from_document(document)
         broad_rule_count = sum(rule.match is None for rule in policy.rules)
         if broad_rule_count and not acknowledge_broad_rules:
-            raise ConfigConflictError(
-                "activation requires acknowledgement of unscoped rules"
+            raise _conflict(
+                "activation requires acknowledgement of unscoped rules",
+                reason="unacknowledged_broad_rules",
+                expected_generation=expected_generation,
+                broad_rule_count=broad_rule_count,
             )
         newest_shipped = conn.execute(
             """SELECT revisions.revision
@@ -1072,12 +1418,18 @@ def _activate_revision_locked(
             ).fetchone()
         if newest_shipped is None:
             raise ConfigIntegrityError("shipped prefilter baseline is missing")
+        # The submitted lifecycle's shipped baseline decides this guard. Reused
+        # canonical content may carry a much older baseline of its own, and
+        # honouring that would let a candidate raised against a superseded
+        # baseline activate without the operator ever acknowledging it.
         if (
-            candidate[6] != newest_shipped[0]
+            shipped_base_revision != newest_shipped[0]
             and not acknowledge_shipped_base_change
         ):
-            raise ConfigConflictError(
-                "activation requires acknowledgement of a shipped-base change"
+            raise _conflict(
+                "activation requires acknowledgement of a shipped-base change",
+                reason="unacknowledged_shipped_base_change",
+                expected_generation=expected_generation,
             )
     previous_prefilter = int(state[3])
     previous_asset = int(state[4])
@@ -1170,18 +1522,51 @@ def rollback_revision(
     """Reactivate one superseded revision through the guarded activation path."""
     _require_kind(kind)
     timestamp = occurred_at or utc_now_iso()
-    try:
+    with _rejection_recorder(
+        conn,
+        kind=kind,
+        actor=actor,
+        auth_via=auth_via,
+        request_id=request_id,
+        action="revision_rollback_rejected",
+        revision_id=revision_id,
+        occurred_at=timestamp,
+    ):
         conn.execute("BEGIN IMMEDIATE")
         state = _state_row(conn)
         if state[0] != "database":
-            raise ConfigConflictError("rollback requires database authority mode")
+            raise _conflict(
+                "rollback requires database authority mode",
+                reason="legacy_authority",
+                expected_generation=expected_generation,
+            )
         if int(state[1]) != expected_generation:
-            raise ConfigConflictError("configuration generation is stale")
+            raise _conflict(
+                "configuration generation is stale",
+                reason="stale_generation",
+                expected_generation=expected_generation,
+                generation=int(state[1]),
+            )
         candidate = _revision_row(conn, revision_id)
         if candidate is None or candidate[1] != kind:
             raise ConfigNotFoundError("configuration revision not found")
         if candidate[7] != "superseded":
-            raise ConfigConflictError("only a superseded revision can be rolled back")
+            raise _conflict(
+                "only a superseded revision can be rolled back",
+                reason="not_superseded",
+                expected_generation=expected_generation,
+                state=str(candidate[7]),
+            )
+        # A superseded row is not necessarily a previously active revision: a
+        # draft that validation normalized is retained in the same state, still
+        # holding the operator's pre-canonical bytes. It was never active, so it
+        # is refused here rather than failing later as stored-content corruption.
+        if _is_normalization_input(conn, candidate):
+            raise _conflict(
+                "a normalization input revision cannot be rolled back",
+                reason="normalization_input",
+                expected_generation=expected_generation,
+            )
         document_json = str(candidate[3])
         try:
             validate_stored_revision(kind, document_json, str(candidate[2]))
@@ -1194,6 +1579,9 @@ def rollback_revision(
             kind=kind,
             candidate=candidate,
             document=document,
+            shipped_base_revision=(
+                str(candidate[6]) if candidate[6] is not None else None
+            ),
             expected_generation=expected_generation,
             acknowledge_broad_rules=acknowledge_broad_rules,
             acknowledge_shipped_base_change=acknowledge_shipped_base_change,
@@ -1205,9 +1593,6 @@ def rollback_revision(
         )
         conn.commit()
         return payload
-    except Exception:
-        conn.rollback()
-        raise
 
 
 def _encode_id_cursor(row_id: int) -> str:

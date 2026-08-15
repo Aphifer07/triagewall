@@ -27,17 +27,22 @@ from triagewall.dashboard.api.auth import (
 )
 
 
-def prefilter_document(*, signature_id: int = 1001, protocol: str = "tcp"):
+def prefilter_document(
+    *,
+    signature_id: int = 1001,
+    protocol: str = "tcp",
+    scoped: bool = True,
+):
+    rule = {
+        "signature_ids": [signature_id],
+        "reason": f"Reviewed rule {signature_id}",
+    }
+    if scoped:
+        rule["match"] = {"protocols": [protocol]}
     return {
         "version": 1,
         "internal_cidrs": ["10.0.0.0/24"],
-        "auto_false_positive": [
-            {
-                "signature_ids": [signature_id],
-                "reason": f"Reviewed rule {signature_id}",
-                "match": {"protocols": [protocol]},
-            }
-        ],
+        "auto_false_positive": [rule],
     }
 
 
@@ -578,6 +583,236 @@ class ConfigApiTests(unittest.TestCase):
                 sort_keys=True,
                 separators=(",", ":"),
             ),)],
+        )
+
+    def test_canonical_reuse_still_requires_shipped_base_acknowledgement(self):
+        # Discover a newer shipped baseline, which lands as its own revision
+        # carrying that new baseline.
+        self.write(self.packaged, prefilter_document(signature_id=3003))
+        operator_config.bootstrap_operator_configuration(
+            self.db_path,
+            packaged_prefilter_path=self.packaged,
+            legacy_prefilter_path=self.legacy,
+            asset_inventory_path=self.assets,
+        )
+        summary = self.summary()
+        self.assertEqual(
+            summary["active"]["prefilter_policy"]["shipped_base_revision"],
+            operator_config.load_revision(
+                operator_config.PREFILTER_KIND,
+                self.legacy,
+                "shipped",
+            ).revision,
+        )
+
+        # This draft is raised against the older baseline but canonicalizes onto
+        # the row that was imported with the newer one.
+        created = self.create_draft(
+            prefilter_document(signature_id=3003, protocol="TCP")
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        draft_id = created.json()["draft"]["id"]
+        validated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        self.assertEqual(validated.status_code, 200, validated.text)
+        reused = validated.json()["revision"]
+        self.assertNotEqual(reused["id"], draft_id)
+        self.assertNotEqual(
+            reused["shipped_base_revision"],
+            created.json()["draft"]["shipped_base_revision"],
+        )
+
+        missing_ack = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.config_headers,
+            json={"expected_generation": summary["generation"]},
+        )
+
+        self.assertEqual(missing_ack.status_code, 409, missing_ack.text)
+        self.assertIn("shipped-base change", missing_ack.text)
+        self.assertEqual(self.summary()["generation"], summary["generation"])
+        rejected = self.db_rows(
+            """SELECT detail_json FROM operator_config_audit
+               WHERE action = 'revision_activation_rejected'
+               ORDER BY id DESC LIMIT 1"""
+        )
+        self.assertEqual(
+            json.loads(rejected[0][0])["reason"],
+            "unacknowledged_shipped_base_change",
+        )
+
+        acknowledged = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.config_headers,
+            json={
+                "expected_generation": summary["generation"],
+                "acknowledge_shipped_base_change": True,
+            },
+        )
+        self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
+        self.assertEqual(acknowledged.json()["revision"]["id"], reused["id"])
+
+    def test_normalized_draft_resumes_after_losing_the_draft_handle(self):
+        self.activate(prefilter_document(signature_id=2002))
+        self.activate(prefilter_document(signature_id=3003))
+        noncanonical = prefilter_document(signature_id=2002, protocol="TCP")
+        created = self.create_draft(noncanonical)
+        draft_id = created.json()["draft"]["id"]
+        validated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        self.assertEqual(validated.status_code, 200, validated.text)
+        canonical_id = validated.json()["revision"]["id"]
+
+        # The editor loses the draft handle and the operator resubmits, first
+        # the identical noncanonical document, then its canonical form.
+        resumed = self.create_draft(noncanonical)
+        resumed_canonical = self.create_draft(prefilter_document(signature_id=2002))
+
+        for response in (resumed, resumed_canonical):
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["resumed"])
+            self.assertEqual(response.json()["draft"]["id"], draft_id)
+            self.assertEqual(response.json()["validated_revision_id"], canonical_id)
+
+        generation = self.summary()["generation"]
+        revalidated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        self.assertEqual(revalidated.status_code, 200, revalidated.text)
+        self.assertEqual(revalidated.json()["revision"]["id"], canonical_id)
+        previewed = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+            headers=self.config_headers,
+            json={"expected_generation": generation},
+        )
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.config_headers,
+            json={
+                "expected_generation": generation,
+                "acknowledge_shipped_base_change": True,
+            },
+        )
+
+        self.assertEqual(previewed.status_code, 200, previewed.text)
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(activated.json()["generation"], generation + 1)
+        self.assertEqual(
+            self.summary()["active"]["prefilter_policy"]["id"], canonical_id
+        )
+        self.assertEqual(
+            self.db_rows(
+                """SELECT COUNT(*) FROM operator_config_revisions
+                   WHERE kind = 'prefilter_policy' AND revision = ?""",
+                (created.json()["draft"]["revision"],),
+            ),
+            [(1,)],
+        )
+
+    def test_normalization_input_is_not_a_rollback_target(self):
+        self.activate(prefilter_document(signature_id=2002))
+        created = self.create_draft(
+            prefilter_document(signature_id=3003, protocol="TCP")
+        )
+        draft_id = created.json()["draft"]["id"]
+        self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        listed = self.client.get(
+            "/api/v1/config/prefilter_policy/revisions?state=superseded",
+            headers=self.config_headers,
+        )
+        self.assertEqual(listed.status_code, 200)
+        normalization_inputs = [
+            revision
+            for revision in listed.json()["revisions"]
+            if revision["validation"].get("normalized_revision_id") is not None
+        ]
+        self.assertEqual([revision["id"] for revision in normalization_inputs], [draft_id])
+
+        response = self.client.post(
+            f"/api/v1/config/prefilter_policy/revisions/{draft_id}/rollback",
+            headers=self.config_headers,
+            json={"expected_generation": self.summary()["generation"]},
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("normalization input", response.text)
+        self.assertEqual(
+            json.loads(
+                self.db_rows(
+                    """SELECT detail_json FROM operator_config_audit
+                       WHERE action = 'revision_rollback_rejected'
+                       ORDER BY id DESC LIMIT 1"""
+                )[0][0]
+            )["reason"],
+            "normalization_input",
+        )
+
+    def test_refused_mutations_leave_attributable_audit_evidence(self):
+        summary = self.summary()
+        stale = self.client.post(
+            "/api/v1/config/prefilter_policy/drafts",
+            headers={**self.config_headers, "X-Request-ID": "stale-generation"},
+            json={
+                "document": prefilter_document(signature_id=2002),
+                "parent_revision_id": summary["active"]["prefilter_policy"]["id"],
+                "expected_generation": 99,
+            },
+        )
+        self.assertEqual(stale.status_code, 409)
+
+        created = self.create_draft(prefilter_document(signature_id=4004, scoped=False))
+        draft_id = created.json()["draft"]["id"]
+        self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.config_headers,
+        )
+        missing_ack = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers={**self.config_headers, "X-Request-ID": "missing-ack"},
+            json={"expected_generation": summary["generation"]},
+        )
+        self.assertEqual(missing_ack.status_code, 409)
+
+        rejections = self.db_rows(
+            """SELECT action, actor, auth_via, request_id, detail_json
+               FROM operator_config_audit
+               WHERE action IN (
+                   'draft_creation_rejected', 'revision_activation_rejected'
+               ) ORDER BY id"""
+        )
+        self.assertEqual(
+            [row[0] for row in rejections],
+            ["draft_creation_rejected", "revision_activation_rejected"],
+        )
+        for row in rejections:
+            self.assertEqual(row[1], "config-operator")
+            self.assertEqual(row[2], "api_key")
+            self.assertNotIn("Reviewed rule", row[4])
+            self.assertNotIn(self.config_key, row[4])
+        self.assertEqual(rejections[0][3], "stale-generation")
+        self.assertEqual(rejections[1][3], "missing-ack")
+        self.assertEqual(
+            json.loads(rejections[0][4])["reason"], "stale_generation"
+        )
+        self.assertEqual(
+            json.loads(rejections[1][4])["reason"], "unacknowledged_broad_rules"
+        )
+        # Evidence survives the rollback of the refused mutation itself.
+        self.assertEqual(self.summary()["generation"], summary["generation"])
+        self.assertEqual(
+            self.db_rows(
+                """SELECT COUNT(*) FROM operator_config_revisions
+                   WHERE kind = 'prefilter_policy' AND state = 'active'"""
+            ),
+            [(1,)],
         )
 
     def test_canonicalized_candidate_off_a_stale_parent_cannot_activate(self):

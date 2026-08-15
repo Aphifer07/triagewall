@@ -193,13 +193,16 @@ def start_configuration_owner(
     the durable record truthful for every consumer start, and publishing the
     exact objects that synchronization validated means one read of each mount
     backs both the durable revision and the runtime bundle. Under `database`
-    authority no mount is read at all.
+    authority no file is read at all: recording a changed packaged default
+    belongs to the one-shot bootstrap, and a consumer must be able to start from
+    a valid durable bundle on a host that installs no packaged default.
     """
     snapshot = synchronize_legacy_configuration(
         db_path or DB_PATH,
         packaged_prefilter_path=packaged_prefilter_path(),
         legacy_prefilter_path=PREFILTER_CONFIG_PATH,
         asset_inventory_path=configured_inventory_path(),
+        discover_shipped_baseline=False,
     )
     log.info(
         "Configuration authority: mode=%s generation=%s",

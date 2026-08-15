@@ -154,7 +154,16 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         self.assertEqual(validated.json()["validation"]["status"], "valid")
         return draft_id, validated.json()["revision"]["id"], summary
 
-    def add_event(self, event_id, signature_id, src_ip, dest_ip, *, source="suricata"):
+    def add_event(
+        self,
+        event_id,
+        signature_id,
+        src_ip,
+        dest_ip,
+        *,
+        source="suricata",
+        padding=0,
+    ):
         raw = {
             "event_type": "alert",
             "timestamp": utc_now_iso(),
@@ -163,6 +172,8 @@ class ConfigPreviewActivationTests(unittest.TestCase):
             "proto": "TCP",
             "alert": {"signature_id": signature_id, "signature": f"SID {signature_id}"},
         }
+        if padding:
+            raw["payload_printable"] = "x" * padding
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(
@@ -180,11 +191,12 @@ class ConfigPreviewActivationTests(unittest.TestCase):
                     utc_now_iso(),
                 ),
             )
-            conn.execute(
-                """INSERT INTO sensor_event_context
-                   (triage_event_id, source_type) VALUES (?, ?)""",
-                (cursor.lastrowid, source),
-            )
+            if source is not None:
+                conn.execute(
+                    """INSERT INTO sensor_event_context
+                       (triage_event_id, source_type) VALUES (?, ?)""",
+                    (cursor.lastrowid, source),
+                )
             conn.commit()
             return int(cursor.lastrowid)
         finally:
@@ -252,6 +264,133 @@ class ConfigPreviewActivationTests(unittest.TestCase):
             conn.close()
         self.assertEqual(audit[:4], ("operator", "api_key", "slice-3-test", "draft_previewed"))
         self.assertNotIn("Reviewed rule", audit[4])
+
+    def test_preview_includes_migrated_events_without_sensor_context(self):
+        migrated = self.add_event(1, 1001, "10.0.0.1", "198.51.100.1", source=None)
+        self.add_event(2, 1001, "10.0.0.9", "198.51.100.9", source="wazuh")
+        draft_id, _, summary = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+
+        response = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+            headers=self.headers,
+            json={"expected_generation": summary["generation"], "candidate_limit": 20},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        # The migrated Suricata row is compared; the Wazuh row is still excluded.
+        self.assertEqual(payload["candidates_examined"], 1)
+        self.assertEqual(payload["summary"]["counts"]["no_longer_suppressed"], 1)
+        self.assertEqual(payload["summary"]["affected_event_ids"], [migrated])
+
+    def test_asset_preview_includes_migrated_events_and_reads_no_alert_bodies(self):
+        migrated = self.add_event(
+            1, 5001, "10.0.0.1", "10.0.0.2", source=None, padding=2048
+        )
+        draft_id, _, summary = self.create_validate(
+            "asset_inventory",
+            asset_document(asset("firewall", "10.0.0.1")),
+        )
+
+        with patch.object(
+            config_repository,
+            "MAX_PREVIEW_SAMPLE_BYTES",
+            1,
+        ):
+            response = self.client.post(
+                f"/api/v1/config/asset_inventory/drafts/{draft_id}/preview",
+                headers=self.headers,
+                json={"expected_generation": summary["generation"], "candidate_limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        # No alert body is selected for an asset preview, so the byte budget is
+        # never consumed and the migrated row is still examined.
+        self.assertEqual(payload["candidates_examined"], 1)
+        self.assertFalse(payload["truncated"])
+        self.assertEqual(payload["summary"]["affected_event_ids"], [migrated])
+
+    def test_prefilter_preview_stops_at_the_sample_byte_budget(self):
+        for index in range(4):
+            self.add_event(
+                index + 1,
+                1001,
+                f"10.0.0.{index + 1}",
+                "198.51.100.5",
+                padding=4096,
+            )
+        draft_id, _, summary = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+
+        with patch.object(config_repository, "MAX_PREVIEW_SAMPLE_BYTES", 6_000):
+            response = self.client.post(
+                f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+                headers=self.headers,
+                json={"expected_generation": summary["generation"], "candidate_limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertLess(payload["candidates_examined"], 4)
+        self.assertGreaterEqual(payload["candidates_examined"], 1)
+        self.assertTrue(payload["truncated"])
+        self.assertIn(
+            "preview sample reached its byte budget before its row limit",
+            payload["warnings"],
+        )
+        detail = json.loads(
+            self.db_rows(
+                """SELECT detail_json FROM operator_config_audit
+                   WHERE action = 'draft_previewed' ORDER BY id DESC LIMIT 1"""
+            )[0][0]
+        )
+        self.assertTrue(detail["truncated_by_bytes"])
+
+    def test_preview_refuses_a_candidate_whose_parent_is_no_longer_active(self):
+        draft_id, _, summary = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+        other_draft, _, _ = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(3003)),
+        )
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{other_draft}/activate",
+            headers=self.headers,
+            json={"expected_generation": summary["generation"]},
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+
+        response = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+            headers=self.headers,
+            json={"expected_generation": self.summary()["generation"]},
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("parent is no longer active", response.text)
+        # Refused before sampling, so no preview event is recorded for it.
+        self.assertEqual(
+            self.db_rows(
+                """SELECT COUNT(*) FROM operator_config_audit
+                   WHERE action = 'draft_previewed' AND revision_id = ?""",
+                (draft_id,),
+            ),
+            [(0,)],
+        )
+        rejection = self.db_rows(
+            """SELECT revision_id, detail_json FROM operator_config_audit
+               WHERE action = 'draft_preview_rejected' ORDER BY id DESC LIMIT 1"""
+        )
+        self.assertEqual(rejection[0][0], draft_id)
+        self.assertEqual(json.loads(rejection[0][1])["reason"], "stale_parent")
 
     def test_asset_preview_reports_address_context_changes(self):
         changed_event = self.add_event(

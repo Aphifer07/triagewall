@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -271,6 +272,65 @@ class OperatorConfigBootstrapTests(unittest.TestCase):
             ),
             [(snapshot.result.active_prefilter_revision,)],
         )
+
+    def test_mounted_documents_are_read_inside_the_write_transaction(self):
+        """Ordering proof: no authoritative read happens before the lock."""
+        events = []
+        real_connect = operator_config.connect_database
+        real_read = operator_config._read_json_document
+
+        def recording_connect(path, **kwargs):
+            connection = real_connect(path, **kwargs)
+            events.append("connect")
+
+            def trace(statement):
+                if str(statement).strip().upper().startswith("BEGIN IMMEDIATE"):
+                    events.append("begin_immediate")
+
+            connection.set_trace_callback(trace)
+            return connection
+
+        def recording_read(path, label):
+            events.append(f"read:{label}")
+            return real_read(path, label)
+
+        with unittest.mock.patch.object(
+            operator_config, "connect_database", recording_connect
+        ), unittest.mock.patch.object(
+            operator_config, "_read_json_document", recording_read
+        ):
+            self.bootstrap()
+
+        self.assertIn("begin_immediate", events)
+        self.assertTrue([event for event in events if event.startswith("read:")])
+        first_read = min(
+            index for index, event in enumerate(events) if event.startswith("read:")
+        )
+        self.assertLess(events.index("begin_immediate"), first_read)
+
+    def test_a_stale_synchronizer_cannot_reactivate_an_older_mount(self):
+        self.bootstrap()
+
+        # A observes P1 and commits it, the mount becomes P2, B synchronizes it,
+        # and A then resumes: A must re-read under the lock, never resurrect P1.
+        first = self.bootstrap()
+        self.write(self.legacy, prefilter_document(signature_id=2002))
+        second = self.bootstrap()
+        resumed = self.bootstrap()
+
+        self.assertEqual(first.generation, 1)
+        self.assertEqual(second.generation, 2)
+        self.assertEqual(resumed.generation, 2)
+        self.assertEqual(
+            resumed.active_prefilter_revision,
+            second.active_prefilter_revision,
+        )
+        active = self.rows(
+            """SELECT document_json FROM operator_config_revisions
+               WHERE kind = 'prefilter_policy' AND state = 'active'"""
+        )
+        self.assertEqual(len(active), 1)
+        self.assertIn("2002", active[0][0])
 
     def test_database_mode_synchronization_reads_no_mounted_document(self):
         self.bootstrap()

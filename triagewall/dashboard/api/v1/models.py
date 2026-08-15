@@ -420,6 +420,7 @@ class ConfigDraftResponse(BaseModel):
 
     draft: ConfigRevisionMetadata
     resumed: bool = False
+    validated_revision_id: int | None = None
 
 
 class ConfigValidationResponse(BaseModel):
