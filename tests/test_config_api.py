@@ -215,6 +215,8 @@ class ConfigApiTests(unittest.TestCase):
             ("/api/v1/config/{kind}/revisions/{revision_id}", "get"),
             ("/api/v1/config/{kind}/drafts", "post"),
             ("/api/v1/config/{kind}/drafts/{draft_id}/validate", "post"),
+            ("/api/v1/config/{kind}/drafts/{draft_id}/preview", "post"),
+            ("/api/v1/config/{kind}/drafts/{draft_id}/activate", "post"),
             ("/api/v1/config/audit", "get"),
         ):
             with self.subTest(path=path):

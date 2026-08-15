@@ -63,6 +63,15 @@ class ActiveState:
     active_asset_revision: str
 
 
+@dataclass(frozen=True)
+class DecisionBundle:
+    """Exact durable configuration tuple used for one classification."""
+
+    generation: int
+    prefilter_revision: str
+    asset_revision: str
+
+
 def _read_json_document(path: Path | str, label: str) -> Any:
     target = Path(path)
     try:
@@ -279,6 +288,53 @@ def _read_existing_state(conn: sqlite3.Connection) -> ActiveState | None:
         active_asset_id=int(row[1]),
         active_prefilter_revision=prefilter_revision,
         active_asset_revision=asset_revision,
+    )
+
+
+def load_decision_bundle(
+    conn: sqlite3.Connection,
+    *,
+    effective_prefilter_document: Any,
+    effective_asset_revision: str,
+) -> DecisionBundle:
+    """Resolve and verify the durable bundle represented by loaded runtime data.
+
+    Slice 3 still runs consumers from legacy-mounted files. Refuse database mode
+    until the hot-reload cutover in Slice 4, and refuse any legacy/database
+    mismatch so an event can never be stamped with provenance it did not use.
+    """
+    state = _read_existing_state(conn)
+    if state is None:
+        raise OperatorConfigError("active operator configuration state is missing")
+    if state.mode != "legacy":
+        raise OperatorConfigError(
+            "database configuration mode requires generation-aware consumers"
+        )
+    try:
+        canonical_prefilter, validation = canonicalize_document(
+            PREFILTER_KIND,
+            effective_prefilter_document,
+        )
+    except (TypeError, ValueError) as exc:
+        raise OperatorConfigError("effective prefilter policy is invalid") from exc
+    effective_prefilter = _revision(
+        PREFILTER_KIND,
+        "operator",
+        canonical_prefilter,
+        validation,
+    ).revision
+    if effective_prefilter != state.active_prefilter_revision:
+        raise OperatorConfigError(
+            "loaded prefilter policy does not match the active durable revision"
+        )
+    if effective_asset_revision != state.active_asset_revision:
+        raise OperatorConfigError(
+            "loaded asset inventory does not match the active durable revision"
+        )
+    return DecisionBundle(
+        generation=state.generation,
+        prefilter_revision=state.active_prefilter_revision,
+        asset_revision=state.active_asset_revision,
     )
 
 

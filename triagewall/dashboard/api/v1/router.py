@@ -15,9 +15,13 @@ from triagewall.dashboard.api import services
 from triagewall.dashboard.api.v1.models import (
     ActiveConfigResponse,
     ConfigAuditResponse,
+    ConfigActivationRequest,
+    ConfigActivationResponse,
     ConfigDraftRequest,
     ConfigDraftResponse,
     ConfigKind,
+    ConfigPreviewRequest,
+    ConfigPreviewResponse,
     ConfigRevisionState,
     ConfigRevisionResponse,
     ConfigRevisionsResponse,
@@ -534,6 +538,73 @@ def create_v1_router(
             request,
             payload,
             model=ConfigValidationResponse,
+            max_age=0,
+            no_store=True,
+        )
+
+    @router.post(
+        "/config/{kind}/drafts/{draft_id}/preview",
+        response_model=ConfigPreviewResponse,
+    )
+    def preview_config_draft(
+        request: Request,
+        kind: ConfigKind,
+        draft_id: int,
+        body: ConfigPreviewRequest,
+        auth_ctx: AuthContext = Depends(require_config_mutation),
+    ):
+        try:
+            with db_factory() as conn:
+                payload = config_repository.preview_draft(
+                    conn,
+                    kind=kind,
+                    draft_id=draft_id,
+                    expected_generation=body.expected_generation,
+                    hours=body.hours,
+                    candidate_limit=body.candidate_limit,
+                    actor=auth_ctx.principal,
+                    auth_via=auth_ctx.via,
+                    request_id=request_id(request),
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigPreviewResponse,
+            max_age=0,
+            no_store=True,
+        )
+
+    @router.post(
+        "/config/{kind}/drafts/{draft_id}/activate",
+        response_model=ConfigActivationResponse,
+    )
+    def activate_config_draft(
+        request: Request,
+        kind: ConfigKind,
+        draft_id: int,
+        body: ConfigActivationRequest,
+        auth_ctx: AuthContext = Depends(require_config_mutation),
+    ):
+        try:
+            with db_factory() as conn:
+                payload = config_repository.activate_draft(
+                    conn,
+                    kind=kind,
+                    draft_id=draft_id,
+                    expected_generation=body.expected_generation,
+                    acknowledge_broad_rules=body.acknowledge_broad_rules,
+                    actor=auth_ctx.principal,
+                    auth_via=auth_ctx.via,
+                    request_id=request_id(request),
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigActivationResponse,
             max_age=0,
             no_store=True,
         )

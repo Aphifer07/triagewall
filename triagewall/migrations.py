@@ -132,11 +132,20 @@ def ensure_db_initialized(db_path: str | Path) -> None:
                 for column_name in (
                     "src_asset_snapshot_id",
                     "dest_asset_snapshot_id",
+                    "config_generation",
+                    "prefilter_revision",
+                    "asset_revision",
                 ):
                     if column_name not in event_columns:
+                        column_type = (
+                            "INTEGER"
+                            if column_name.endswith("_id")
+                            or column_name == "config_generation"
+                            else "TEXT"
+                        )
                         conn.execute(
                             f"ALTER TABLE triage_events "
-                            f"ADD COLUMN {column_name} INTEGER"
+                            f"ADD COLUMN {column_name} {column_type}"
                         )
 
             failure_table_exists = conn.execute(
@@ -239,6 +248,9 @@ def verify_db_initialized(db_path: str | Path) -> None:
     missing_columns = {
         "src_asset_snapshot_id",
         "dest_asset_snapshot_id",
+        "config_generation",
+        "prefilter_revision",
+        "asset_revision",
     } - event_columns
     if "source_type" not in failure_columns:
         missing_columns.add("ingest_failures.source_type")

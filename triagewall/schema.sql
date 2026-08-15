@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS triage_events (
     processed_at TEXT,
     src_asset_snapshot_id INTEGER,
     dest_asset_snapshot_id INTEGER,
+    config_generation INTEGER,
+    prefilter_revision TEXT,
+    asset_revision TEXT,
     
     -- Human feedback
     human_verdict TEXT,

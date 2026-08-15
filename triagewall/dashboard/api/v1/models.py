@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from triagewall import config_repository
 from triagewall.config_repository import MAX_NOTE_LENGTH
 from triagewall.dashboard.api.services import MAX_FEEDBACK_NOTES_LENGTH
 
@@ -409,6 +410,59 @@ class ConfigValidationResponse(BaseModel):
 
     draft_id: int
     validation: dict[str, Any]
+    revision: ConfigRevisionMetadata
+
+
+class ConfigPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_generation: int = Field(gt=0, strict=True)
+    hours: int = Field(
+        default=config_repository.DEFAULT_PREVIEW_HOURS,
+        ge=1,
+        le=config_repository.MAX_PREVIEW_HOURS,
+        strict=True,
+    )
+    candidate_limit: int = Field(
+        default=config_repository.DEFAULT_PREVIEW_CANDIDATES,
+        ge=1,
+        le=config_repository.MAX_PREVIEW_CANDIDATES,
+        strict=True,
+    )
+
+
+class ConfigPreviewResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    kind: ConfigKind
+    draft_id: int
+    candidate_revision_id: int
+    active_revision_id: int
+    generation: int
+    window_hours: int
+    window_start: str
+    candidate_limit: int
+    candidates_examined: int
+    truncated: bool
+    summary: dict[str, Any]
+    warnings: list[str]
+
+
+class ConfigActivationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_generation: int = Field(gt=0, strict=True)
+    acknowledge_broad_rules: bool = False
+
+
+class ConfigActivationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    activated_at: str
+    kind: ConfigKind
+    generation: int
+    previous_revision_id: int
     revision: ConfigRevisionMetadata
 
 

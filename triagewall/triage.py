@@ -379,6 +379,7 @@ def insert_triage_row(
     alert: dict | SensorEvent,
     verdict: dict,
     asset_context=None,
+    config_bundle=None,
 ) -> None:
     """Insert one alert + its verdict into triage_events."""
     event = (
@@ -398,8 +399,9 @@ def insert_triage_row(
             timestamp, flow_id, src_ip, src_port, dest_ip, dest_port, proto,
             in_iface, pkt_src, signature_id, signature, category, severity, action,
             raw_alert, verdict, confidence, reasoning, model_used, processed_at,
-            src_asset_snapshot_id, dest_asset_snapshot_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            src_asset_snapshot_id, dest_asset_snapshot_id, config_generation,
+            prefilter_revision, asset_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             format_utc_timestamp(event.timestamp),
             event.flow_id,
@@ -423,6 +425,9 @@ def insert_triage_row(
             utc_now_iso(),
             src_asset_snapshot_id,
             dest_asset_snapshot_id,
+            config_bundle.generation if config_bundle is not None else None,
+            config_bundle.prefilter_revision if config_bundle is not None else None,
+            config_bundle.asset_revision if config_bundle is not None else None,
         ),
     )
     conn.execute(

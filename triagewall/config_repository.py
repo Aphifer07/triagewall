@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import sqlite3
+from datetime import timedelta
 from typing import Any
 
 try:
-    from .asset_inventory import canonical_json
+    from .asset_inventory import AssetInventory, canonical_json
     from .operator_config import (
         ASSET_KIND,
         CONFIG_KINDS,
@@ -18,10 +20,10 @@ try:
         canonicalize_document,
         validate_stored_revision,
     )
-    from .prefilter import MAX_CONFIG_BYTES
-    from .time_utils import utc_now_iso
+    from .prefilter import MAX_CONFIG_BYTES, PrefilterPolicy
+    from .time_utils import format_utc_timestamp, utc_now, utc_now_iso
 except ImportError:  # Direct script-style imports used by container entrypoints.
-    from asset_inventory import canonical_json
+    from asset_inventory import AssetInventory, canonical_json
     from operator_config import (
         ASSET_KIND,
         CONFIG_KINDS,
@@ -30,8 +32,8 @@ except ImportError:  # Direct script-style imports used by container entrypoints
         canonicalize_document,
         validate_stored_revision,
     )
-    from prefilter import MAX_CONFIG_BYTES
-    from time_utils import utc_now_iso
+    from prefilter import MAX_CONFIG_BYTES, PrefilterPolicy
+    from time_utils import format_utc_timestamp, utc_now, utc_now_iso
 
 
 MAX_NOTE_LENGTH = 2_000
@@ -41,6 +43,12 @@ MAX_AUDIT_LIMIT = 100
 MAX_CONFIG_CURSOR_LENGTH = 512
 DEFAULT_REVISION_LIMIT = 50
 MAX_REVISION_LIMIT = 100
+DEFAULT_PREVIEW_HOURS = 24
+MAX_PREVIEW_HOURS = 168
+DEFAULT_PREVIEW_CANDIDATES = 500
+MAX_PREVIEW_CANDIDATES = 2_000
+MAX_PREVIEW_EXAMPLES = 10
+MAX_PREVIEW_SIGNATURES = 100
 
 
 class ConfigRepositoryError(RuntimeError):
@@ -532,6 +540,411 @@ def validate_draft(
             "draft_id": draft_id,
             "validation": validation,
             "revision": _revision_metadata(validated),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _validated_candidate(conn: sqlite3.Connection, kind: str, draft_id: int):
+    row = _revision_row(conn, draft_id)
+    if row is None or row[1] != kind:
+        raise ConfigNotFoundError("configuration draft not found")
+    if row[7] == "validated":
+        return row
+    if row[7] == "superseded":
+        validation = _decode_object(row[8], "validation result")
+        normalized_id = validation.get("normalized_revision_id")
+        if isinstance(normalized_id, int) and not isinstance(normalized_id, bool):
+            normalized = _revision_row(conn, normalized_id)
+            if normalized is not None and normalized[1] == kind:
+                return normalized
+    raise ConfigConflictError("configuration draft has not produced a validated revision")
+
+
+def _validated_document(conn: sqlite3.Connection, kind: str, draft_id: int):
+    candidate = _validated_candidate(conn, kind, draft_id)
+    document_json = str(candidate[3])
+    try:
+        validate_stored_revision(kind, document_json, str(candidate[2]))
+        document = json.loads(document_json)
+    except (OperatorConfigError, json.JSONDecodeError) as exc:
+        raise ConfigIntegrityError(str(exc)) from exc
+    return candidate, document
+
+
+def _active_document(conn: sqlite3.Connection, kind: str, state):
+    revision_id = int(state[3] if kind == PREFILTER_KIND else state[4])
+    row = _revision_row(conn, revision_id)
+    _validate_active_row(row, kind)
+    try:
+        return row, json.loads(str(row[3]))
+    except json.JSONDecodeError as exc:
+        raise ConfigIntegrityError(f"stored {kind} document is invalid JSON") from exc
+
+
+def _preview_bounds(hours: int, candidate_limit: int) -> None:
+    if not 1 <= hours <= MAX_PREVIEW_HOURS:
+        raise ConfigRepositoryError("preview hours is out of range")
+    if not 1 <= candidate_limit <= MAX_PREVIEW_CANDIDATES:
+        raise ConfigRepositoryError("preview candidate limit is out of range")
+
+
+def _sample_rows(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    window_start: str,
+    candidate_limit: int,
+):
+    source_clause = "AND sensor.source_type = 'suricata'" if kind == PREFILTER_KIND else ""
+    return conn.execute(
+        f"""SELECT events.id, events.raw_alert, events.signature_id,
+                   events.src_ip, events.dest_ip
+            FROM triage_events AS events
+            JOIN sensor_event_context AS sensor
+              ON sensor.triage_event_id = events.id
+            WHERE events.processed_at IS NOT NULL
+              AND events.processed_at >= ?
+              {source_clause}
+            ORDER BY events.processed_at DESC, events.id DESC
+            LIMIT ?""",
+        (window_start, candidate_limit + 1),
+    ).fetchall()
+
+
+def _prefilter_preview(
+    active_document,
+    candidate_document,
+    active_asset_document,
+    rows,
+):
+    active = PrefilterPolicy.from_document(active_document)
+    candidate = PrefilterPolicy.from_document(candidate_document)
+    active_assets = AssetInventory.from_document(active_asset_document)
+    counts = {
+        "newly_suppressed": 0,
+        "no_longer_suppressed": 0,
+        "unchanged_suppressed": 0,
+        "unchanged_unsuppressed": 0,
+        "skipped_invalid_records": 0,
+    }
+    affected_ids: list[int] = []
+    affected_signatures: set[int] = set()
+    matched_rule_indexes: set[int] = set()
+    for row in rows:
+        try:
+            alert = json.loads(str(row[1]))
+        except json.JSONDecodeError:
+            counts["skipped_invalid_records"] += 1
+            continue
+        if not isinstance(alert, dict):
+            counts["skipped_invalid_records"] += 1
+            continue
+        asset_context = active_assets.resolve_alert(alert)
+        active_match = active.match_reason(alert, asset_context) is not None
+        candidate_match = candidate.match_reason(alert, asset_context) is not None
+        sid = alert.get("alert", {}).get("signature_id")
+        if isinstance(sid, int) and not isinstance(sid, bool):
+            for index, rule in enumerate(candidate.rules):
+                if sid not in rule.signature_ids:
+                    continue
+                if rule.match is None or rule.match.matches(
+                    alert,
+                    asset_context,
+                    candidate.internal_cidrs,
+                ):
+                    matched_rule_indexes.add(index)
+        if not active_match and candidate_match:
+            bucket = "newly_suppressed"
+        elif active_match and not candidate_match:
+            bucket = "no_longer_suppressed"
+        elif active_match:
+            bucket = "unchanged_suppressed"
+        else:
+            bucket = "unchanged_unsuppressed"
+        counts[bucket] += 1
+        if active_match != candidate_match:
+            if len(affected_ids) < MAX_PREVIEW_EXAMPLES:
+                affected_ids.append(int(row[0]))
+            if (
+                isinstance(row[2], int)
+                and len(affected_signatures) < MAX_PREVIEW_SIGNATURES
+            ):
+                affected_signatures.add(int(row[2]))
+    broad = [index for index, rule in enumerate(candidate.rules) if rule.match is None]
+    unmatched = [
+        index for index in range(len(candidate.rules)) if index not in matched_rule_indexes
+    ]
+    warnings = []
+    if broad:
+        warnings.append("candidate contains unscoped signature-only rules")
+    if unmatched:
+        warnings.append("candidate contains rules with no matches in the sample")
+    return {
+        "counts": counts,
+        "affected_event_ids": affected_ids,
+        "affected_signature_ids": sorted(affected_signatures),
+        "broad_rule_indexes": broad,
+        "unmatched_rule_indexes": unmatched,
+    }, warnings
+
+
+def _asset_value(inventory: AssetInventory, address: str):
+    snapshot = inventory.resolve(address)
+    if snapshot is None:
+        return None
+    return {key: value for key, value in snapshot.items() if key != "inventory_revision"}
+
+
+def _asset_preview(active_document, candidate_document, rows):
+    active = AssetInventory.from_document(active_document)
+    candidate = AssetInventory.from_document(candidate_document)
+    addresses: dict[str, list[int]] = {}
+    skipped = 0
+    for row in rows:
+        for value in (row[3], row[4]):
+            if value is None:
+                continue
+            try:
+                normalized = str(ipaddress.ip_address(str(value)))
+            except ValueError:
+                skipped += 1
+                continue
+            addresses.setdefault(normalized, []).append(int(row[0]))
+    counts = {
+        "newly_matched_addresses": 0,
+        "no_longer_matched_addresses": 0,
+        "changed_context_addresses": 0,
+        "unchanged_addresses": 0,
+        "skipped_invalid_addresses": skipped,
+    }
+    affected_addresses: list[str] = []
+    affected_event_ids: list[int] = []
+    for address in sorted(addresses, key=lambda value: (ipaddress.ip_address(value).version, int(ipaddress.ip_address(value)))):
+        before = _asset_value(active, address)
+        after = _asset_value(candidate, address)
+        if before is None and after is not None:
+            bucket = "newly_matched_addresses"
+        elif before is not None and after is None:
+            bucket = "no_longer_matched_addresses"
+        elif before != after:
+            bucket = "changed_context_addresses"
+        else:
+            bucket = "unchanged_addresses"
+        counts[bucket] += 1
+        if before != after:
+            if len(affected_addresses) < MAX_PREVIEW_EXAMPLES:
+                affected_addresses.append(address)
+            for event_id in addresses[address]:
+                if event_id not in affected_event_ids and len(affected_event_ids) < MAX_PREVIEW_EXAMPLES:
+                    affected_event_ids.append(event_id)
+    return {
+        "counts": counts,
+        "unique_addresses_examined": len(addresses),
+        "affected_addresses": affected_addresses,
+        "affected_event_ids": affected_event_ids,
+    }, []
+
+
+def preview_draft(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    draft_id: int,
+    expected_generation: int,
+    hours: int,
+    candidate_limit: int,
+    actor: str,
+    auth_via: str,
+    request_id: str | None,
+    occurred_at: str | None = None,
+) -> dict[str, Any]:
+    """Compare a validated candidate with active config over a bounded corpus."""
+    _require_kind(kind)
+    _preview_bounds(hours, candidate_limit)
+    state = _state_row(conn)
+    if int(state[1]) != expected_generation:
+        raise ConfigConflictError("configuration generation is stale")
+    candidate, candidate_document = _validated_document(conn, kind, draft_id)
+    active, active_document = _active_document(conn, kind, state)
+    now = utc_now()
+    window_start = format_utc_timestamp(now - timedelta(hours=hours))
+    sampled = _sample_rows(
+        conn,
+        kind=kind,
+        window_start=window_start,
+        candidate_limit=candidate_limit,
+    )
+    truncated = len(sampled) > candidate_limit
+    sampled = sampled[:candidate_limit]
+    if kind == PREFILTER_KIND:
+        _, active_asset_document = _active_document(conn, ASSET_KIND, state)
+        summary, warnings = _prefilter_preview(
+            active_document,
+            candidate_document,
+            active_asset_document,
+            sampled,
+        )
+    else:
+        summary, warnings = _asset_preview(
+            active_document,
+            candidate_document,
+            sampled,
+        )
+    timestamp = occurred_at or utc_now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        locked_state = _state_row(conn)
+        if int(locked_state[1]) != expected_generation:
+            raise ConfigConflictError("configuration generation changed during preview")
+        _insert_audit(
+            conn,
+            occurred_at=timestamp,
+            actor=actor,
+            auth_via=auth_via,
+            request_id=request_id,
+            action="draft_previewed",
+            kind=kind,
+            revision_id=draft_id,
+            from_revision_id=int(active[0]),
+            to_revision_id=int(candidate[0]),
+            detail={
+                "expected_generation": expected_generation,
+                "candidate_limit": candidate_limit,
+                "candidates_examined": len(sampled),
+                "truncated": truncated,
+                "warning_count": len(warnings),
+            },
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "generated_at": timestamp,
+        "kind": kind,
+        "draft_id": draft_id,
+        "candidate_revision_id": int(candidate[0]),
+        "active_revision_id": int(active[0]),
+        "generation": expected_generation,
+        "window_hours": hours,
+        "window_start": window_start,
+        "candidate_limit": candidate_limit,
+        "candidates_examined": len(sampled),
+        "truncated": truncated,
+        "summary": summary,
+        "warnings": warnings,
+    }
+
+
+def activate_draft(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    draft_id: int,
+    expected_generation: int,
+    acknowledge_broad_rules: bool,
+    actor: str,
+    auth_via: str,
+    request_id: str | None,
+    occurred_at: str | None = None,
+) -> dict[str, Any]:
+    """Atomically activate one validated revision in database authority mode."""
+    _require_kind(kind)
+    timestamp = occurred_at or utc_now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        state = _state_row(conn)
+        if state[0] != "database":
+            raise ConfigConflictError(
+                "activation is unavailable until database-mode consumers are ready"
+            )
+        if int(state[1]) != expected_generation:
+            raise ConfigConflictError("configuration generation is stale")
+        candidate, document = _validated_document(conn, kind, draft_id)
+        active_id = int(state[3] if kind == PREFILTER_KIND else state[4])
+        if int(candidate[0]) == active_id:
+            raise ConfigConflictError("configuration revision is already active")
+        if candidate[5] != active_id:
+            raise ConfigConflictError("configuration draft parent is no longer active")
+        broad_rule_count = 0
+        if kind == PREFILTER_KIND:
+            policy = PrefilterPolicy.from_document(document)
+            broad_rule_count = sum(rule.match is None for rule in policy.rules)
+            if broad_rule_count and not acknowledge_broad_rules:
+                raise ConfigConflictError(
+                    "activation requires acknowledgement of unscoped rules"
+                )
+        previous_prefilter = int(state[3])
+        previous_asset = int(state[4])
+        conn.execute(
+            "UPDATE operator_config_revisions SET state = 'superseded' WHERE id = ?",
+            (active_id,),
+        )
+        conn.execute(
+            "UPDATE operator_config_revisions SET state = 'active' WHERE id = ?",
+            (int(candidate[0]),),
+        )
+        next_generation = expected_generation + 1
+        if kind == PREFILTER_KIND:
+            conn.execute(
+                """UPDATE operator_config_state
+                   SET active_prefilter_revision_id = ?,
+                       previous_prefilter_revision_id = ?,
+                       previous_asset_revision_id = ?,
+                       generation = ?, updated_at = ?
+                   WHERE id = 1""",
+                (
+                    int(candidate[0]),
+                    previous_prefilter,
+                    previous_asset,
+                    next_generation,
+                    timestamp,
+                ),
+            )
+        else:
+            conn.execute(
+                """UPDATE operator_config_state
+                   SET active_asset_revision_id = ?,
+                       previous_prefilter_revision_id = ?,
+                       previous_asset_revision_id = ?,
+                       generation = ?, updated_at = ?
+                   WHERE id = 1""",
+                (
+                    int(candidate[0]),
+                    previous_prefilter,
+                    previous_asset,
+                    next_generation,
+                    timestamp,
+                ),
+            )
+        _insert_audit(
+            conn,
+            occurred_at=timestamp,
+            actor=actor,
+            auth_via=auth_via,
+            request_id=request_id,
+            action="revision_activated",
+            kind=kind,
+            revision_id=int(candidate[0]),
+            from_revision_id=active_id,
+            to_revision_id=int(candidate[0]),
+            detail={
+                "expected_generation": expected_generation,
+                "generation": next_generation,
+                "broad_rule_count": broad_rule_count,
+                "broad_rules_acknowledged": acknowledge_broad_rules,
+            },
+        )
+        conn.commit()
+        activated = _revision_row(conn, int(candidate[0]))
+        return {
+            "activated_at": timestamp,
+            "kind": kind,
+            "generation": next_generation,
+            "previous_revision_id": active_id,
+            "revision": _revision_metadata(activated),
         }
     except Exception:
         conn.rollback()

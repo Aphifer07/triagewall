@@ -282,11 +282,33 @@ document, validation preserves the submitted draft and creates a canonical
 `validated` child. Neither operation activates configuration or changes the
 bundle generation.
 
+`POST /api/v1/config/{kind}/drafts/{id}/preview` accepts
+`expected_generation`, a capped time window, and a candidate limit up to
+2,000. It compares only the newest eligible events, reports the examined count
+and whether the sample was truncated, never calls Ollama, and never changes
+verdicts or checkpoints. Prefilter previews report suppression deltas,
+bounded event/signature examples, unmatched rules, and unscoped-rule warnings.
+Asset previews report exact-IP match and context changes with bounded examples.
+
+`POST /api/v1/config/{kind}/drafts/{id}/activate` requires the current
+`expected_generation`. Prefilter candidates containing signature-only rules
+also require `acknowledge_broad_rules=true`. Activation revalidates stored
+content under `BEGIN IMMEDIATE`, checks the draft parent is still active, moves
+the old and new revision states, updates both previous-bundle pointers, and
+increments generation in one transaction. While the deployment remains in
+`legacy` authority mode the endpoint returns `409`; the Slice 4 runtime cutover
+will enable database-mode activation only when consumers can reload safely.
+
 `GET /api/v1/config/audit` returns newest-first audit records with `limit`
 (1–100, default 50), optional `kind`, and an opaque `cursor`. Audit details are
 bounded lifecycle metadata and never contain configuration documents or API
 keys. All configuration responses use `Cache-Control: private, no-store` and
 emit no ETag.
+
+New verdict rows also store `config_generation`, `prefilter_revision`, and
+`asset_revision`. Both ingest adapters verify at startup that their loaded
+legacy files match the durable active bundle before they classify an event;
+database mode remains fail-closed until the runtime cutover is delivered.
 
 ### `GET /api/v1/timeline`
 

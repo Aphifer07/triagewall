@@ -73,6 +73,12 @@ def create_legacy_database_without_asset_columns(db_path: Path) -> None:
         "",
     )
     schema_sql = schema_sql.replace(
+        "    config_generation INTEGER,\n"
+        "    prefilter_revision TEXT,\n"
+        "    asset_revision TEXT,\n",
+        "",
+    )
+    schema_sql = schema_sql.replace(
         "    source_type TEXT NOT NULL DEFAULT 'suricata',\n",
         "",
     )
@@ -174,6 +180,9 @@ class DatabaseStartupTests(unittest.TestCase):
 
             self.assertIn("src_asset_snapshot_id", columns)
             self.assertIn("dest_asset_snapshot_id", columns)
+            self.assertIn("config_generation", columns)
+            self.assertIn("prefilter_revision", columns)
+            self.assertIn("asset_revision", columns)
             self.assertEqual(historical, (None, None))
             self.assertEqual(snapshot_table, ("asset_snapshots",))
             self.assertEqual(sensor_table, ("sensor_event_context",))
@@ -302,6 +311,9 @@ class DatabaseStartupTests(unittest.TestCase):
 
             self.assertNotIn("src_asset_snapshot_id", columns)
             self.assertNotIn("dest_asset_snapshot_id", columns)
+            self.assertNotIn("config_generation", columns)
+            self.assertNotIn("prefilter_revision", columns)
+            self.assertNotIn("asset_revision", columns)
 
     def test_compose_assigns_one_migration_owner_before_consumers(self):
         base = (PROJECT_ROOT / "docker-compose.yml").read_text()

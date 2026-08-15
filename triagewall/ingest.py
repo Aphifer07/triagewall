@@ -28,6 +28,7 @@ from pathlib import Path
 from database import connect_database
 from environment import parse_boolean
 from migrations import verify_db_initialized
+from operator_config import load_decision_bundle
 from time_utils import format_utc_timestamp, utc_now_iso
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -61,7 +62,14 @@ _load_dotenv(override=False)
 
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
-from triage import call_ollama, get_asset_context, insert_triage_row, MODEL
+from triage import (
+    ASSET_INVENTORY,
+    MODEL,
+    PREFILTER_POLICY,
+    call_ollama,
+    get_asset_context,
+    insert_triage_row,
+)
 from sensor_event import (
     SuricataValidationError,
     normalize_suricata_event,
@@ -151,6 +159,9 @@ class IngestCheckpointError(EveCheckpointError):
 
 # Graceful shutdown
 _stop = False
+RUNTIME_CONFIG_BUNDLE = None
+
+
 def _handle_signal(signum, frame):
     global _stop
     _stop = True
@@ -574,6 +585,7 @@ def insert_with_retry(
     event,
     verdict,
     asset_context=None,
+    config_bundle=None,
     max_retries=3,
     base_backoff_ms=100,
 ):
@@ -588,6 +600,7 @@ def insert_with_retry(
                 event,
                 verdict,
                 asset_context=asset_context,
+                config_bundle=config_bundle,
             )
             conn.commit()
             return True
@@ -663,11 +676,14 @@ def process_line(conn, line):
             classification_event,
             asset_context=asset_context,
         )
+        insert_kwargs = {"asset_context": asset_context}
+        if RUNTIME_CONFIG_BUNDLE is not None:
+            insert_kwargs["config_bundle"] = RUNTIME_CONFIG_BUNDLE
         if not insert_with_retry(
             conn,
             normalized_event,
             verdict,
-            asset_context=asset_context,
+            **insert_kwargs,
         ):
             log.error(
                 f"Failed to persist alert ({sig}); retrying without advancing checkpoint"
@@ -701,6 +717,7 @@ def process_line(conn, line):
 
 
 def demo_loop():
+    global RUNTIME_CONFIG_BUNDLE
     fixtures_path = Path(__file__).parent.parent / "tests" / "fixtures" / "diverse_alerts.json"
     if not fixtures_path.exists():
         log.error(f"Demo fixtures not found at {fixtures_path}")
@@ -723,6 +740,11 @@ def demo_loop():
     conn = connect_database(DB_PATH)
 
     try:
+        RUNTIME_CONFIG_BUNDLE = load_decision_bundle(
+            conn,
+            effective_prefilter_document=PREFILTER_POLICY.to_document(),
+            effective_asset_revision=ASSET_INVENTORY.revision,
+        )
         while not _stop:
             for line in demo_lines:
                 if _stop:
@@ -730,11 +752,13 @@ def demo_loop():
                 process_line(conn, line)
                 time.sleep(random.uniform(2, 8))
     finally:
+        RUNTIME_CONFIG_BUNDLE = None
         conn.close()
 
 
 def tail_file():
     """Main loop: poll the file, process new lines."""
+    global RUNTIME_CONFIG_BUNDLE
     if EVE_PATH.is_dir():
         log.error(f"{EVE_PATH} is a directory, not a file.")
         log.error("Either:")
@@ -763,6 +787,11 @@ def tail_file():
             return None
 
     try:
+        RUNTIME_CONFIG_BUNDLE = load_decision_bundle(
+            conn,
+            effective_prefilter_document=PREFILTER_POLICY.to_document(),
+            effective_asset_revision=ASSET_INVENTORY.revision,
+        )
         while not _stop:
             try:
                 # Warn if we haven't seen new eve.json lines recently (rate-limited).
@@ -953,6 +982,7 @@ def tail_file():
                 log.error(f"Loop error: {type(e).__name__}: {e}")
                 time.sleep(POLL_INTERVAL)
     finally:
+        RUNTIME_CONFIG_BUNDLE = None
         conn.close()
         log.info("Ingest daemon stopped cleanly")
 

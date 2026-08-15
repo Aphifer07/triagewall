@@ -344,11 +344,14 @@ Status: implemented.
 
 ### Slice 3 — preview and activation
 
+Status: implemented, with authority cutover intentionally held for Slice 4.
+
 - Add bounded prefilter and asset previews.
 - Add generation-based conflict handling and atomic activation.
-- Switch the singleton from `legacy` to `database` authority only through the
-  guarded activation path once both ingest consumers support durable bundles.
-- Persist decision bundle provenance.
+- The guarded activation primitive succeeds only in `database` mode. It cannot
+  switch a legacy deployment early; the mode cutover remains coupled to the
+  generation-aware reload owner in Slice 4.
+- Persist and startup-verify decision bundle provenance for both sensor paths.
 
 ### Slice 4 — hot reload and rollback
 
