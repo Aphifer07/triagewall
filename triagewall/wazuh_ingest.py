@@ -26,13 +26,14 @@ from ingest import (
     quarantine_line,
 )
 from migrations import verify_db_initialized
-from operator_config import OperatorConfigError, load_decision_bundle
+from operator_config import ConfigurationBundleOwner, OperatorConfigError
 from triage import (
     ASSET_INVENTORY,
     MODEL,
     PREFILTER_POLICY,
     call_ollama_wazuh,
     get_asset_context,
+    set_configuration_bundle_owner,
 )
 from wazuh_event import (
     WazuhValidationError,
@@ -69,7 +70,15 @@ logging.basicConfig(
 log = logging.getLogger("wazuh-ingest")
 
 _stop = False
-RUNTIME_CONFIG_BUNDLE = None
+RUNTIME_CONFIG_OWNER = None
+
+CONFIG_RELOAD_INTERVAL_SECONDS = float(
+    os.environ.get("TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS", "5")
+)
+if not 1 <= CONFIG_RELOAD_INTERVAL_SECONDS <= 300:
+    raise RuntimeError(
+        "TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS must be from 1 to 300"
+    )
 
 
 class WazuhCheckpointError(RuntimeError):
@@ -290,6 +299,8 @@ def is_duplicate(conn, event) -> bool:
 
 
 def process_wazuh_record(conn, raw: bytes):
+    if RUNTIME_CONFIG_OWNER is not None:
+        RUNTIME_CONFIG_OWNER.maybe_reload(conn)
     try:
         text = raw.rstrip(b"\r\n").decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -331,8 +342,8 @@ def process_wazuh_record(conn, raw: bytes):
             asset_context=asset_context,
         )
         insert_kwargs = {"asset_context": asset_context}
-        if RUNTIME_CONFIG_BUNDLE is not None:
-            insert_kwargs["config_bundle"] = RUNTIME_CONFIG_BUNDLE
+        if RUNTIME_CONFIG_OWNER is not None:
+            insert_kwargs["config_bundle"] = RUNTIME_CONFIG_OWNER.bundle
         if not insert_with_retry(
             conn,
             event,
@@ -540,7 +551,7 @@ def process_available(conn, state: dict) -> StreamResult:
 
 
 def tail_wazuh() -> int:
-    global RUNTIME_CONFIG_BUNDLE
+    global RUNTIME_CONFIG_OWNER
     try:
         validate_config()
         verify_db_initialized(DB_PATH)
@@ -565,11 +576,14 @@ def tail_wazuh() -> int:
     conn = connect_database(DB_PATH)
     try:
         try:
-            RUNTIME_CONFIG_BUNDLE = load_decision_bundle(
-                conn,
-                effective_prefilter_document=PREFILTER_POLICY.to_document(),
-                effective_asset_revision=ASSET_INVENTORY.revision,
+            RUNTIME_CONFIG_OWNER = ConfigurationBundleOwner(
+                consumer="wazuh",
+                legacy_prefilter_policy=PREFILTER_POLICY,
+                legacy_asset_inventory=ASSET_INVENTORY,
+                reload_interval_seconds=CONFIG_RELOAD_INTERVAL_SECONDS,
             )
+            RUNTIME_CONFIG_OWNER.start(conn)
+            set_configuration_bundle_owner(RUNTIME_CONFIG_OWNER)
         except (OperatorConfigError, sqlite3.Error) as exc:
             log.critical("Wazuh ingest configuration startup failed: %s", exc)
             return 1
@@ -598,7 +612,8 @@ def tail_wazuh() -> int:
                 )
             time.sleep(POLL_INTERVAL)
     finally:
-        RUNTIME_CONFIG_BUNDLE = None
+        set_configuration_bundle_owner(None)
+        RUNTIME_CONFIG_OWNER = None
         conn.close()
     log.info("Wazuh ingest stopped cleanly")
     return 0

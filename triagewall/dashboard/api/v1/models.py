@@ -347,11 +347,27 @@ class ConfigRevisionMetadata(BaseModel):
     note: str | None = None
 
 
+class ConfigConsumerReloadStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    consumer: Literal["suricata", "wazuh"]
+    loaded_generation: int
+    desired_generation: int
+    status: Literal["ok", "error"]
+    prefilter_revision: str
+    asset_revision: str
+    loaded_at: str
+    checked_at: str
+    status_age_seconds: int
+    last_error: str | None = None
+
+
 class ConfigReloadStatus(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     supported: bool
     desired_generation: int
+    consumers: list[ConfigConsumerReloadStatus]
 
 
 class ConfigSummaryResponse(BaseModel):
@@ -454,6 +470,7 @@ class ConfigActivationRequest(BaseModel):
 
     expected_generation: int = Field(gt=0, strict=True)
     acknowledge_broad_rules: bool = False
+    acknowledge_shipped_base_change: bool = False
 
 
 class ConfigActivationResponse(BaseModel):
@@ -463,6 +480,7 @@ class ConfigActivationResponse(BaseModel):
     kind: ConfigKind
     generation: int
     previous_revision_id: int
+    authority_cutover: bool
     revision: ConfigRevisionMetadata
 
 

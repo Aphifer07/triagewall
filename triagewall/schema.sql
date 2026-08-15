@@ -167,3 +167,17 @@ CREATE TABLE IF NOT EXISTS operator_config_audit (
 
 CREATE INDEX IF NOT EXISTS idx_operator_config_audit_occurred
 ON operator_config_audit(occurred_at, id);
+
+-- Cross-process reload health. Each consumer owns exactly one bounded status
+-- row; configuration content and sensor data are never stored here.
+CREATE TABLE IF NOT EXISTS operator_config_consumers (
+    consumer TEXT PRIMARY KEY CHECK (consumer IN ('suricata', 'wazuh')),
+    loaded_generation INTEGER NOT NULL CHECK (loaded_generation >= 1),
+    desired_generation INTEGER NOT NULL CHECK (desired_generation >= 1),
+    status TEXT NOT NULL CHECK (status IN ('ok', 'error')),
+    prefilter_revision TEXT NOT NULL,
+    asset_revision TEXT NOT NULL,
+    loaded_at TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    last_error TEXT CHECK (last_error IS NULL OR length(last_error) <= 512)
+);

@@ -251,8 +251,11 @@ policy, so every endpoint below requires an `X-API-Key` carrying
 Demo mode rejects configuration access even when such a key is supplied.
 
 `GET /api/v1/config` returns the active revision metadata for both kinds,
-bundle generation, compatibility mode, revision counts, and truthful reload
-support. `GET /api/v1/config/{kind}` returns the active canonical document for
+bundle generation, compatibility mode, revision counts, and per-consumer
+reload health. Health includes each consumer's desired and loaded generation,
+loaded revision pair, status age, and a bounded generic error. A missing Wazuh
+row means the optional Wazuh ingest has not started; it is not synthesized as
+healthy. `GET /api/v1/config/{kind}` returns the active canonical document for
 `prefilter_policy` or `asset_inventory`. `GET /api/v1/config/{kind}/revisions`
 lists newest-first revision metadata without documents; it accepts `state`,
 `limit` (1–100), and an opaque `cursor`. The per-revision endpoint,
@@ -296,8 +299,15 @@ also require `acknowledge_broad_rules=true`. Activation revalidates stored
 content under `BEGIN IMMEDIATE`, checks the draft parent is still active, moves
 the old and new revision states, updates both previous-bundle pointers, and
 increments generation in one transaction. While the deployment remains in
-`legacy` authority mode the endpoint returns `409`; the Slice 4 runtime cutover
-will enable database-mode activation only when consumers can reload safely.
+`legacy` authority mode, the first successful activation atomically changes
+authority to `database`; both ingest processes observe the new complete bundle
+between records. A candidate based on an older packaged prefilter baseline also
+requires `acknowledge_shipped_base_change=true`.
+
+`POST /api/v1/config/{kind}/revisions/{id}/rollback` reactivates a superseded
+revision through the same validation, acknowledgement, optimistic-generation,
+transaction, audit, and runtime-reload path. Rollback creates a new bundle
+generation; it never rewrites revision content or restores files.
 
 `GET /api/v1/config/audit` returns newest-first audit records with `limit`
 (1–100, default 50), optional `kind`, and an opaque `cursor`. Audit details are
@@ -306,9 +316,11 @@ keys. All configuration responses use `Cache-Control: private, no-store` and
 emit no ETag.
 
 New verdict rows also store `config_generation`, `prefilter_revision`, and
-`asset_revision`. Both ingest adapters verify at startup that their loaded
-legacy files match the durable active bundle before they classify an event;
-database mode remains fail-closed until the runtime cutover is delivered.
+`asset_revision`. Both ingest adapters load both documents as one immutable
+bundle and verify legacy mounts while authority remains `legacy`. In `database`
+mode, mounts are ignored. Startup fails closed without a valid complete bundle;
+a later reload failure retains the last-known-good bundle, reports degraded
+health, records bounded audit evidence, and retries with bounded backoff.
 
 ### `GET /api/v1/timeline`
 

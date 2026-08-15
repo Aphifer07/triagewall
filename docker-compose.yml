@@ -66,6 +66,7 @@ services:
       EVE_PATH: ${EVE_PATH:-/var/log/suricata/eve.json}
       POSITION_PATH: ${POSITION_PATH:-/var/lib/triagewall/position.json}
       POLL_INTERVAL: ${POLL_INTERVAL:-10}
+      TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS: ${TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS:-5}
 
       OLLAMA_HOST: ${OLLAMA_HOST:-http://localhost:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M}

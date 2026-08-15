@@ -196,7 +196,8 @@ class ConfigApiTests(unittest.TestCase):
         self.assertEqual(summary["mode"], "legacy")
         self.assertEqual(summary["generation"], 1)
         self.assertTrue(summary["writes_enabled"])
-        self.assertFalse(summary["reload"]["supported"])
+        self.assertTrue(summary["reload"]["supported"])
+        self.assertEqual(summary["reload"]["consumers"], [])
         self.assertEqual(asset_response.status_code, 200)
         self.assertEqual(asset_response.headers["cache-control"], "private, no-store")
         self.assertEqual(
@@ -217,6 +218,7 @@ class ConfigApiTests(unittest.TestCase):
             ("/api/v1/config/{kind}/drafts/{draft_id}/validate", "post"),
             ("/api/v1/config/{kind}/drafts/{draft_id}/preview", "post"),
             ("/api/v1/config/{kind}/drafts/{draft_id}/activate", "post"),
+            ("/api/v1/config/{kind}/revisions/{revision_id}/rollback", "post"),
             ("/api/v1/config/audit", "get"),
         ):
             with self.subTest(path=path):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -64,12 +65,23 @@ class ActiveState:
 
 
 @dataclass(frozen=True)
-class DecisionBundle:
-    """Exact durable configuration tuple used for one classification."""
+class ConfigurationBundle:
+    """One complete, immutable runtime configuration generation."""
 
     generation: int
+    mode: str
+    prefilter_policy: PrefilterPolicy
     prefilter_revision: str
+    prefilter_shipped_base_revision: str | None
+    asset_inventory: AssetInventory
     asset_revision: str
+    asset_shipped_base_revision: str | None
+    loaded_at: str
+
+
+RUNTIME_CONSUMERS = frozenset({"suricata", "wazuh"})
+DEFAULT_RELOAD_INTERVAL_SECONDS = 5.0
+MAX_RELOAD_BACKOFF_SECONDS = 60.0
 
 
 def _read_json_document(path: Path | str, label: str) -> Any:
@@ -228,6 +240,8 @@ def _audit(
     revision_id: int | None = None,
     to_revision_id: int | None = None,
     detail: dict[str, Any] | None = None,
+    actor: str = SYSTEM_ACTOR,
+    auth_via: str = SYSTEM_AUTH_VIA,
 ) -> None:
     conn.execute(
         """INSERT INTO operator_config_audit (
@@ -239,8 +253,8 @@ def _audit(
             kind,
             revision_id,
             to_revision_id,
-            SYSTEM_ACTOR,
-            SYSTEM_AUTH_VIA,
+            actor,
+            auth_via,
             action,
             canonical_json(detail or {}),
         ),
@@ -291,51 +305,319 @@ def _read_existing_state(conn: sqlite3.Connection) -> ActiveState | None:
     )
 
 
-def load_decision_bundle(
+def _runtime_revision_row(
+    conn: sqlite3.Connection,
+    revision_id: int,
+    expected_kind: str,
+):
+    row = conn.execute(
+        """SELECT id, kind, revision, document_json, shipped_base_revision,
+                  state
+           FROM operator_config_revisions WHERE id = ?""",
+        (revision_id,),
+    ).fetchone()
+    if row is None:
+        raise OperatorConfigError(f"active {expected_kind} revision is missing")
+    if row[1] != expected_kind or row[5] != "active":
+        raise OperatorConfigError(f"active {expected_kind} pointer is inconsistent")
+    validate_stored_revision(expected_kind, str(row[3]), str(row[2]))
+    return row
+
+
+def load_configuration_bundle(
     conn: sqlite3.Connection,
     *,
-    effective_prefilter_document: Any,
-    effective_asset_revision: str,
-) -> DecisionBundle:
-    """Resolve and verify the durable bundle represented by loaded runtime data.
-
-    Slice 3 still runs consumers from legacy-mounted files. Refuse database mode
-    until the hot-reload cutover in Slice 4, and refuse any legacy/database
-    mismatch so an event can never be stamped with provenance it did not use.
-    """
-    state = _read_existing_state(conn)
-    if state is None:
-        raise OperatorConfigError("active operator configuration state is missing")
-    if state.mode != "legacy":
+    legacy_prefilter_policy: PrefilterPolicy,
+    legacy_asset_inventory: AssetInventory,
+    loaded_at: str | None = None,
+) -> ConfigurationBundle:
+    """Read, validate, and construct both active documents from one snapshot."""
+    if conn.in_transaction:
         raise OperatorConfigError(
-            "database configuration mode requires generation-aware consumers"
+            "runtime configuration must be loaded between database transactions"
         )
     try:
-        canonical_prefilter, validation = canonicalize_document(
+        conn.execute("BEGIN")
+        state = conn.execute(
+            """SELECT mode, generation, active_prefilter_revision_id,
+                      active_asset_revision_id
+               FROM operator_config_state WHERE id = 1"""
+        ).fetchone()
+        if state is None:
+            raise OperatorConfigError("active operator configuration state is missing")
+        mode = str(state[0])
+        if mode not in {"legacy", "database"}:
+            raise OperatorConfigError("active operator configuration mode is invalid")
+        prefilter_row = _runtime_revision_row(
+            conn,
+            int(state[2]),
             PREFILTER_KIND,
-            effective_prefilter_document,
         )
-    except (TypeError, ValueError) as exc:
-        raise OperatorConfigError("effective prefilter policy is invalid") from exc
-    effective_prefilter = _revision(
-        PREFILTER_KIND,
-        "operator",
-        canonical_prefilter,
-        validation,
-    ).revision
-    if effective_prefilter != state.active_prefilter_revision:
-        raise OperatorConfigError(
-            "loaded prefilter policy does not match the active durable revision"
+        asset_row = _runtime_revision_row(
+            conn,
+            int(state[3]),
+            ASSET_KIND,
         )
-    if effective_asset_revision != state.active_asset_revision:
-        raise OperatorConfigError(
-            "loaded asset inventory does not match the active durable revision"
+        if mode == "legacy":
+            effective_prefilter = _revision(
+                PREFILTER_KIND,
+                "operator",
+                legacy_prefilter_policy.to_document(),
+                canonicalize_document(
+                    PREFILTER_KIND,
+                    legacy_prefilter_policy.to_document(),
+                )[1],
+            ).revision
+            if effective_prefilter != prefilter_row[2]:
+                raise OperatorConfigError(
+                    "loaded prefilter policy does not match the active durable revision"
+                )
+            if legacy_asset_inventory.revision != asset_row[2]:
+                raise OperatorConfigError(
+                    "loaded asset inventory does not match the active durable revision"
+                )
+            policy = legacy_prefilter_policy
+            inventory = legacy_asset_inventory
+        else:
+            try:
+                policy = PrefilterPolicy.from_document(
+                    json.loads(str(prefilter_row[3]))
+                )
+                inventory = AssetInventory.from_document(
+                    json.loads(str(asset_row[3]))
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise OperatorConfigError(
+                    "active database configuration could not be constructed"
+                ) from exc
+        bundle = ConfigurationBundle(
+            generation=int(state[1]),
+            mode=mode,
+            prefilter_policy=policy,
+            prefilter_revision=str(prefilter_row[2]),
+            prefilter_shipped_base_revision=(
+                str(prefilter_row[4]) if prefilter_row[4] is not None else None
+            ),
+            asset_inventory=inventory,
+            asset_revision=str(asset_row[2]),
+            asset_shipped_base_revision=(
+                str(asset_row[4]) if asset_row[4] is not None else None
+            ),
+            loaded_at=loaded_at or utc_now_iso(),
         )
-    return DecisionBundle(
-        generation=state.generation,
-        prefilter_revision=state.active_prefilter_revision,
-        asset_revision=state.active_asset_revision,
+        conn.commit()
+        return bundle
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _bounded_reload_error(_exc: Exception) -> str:
+    return "active configuration reload failed validation"
+
+
+def _record_consumer_status(
+    conn: sqlite3.Connection,
+    *,
+    consumer: str,
+    bundle: ConfigurationBundle,
+    desired_generation: int,
+    status: str,
+    checked_at: str,
+    last_error: str | None,
+) -> None:
+    conn.execute(
+        """INSERT INTO operator_config_consumers (
+               consumer, loaded_generation, desired_generation, status,
+               prefilter_revision, asset_revision, loaded_at, checked_at,
+               last_error
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(consumer) DO UPDATE SET
+               loaded_generation = excluded.loaded_generation,
+               desired_generation = excluded.desired_generation,
+               status = excluded.status,
+               prefilter_revision = excluded.prefilter_revision,
+               asset_revision = excluded.asset_revision,
+               loaded_at = excluded.loaded_at,
+               checked_at = excluded.checked_at,
+               last_error = excluded.last_error""",
+        (
+            consumer,
+            bundle.generation,
+            desired_generation,
+            status,
+            bundle.prefilter_revision,
+            bundle.asset_revision,
+            bundle.loaded_at,
+            checked_at,
+            last_error,
+        ),
     )
+
+
+class ConfigurationBundleOwner:
+    """Atomically publish validated generations and retain last-known-good."""
+
+    def __init__(
+        self,
+        *,
+        consumer: str,
+        legacy_prefilter_policy: PrefilterPolicy,
+        legacy_asset_inventory: AssetInventory,
+        reload_interval_seconds: float = DEFAULT_RELOAD_INTERVAL_SECONDS,
+        clock=time.monotonic,
+    ):
+        if consumer not in RUNTIME_CONSUMERS:
+            raise ValueError("unsupported runtime configuration consumer")
+        if reload_interval_seconds <= 0:
+            raise ValueError("reload interval must be positive")
+        self.consumer = consumer
+        self.legacy_prefilter_policy = legacy_prefilter_policy
+        self.legacy_asset_inventory = legacy_asset_inventory
+        self.reload_interval_seconds = float(reload_interval_seconds)
+        self.clock = clock
+        self._bundle: ConfigurationBundle | None = None
+        self._next_check = 0.0
+        self._backoff = self.reload_interval_seconds
+        self._last_audited_failure_generation: int | None = None
+
+    @property
+    def bundle(self) -> ConfigurationBundle:
+        if self._bundle is None:
+            raise OperatorConfigError("runtime configuration owner has not started")
+        return self._bundle
+
+    def start(self, conn: sqlite3.Connection) -> ConfigurationBundle:
+        replacement = load_configuration_bundle(
+            conn,
+            legacy_prefilter_policy=self.legacy_prefilter_policy,
+            legacy_asset_inventory=self.legacy_asset_inventory,
+        )
+        checked_at = utc_now_iso()
+        try:
+            _record_consumer_status(
+                conn,
+                consumer=self.consumer,
+                bundle=replacement,
+                desired_generation=replacement.generation,
+                status="ok",
+                checked_at=checked_at,
+                last_error=None,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        self._bundle = replacement
+        self._next_check = self.clock() + self.reload_interval_seconds
+        return replacement
+
+    def maybe_reload(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        force: bool = False,
+    ) -> bool:
+        current = self.bundle
+        now = self.clock()
+        if not force and now < self._next_check:
+            return False
+        self._next_check = now + self.reload_interval_seconds
+        checked_at = utc_now_iso()
+        desired_generation = current.generation
+        try:
+            row = conn.execute(
+                "SELECT generation FROM operator_config_state WHERE id = 1"
+            ).fetchone()
+            if row is not None:
+                desired_generation = int(row[0])
+            if row is not None and desired_generation == current.generation:
+                try:
+                    _record_consumer_status(
+                        conn,
+                        consumer=self.consumer,
+                        bundle=current,
+                        desired_generation=desired_generation,
+                        status="ok",
+                        checked_at=checked_at,
+                        last_error=None,
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                self._backoff = self.reload_interval_seconds
+                return False
+            replacement = load_configuration_bundle(
+                conn,
+                legacy_prefilter_policy=self.legacy_prefilter_policy,
+                legacy_asset_inventory=self.legacy_asset_inventory,
+            )
+        except Exception as exc:
+            error = _bounded_reload_error(exc)
+            try:
+                _record_consumer_status(
+                    conn,
+                    consumer=self.consumer,
+                    bundle=current,
+                    desired_generation=desired_generation,
+                    status="error",
+                    checked_at=checked_at,
+                    last_error=error,
+                )
+                if self._last_audited_failure_generation != desired_generation:
+                    _audit(
+                        conn,
+                        occurred_at=checked_at,
+                        action="runtime_reload_failed",
+                        detail={
+                            "consumer": self.consumer,
+                            "loaded_generation": current.generation,
+                            "desired_generation": desired_generation,
+                            "error": error,
+                        },
+                        actor=f"system:{self.consumer}-ingest",
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+            self._last_audited_failure_generation = desired_generation
+            self._next_check = now + self._backoff
+            self._backoff = min(
+                self._backoff * 2,
+                MAX_RELOAD_BACKOFF_SECONDS,
+            )
+            return False
+
+        try:
+            _record_consumer_status(
+                conn,
+                consumer=self.consumer,
+                bundle=replacement,
+                desired_generation=replacement.generation,
+                status="ok",
+                checked_at=checked_at,
+                last_error=None,
+            )
+            _audit(
+                conn,
+                occurred_at=checked_at,
+                action="runtime_reload_succeeded",
+                detail={
+                    "consumer": self.consumer,
+                    "from_generation": current.generation,
+                    "generation": replacement.generation,
+                },
+                actor=f"system:{self.consumer}-ingest",
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            return False
+        self._bundle = replacement
+        self._last_audited_failure_generation = None
+        self._backoff = self.reload_interval_seconds
+        self._next_check = now + self.reload_interval_seconds
+        return True
 
 
 def bootstrap_operator_configuration(

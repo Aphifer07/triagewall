@@ -127,6 +127,14 @@ request identifier, action, and bounded structured detail.
 Secrets, API keys, the process canary, and unrestricted sensor records are
 never configuration content or audit detail.
 
+### `operator_config_consumers`
+
+One bounded heartbeat row per enabled ingest consumer records its loaded and
+desired generation, loaded revision pair, last successful load time, latest
+check time, and `ok` or `error` status. Errors are generic and bounded; this
+table never contains configuration documents or sensor records. A missing row
+means that optional consumer has not started, not that it is healthy.
+
 ## Lifecycle
 
 ```mermaid
@@ -344,16 +352,17 @@ Status: implemented.
 
 ### Slice 3 — preview and activation
 
-Status: implemented, with authority cutover intentionally held for Slice 4.
+Status: implemented.
 
 - Add bounded prefilter and asset previews.
 - Add generation-based conflict handling and atomic activation.
-- The guarded activation primitive succeeds only in `database` mode. It cannot
-  switch a legacy deployment early; the mode cutover remains coupled to the
-  generation-aware reload owner in Slice 4.
+- Keep activation coupled to the generation-aware runtime owner delivered in
+  Slice 4; the first activation atomically cuts authority over to `database`.
 - Persist and startup-verify decision bundle provenance for both sensor paths.
 
 ### Slice 4 — hot reload and rollback
+
+Status: implemented.
 
 - Replace process-global configuration objects with an immutable bundle owner.
 - Add bounded reload checks to both ingest paths.

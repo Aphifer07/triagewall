@@ -187,15 +187,36 @@ print(
     flush=True,
 )
 
+# Installed by a long-running ingest consumer after it has loaded and verified
+# one complete durable bundle. Tests and the standalone fixture runner retain
+# the validated startup objects above when no owner is installed.
+CONFIGURATION_BUNDLE_OWNER = None
+
+
+def set_configuration_bundle_owner(owner) -> None:
+    """Publish or clear the process's single immutable bundle owner."""
+    global CONFIGURATION_BUNDLE_OWNER
+    CONFIGURATION_BUNDLE_OWNER = owner
+
+
+def current_configuration_bundle():
+    if CONFIGURATION_BUNDLE_OWNER is None:
+        return None
+    return CONFIGURATION_BUNDLE_OWNER.bundle
+
 
 def get_asset_context(alert):
     """Resolve the exact source and destination asset snapshots for an alert."""
-    return ASSET_INVENTORY.resolve_alert(alert)
+    bundle = current_configuration_bundle()
+    inventory = bundle.asset_inventory if bundle is not None else ASSET_INVENTORY
+    return inventory.resolve_alert(alert)
 
 
 def prefilter_verdict(alert, asset_context=None):
     """Return a verdict dict if the alert matches a prefilter rule, else None."""
-    reason = PREFILTER_POLICY.match_reason(alert, asset_context)
+    bundle = current_configuration_bundle()
+    policy = bundle.prefilter_policy if bundle is not None else PREFILTER_POLICY
+    reason = policy.match_reason(alert, asset_context)
     if reason is not None:
         return {
             "verdict": "false_positive",

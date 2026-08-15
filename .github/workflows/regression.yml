@@ -45,6 +45,7 @@ jobs:
           tests.test_asset_inventory
           tests.test_config_api
           tests.test_config_preview_activation
+          tests.test_config_runtime
           tests.test_database
           tests.test_db_startup
           tests.test_dashboard_stats

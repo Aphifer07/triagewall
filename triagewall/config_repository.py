@@ -21,7 +21,12 @@ try:
         validate_stored_revision,
     )
     from .prefilter import MAX_CONFIG_BYTES, PrefilterPolicy
-    from .time_utils import format_utc_timestamp, utc_now, utc_now_iso
+    from .time_utils import (
+        format_utc_timestamp,
+        parse_utc_timestamp,
+        utc_now,
+        utc_now_iso,
+    )
 except ImportError:  # Direct script-style imports used by container entrypoints.
     from asset_inventory import AssetInventory, canonical_json
     from operator_config import (
@@ -33,7 +38,7 @@ except ImportError:  # Direct script-style imports used by container entrypoints
         validate_stored_revision,
     )
     from prefilter import MAX_CONFIG_BYTES, PrefilterPolicy
-    from time_utils import format_utc_timestamp, utc_now, utc_now_iso
+    from time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now, utc_now_iso
 
 
 MAX_NOTE_LENGTH = 2_000
@@ -126,14 +131,19 @@ def _state_row(conn: sqlite3.Connection):
 
 
 def _validate_active_row(row, expected_kind: str) -> None:
-    if row is None:
-        raise ConfigIntegrityError(f"active {expected_kind} revision is missing")
-    if row[1] != expected_kind or row[7] != "active":
-        raise ConfigIntegrityError(f"active {expected_kind} pointer is inconsistent")
+    _validate_active_pointer(row, expected_kind)
     try:
         validate_stored_revision(str(row[1]), str(row[3]), str(row[2]))
     except OperatorConfigError as exc:
         raise ConfigIntegrityError(str(exc)) from exc
+
+
+def _validate_active_pointer(row, expected_kind: str) -> None:
+    """Validate summary-safe pointer metadata without decoding private content."""
+    if row is None:
+        raise ConfigIntegrityError(f"active {expected_kind} revision is missing")
+    if row[1] != expected_kind or row[7] != "active":
+        raise ConfigIntegrityError(f"active {expected_kind} pointer is inconsistent")
 
 
 def get_config_summary(
@@ -148,7 +158,7 @@ def get_config_summary(
         (ASSET_KIND, int(state[4])),
     ):
         row = _revision_row(conn, revision_id)
-        _validate_active_row(row, kind)
+        _validate_active_pointer(row, kind)
         active[kind] = _revision_metadata(row)
     counts = {
         kind: {str(state_name): int(count) for state_name, count in rows}
@@ -164,6 +174,33 @@ def get_config_summary(
             for config_kind in sorted(CONFIG_KINDS)
         )
     }
+    now = utc_now()
+    consumer_rows = conn.execute(
+        """SELECT consumer, loaded_generation, desired_generation, status,
+                  prefilter_revision, asset_revision, loaded_at, checked_at,
+                  last_error
+           FROM operator_config_consumers ORDER BY consumer"""
+    ).fetchall()
+    consumers = []
+    for row in consumer_rows:
+        try:
+            age = max(0, int((now - parse_utc_timestamp(str(row[7]))).total_seconds()))
+        except (TypeError, ValueError):
+            age = 10**9
+        consumers.append(
+            {
+                "consumer": str(row[0]),
+                "loaded_generation": int(row[1]),
+                "desired_generation": int(row[2]),
+                "status": str(row[3]),
+                "prefilter_revision": str(row[4]),
+                "asset_revision": str(row[5]),
+                "loaded_at": str(row[6]),
+                "checked_at": str(row[7]),
+                "status_age_seconds": age,
+                "last_error": str(row[8]) if row[8] is not None else None,
+            }
+        )
     return {
         "generated_at": utc_now_iso(),
         "mode": str(state[0]),
@@ -171,8 +208,9 @@ def get_config_summary(
         "updated_at": str(state[2]),
         "writes_enabled": writes_enabled,
         "reload": {
-            "supported": False,
+            "supported": True,
             "desired_generation": int(state[1]),
+            "consumers": consumers,
         },
         "active": active,
         "revision_counts": counts,
@@ -845,107 +883,227 @@ def activate_draft(
     draft_id: int,
     expected_generation: int,
     acknowledge_broad_rules: bool,
+    acknowledge_shipped_base_change: bool,
     actor: str,
     auth_via: str,
     request_id: str | None,
     occurred_at: str | None = None,
 ) -> dict[str, Any]:
-    """Atomically activate one validated revision in database authority mode."""
+    """Atomically activate one validated draft and cut over legacy authority."""
+    _require_kind(kind)
+    timestamp = occurred_at or utc_now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        state = _state_row(conn)
+        if int(state[1]) != expected_generation:
+            raise ConfigConflictError("configuration generation is stale")
+        candidate, document = _validated_document(conn, kind, draft_id)
+        active_id = int(state[3] if kind == PREFILTER_KIND else state[4])
+        active = _revision_row(conn, active_id)
+        _validate_active_row(active, kind)
+        if int(candidate[0]) == active_id:
+            raise ConfigConflictError("configuration revision is already active")
+        if candidate[5] != active_id:
+            raise ConfigConflictError("configuration draft parent is no longer active")
+        payload = _activate_revision_locked(
+            conn,
+            state=state,
+            kind=kind,
+            candidate=candidate,
+            document=document,
+            expected_generation=expected_generation,
+            acknowledge_broad_rules=acknowledge_broad_rules,
+            acknowledge_shipped_base_change=acknowledge_shipped_base_change,
+            actor=actor,
+            auth_via=auth_via,
+            request_id=request_id,
+            timestamp=timestamp,
+            action="revision_activated",
+        )
+        conn.commit()
+        return payload
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _activate_revision_locked(
+    conn: sqlite3.Connection,
+    *,
+    state,
+    kind: str,
+    candidate,
+    document: dict[str, Any],
+    expected_generation: int,
+    acknowledge_broad_rules: bool,
+    acknowledge_shipped_base_change: bool,
+    actor: str,
+    auth_via: str,
+    request_id: str | None,
+    timestamp: str,
+    action: str,
+) -> dict[str, Any]:
+    active_id = int(state[3] if kind == PREFILTER_KIND else state[4])
+    active = _revision_row(conn, active_id)
+    _validate_active_row(active, kind)
+    broad_rule_count = 0
+    if kind == PREFILTER_KIND:
+        policy = PrefilterPolicy.from_document(document)
+        broad_rule_count = sum(rule.match is None for rule in policy.rules)
+        if broad_rule_count and not acknowledge_broad_rules:
+            raise ConfigConflictError(
+                "activation requires acknowledgement of unscoped rules"
+            )
+        newest_shipped = conn.execute(
+            """SELECT revisions.revision
+               FROM operator_config_audit AS audit
+               JOIN operator_config_revisions AS revisions
+                 ON revisions.id = audit.revision_id
+               WHERE audit.action = 'shipped_revision_discovered'
+                 AND audit.kind = 'prefilter_policy'
+               ORDER BY audit.id DESC LIMIT 1"""
+        ).fetchone()
+        if newest_shipped is None:
+            newest_shipped = conn.execute(
+                """SELECT revision FROM operator_config_revisions
+                   WHERE kind = 'prefilter_policy' AND source = 'shipped'
+                   ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        if newest_shipped is None:
+            raise ConfigIntegrityError("shipped prefilter baseline is missing")
+        if (
+            candidate[6] != newest_shipped[0]
+            and not acknowledge_shipped_base_change
+        ):
+            raise ConfigConflictError(
+                "activation requires acknowledgement of a shipped-base change"
+            )
+    previous_prefilter = int(state[3])
+    previous_asset = int(state[4])
+    authority_cutover = state[0] == "legacy"
+    conn.execute(
+        "UPDATE operator_config_revisions SET state = 'superseded' WHERE id = ?",
+        (active_id,),
+    )
+    conn.execute(
+        "UPDATE operator_config_revisions SET state = 'active' WHERE id = ?",
+        (int(candidate[0]),),
+    )
+    next_generation = expected_generation + 1
+    if kind == PREFILTER_KIND:
+        conn.execute(
+            """UPDATE operator_config_state
+               SET active_prefilter_revision_id = ?,
+                   previous_prefilter_revision_id = ?,
+                   previous_asset_revision_id = ?, mode = 'database',
+                   generation = ?, updated_at = ?
+               WHERE id = 1""",
+            (
+                int(candidate[0]),
+                previous_prefilter,
+                previous_asset,
+                next_generation,
+                timestamp,
+            ),
+        )
+    else:
+        conn.execute(
+            """UPDATE operator_config_state
+               SET active_asset_revision_id = ?,
+                   previous_prefilter_revision_id = ?,
+                   previous_asset_revision_id = ?, mode = 'database',
+                   generation = ?, updated_at = ?
+               WHERE id = 1""",
+            (
+                int(candidate[0]),
+                previous_prefilter,
+                previous_asset,
+                next_generation,
+                timestamp,
+            ),
+        )
+    _insert_audit(
+        conn,
+        occurred_at=timestamp,
+        actor=actor,
+        auth_via=auth_via,
+        request_id=request_id,
+        action=action,
+        kind=kind,
+        revision_id=int(candidate[0]),
+        from_revision_id=active_id,
+        to_revision_id=int(candidate[0]),
+        detail={
+            "expected_generation": expected_generation,
+            "generation": next_generation,
+            "broad_rule_count": broad_rule_count,
+            "broad_rules_acknowledged": acknowledge_broad_rules,
+            "shipped_base_change_acknowledged": acknowledge_shipped_base_change,
+            "authority_cutover": authority_cutover,
+        },
+    )
+    activated = _revision_row(conn, int(candidate[0]))
+    return {
+        "activated_at": timestamp,
+        "kind": kind,
+        "generation": next_generation,
+        "previous_revision_id": active_id,
+        "authority_cutover": authority_cutover,
+        "revision": _revision_metadata(activated),
+    }
+
+
+def rollback_revision(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    revision_id: int,
+    expected_generation: int,
+    acknowledge_broad_rules: bool,
+    acknowledge_shipped_base_change: bool,
+    actor: str,
+    auth_via: str,
+    request_id: str | None,
+    occurred_at: str | None = None,
+) -> dict[str, Any]:
+    """Reactivate one superseded revision through the guarded activation path."""
     _require_kind(kind)
     timestamp = occurred_at or utc_now_iso()
     try:
         conn.execute("BEGIN IMMEDIATE")
         state = _state_row(conn)
         if state[0] != "database":
-            raise ConfigConflictError(
-                "activation is unavailable until database-mode consumers are ready"
-            )
+            raise ConfigConflictError("rollback requires database authority mode")
         if int(state[1]) != expected_generation:
             raise ConfigConflictError("configuration generation is stale")
-        candidate, document = _validated_document(conn, kind, draft_id)
-        active_id = int(state[3] if kind == PREFILTER_KIND else state[4])
-        if int(candidate[0]) == active_id:
-            raise ConfigConflictError("configuration revision is already active")
-        if candidate[5] != active_id:
-            raise ConfigConflictError("configuration draft parent is no longer active")
-        broad_rule_count = 0
-        if kind == PREFILTER_KIND:
-            policy = PrefilterPolicy.from_document(document)
-            broad_rule_count = sum(rule.match is None for rule in policy.rules)
-            if broad_rule_count and not acknowledge_broad_rules:
-                raise ConfigConflictError(
-                    "activation requires acknowledgement of unscoped rules"
-                )
-        previous_prefilter = int(state[3])
-        previous_asset = int(state[4])
-        conn.execute(
-            "UPDATE operator_config_revisions SET state = 'superseded' WHERE id = ?",
-            (active_id,),
-        )
-        conn.execute(
-            "UPDATE operator_config_revisions SET state = 'active' WHERE id = ?",
-            (int(candidate[0]),),
-        )
-        next_generation = expected_generation + 1
-        if kind == PREFILTER_KIND:
-            conn.execute(
-                """UPDATE operator_config_state
-                   SET active_prefilter_revision_id = ?,
-                       previous_prefilter_revision_id = ?,
-                       previous_asset_revision_id = ?,
-                       generation = ?, updated_at = ?
-                   WHERE id = 1""",
-                (
-                    int(candidate[0]),
-                    previous_prefilter,
-                    previous_asset,
-                    next_generation,
-                    timestamp,
-                ),
-            )
-        else:
-            conn.execute(
-                """UPDATE operator_config_state
-                   SET active_asset_revision_id = ?,
-                       previous_prefilter_revision_id = ?,
-                       previous_asset_revision_id = ?,
-                       generation = ?, updated_at = ?
-                   WHERE id = 1""",
-                (
-                    int(candidate[0]),
-                    previous_prefilter,
-                    previous_asset,
-                    next_generation,
-                    timestamp,
-                ),
-            )
-        _insert_audit(
+        candidate = _revision_row(conn, revision_id)
+        if candidate is None or candidate[1] != kind:
+            raise ConfigNotFoundError("configuration revision not found")
+        if candidate[7] != "superseded":
+            raise ConfigConflictError("only a superseded revision can be rolled back")
+        document_json = str(candidate[3])
+        try:
+            validate_stored_revision(kind, document_json, str(candidate[2]))
+            document = json.loads(document_json)
+        except (OperatorConfigError, json.JSONDecodeError) as exc:
+            raise ConfigIntegrityError(str(exc)) from exc
+        payload = _activate_revision_locked(
             conn,
-            occurred_at=timestamp,
+            state=state,
+            kind=kind,
+            candidate=candidate,
+            document=document,
+            expected_generation=expected_generation,
+            acknowledge_broad_rules=acknowledge_broad_rules,
+            acknowledge_shipped_base_change=acknowledge_shipped_base_change,
             actor=actor,
             auth_via=auth_via,
             request_id=request_id,
-            action="revision_activated",
-            kind=kind,
-            revision_id=int(candidate[0]),
-            from_revision_id=active_id,
-            to_revision_id=int(candidate[0]),
-            detail={
-                "expected_generation": expected_generation,
-                "generation": next_generation,
-                "broad_rule_count": broad_rule_count,
-                "broad_rules_acknowledged": acknowledge_broad_rules,
-            },
+            timestamp=timestamp,
+            action="revision_rolled_back",
         )
         conn.commit()
-        activated = _revision_row(conn, int(candidate[0]))
-        return {
-            "activated_at": timestamp,
-            "kind": kind,
-            "generation": next_generation,
-            "previous_revision_id": active_id,
-            "revision": _revision_metadata(activated),
-        }
+        return payload
     except Exception:
         conn.rollback()
         raise

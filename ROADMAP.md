@@ -244,15 +244,15 @@ workbench without weakening the production boundary.
 - [x] **Investigation context and correlation.** Add bounded recurrence,
   related activity, source-specific evidence, and queue-aware navigation as
   detailed below.
-- [ ] **Versioned operator-configuration foundation.** Separate immutable
+- [x] **Versioned operator-configuration foundation.** Separate immutable
   shipped defaults from operator revisions and add drafts, validation, bounded
   impact preview, atomic activation, optimistic locking, last-known-good
   recovery, rollback, and audit history. See
   [Operator configuration foundation](docs/operator-configuration-foundation.md).
   Persistence, authorization, immutable drafts, validation, bounded previews,
-  the guarded atomic activation primitive, and per-verdict bundle provenance
-  are delivered. Generation-aware reload, authority cutover, and rollback are
-  the remaining foundation work.
+  atomic authority cutover, generation-aware last-known-good reload, audited
+  rollback, truthful consumer health, and per-verdict bundle provenance are
+  delivered. The editors and release-hardening work remain separate milestones.
 - [x] **Dedicated configuration authorization.** Keep mutation disabled by
   default and require an attributable API key with `config:write`; the
   dashboard feedback cookie is not administrator authentication.

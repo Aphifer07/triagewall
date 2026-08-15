@@ -111,6 +111,7 @@ class OperatorConfigBootstrapTests(unittest.TestCase):
                 "operator_config_revisions",
                 "operator_config_state",
                 "operator_config_audit",
+                "operator_config_consumers",
             }
             <= tables
         )
@@ -127,6 +128,24 @@ class OperatorConfigBootstrapTests(unittest.TestCase):
             for row in self.rows("PRAGMA table_info('operator_config_state')")
         }
         self.assertIn("mode", state_columns)
+        consumer_columns = {
+            row[1]
+            for row in self.rows("PRAGMA table_info('operator_config_consumers')")
+        }
+        self.assertEqual(
+            consumer_columns,
+            {
+                "consumer",
+                "loaded_generation",
+                "desired_generation",
+                "status",
+                "prefilter_revision",
+                "asset_revision",
+                "loaded_at",
+                "checked_at",
+                "last_error",
+            },
+        )
 
     def test_identical_legacy_policy_uses_shipped_revision(self):
         result = self.bootstrap()

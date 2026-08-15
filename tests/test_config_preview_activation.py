@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -123,6 +124,13 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         response = self.client.get("/api/v1/config", headers=self.headers)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
+
+    def db_rows(self, sql, parameters=()):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(sql, parameters).fetchall()
+        finally:
+            conn.close()
 
     def create_validate(self, kind, document):
         summary = self.summary()
@@ -305,33 +313,19 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         self.assertEqual(stale.status_code, 409)
         self.assertEqual(oversized.status_code, 422)
 
-    def test_activation_refuses_legacy_then_atomically_activates_in_database_mode(self):
+    def test_activation_cuts_over_legacy_then_atomically_activates(self):
         draft_id, revision_id, summary = self.create_validate(
             "prefilter_policy",
             prefilter_document(rule(2002, scoped=False)),
         )
         path = f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate"
-        legacy = self.client.post(
-            path,
-            headers=self.headers,
-            json={
-                "expected_generation": summary["generation"],
-                "acknowledge_broad_rules": True,
-            },
-        )
-        self.assertEqual(legacy.status_code, 409)
-        self.assertEqual(self.summary()["generation"], 1)
-
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("UPDATE operator_config_state SET mode = 'database' WHERE id = 1")
-        conn.commit()
-        conn.close()
         missing_ack = self.client.post(
             path,
             headers=self.headers,
-            json={"expected_generation": 1},
+            json={"expected_generation": summary["generation"]},
         )
         self.assertEqual(missing_ack.status_code, 409)
+        self.assertEqual(self.summary()["generation"], 1)
 
         activated = self.client.post(
             path,
@@ -341,9 +335,11 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         self.assertEqual(activated.status_code, 200, activated.text)
         payload = activated.json()
         self.assertEqual(payload["generation"], 2)
+        self.assertTrue(payload["authority_cutover"])
         self.assertEqual(payload["revision"]["id"], revision_id)
         state = self.summary()
         self.assertEqual(state["generation"], 2)
+        self.assertEqual(state["mode"], "database")
         self.assertEqual(state["active"]["prefilter_policy"]["id"], revision_id)
         self.assertEqual(payload["revision"]["state"], "active")
 
@@ -360,7 +356,6 @@ class ConfigPreviewActivationTests(unittest.TestCase):
             asset_document(asset("server", "10.0.0.2")),
         )
         conn = sqlite3.connect(self.db_path)
-        conn.execute("UPDATE operator_config_state SET mode = 'database' WHERE id = 1")
         conn.execute(
             "UPDATE operator_config_revisions SET document_json = '{}' WHERE id = ?",
             (revision_id,),
@@ -387,7 +382,86 @@ class ConfigPreviewActivationTests(unittest.TestCase):
             conn.close()
         self.assertEqual(after, before)
 
-    def test_runtime_bundle_loader_verifies_legacy_authority_and_refuses_cutover(self):
+    def test_activation_acknowledges_a_newer_shipped_baseline(self):
+        draft_id, _, _ = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+        self.packaged.write_text(
+            json.dumps(prefilter_document(rule(3003))),
+            encoding="utf-8",
+        )
+        discovered = operator_config.bootstrap_operator_configuration(
+            self.db_path,
+            packaged_prefilter_path=self.packaged,
+            legacy_prefilter_path=self.legacy,
+            asset_inventory_path=self.assets,
+        )
+        self.assertTrue(discovered.discovered_shipped_revision)
+        self.assertEqual(discovered.generation, 1)
+        path = f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate"
+
+        missing_ack = self.client.post(
+            path,
+            headers=self.headers,
+            json={"expected_generation": 1},
+        )
+        self.assertEqual(missing_ack.status_code, 409)
+        self.assertIn("shipped-base change", missing_ack.text)
+
+        activated = self.client.post(
+            path,
+            headers=self.headers,
+            json={
+                "expected_generation": 1,
+                "acknowledge_shipped_base_change": True,
+            },
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(activated.json()["generation"], 2)
+
+    def test_rollback_reactivates_superseded_revision_with_new_generation(self):
+        original = self.summary()["active"]["prefilter_policy"]["id"]
+        draft_id, candidate_id, _ = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.headers,
+            json={"expected_generation": 1},
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(activated.json()["revision"]["id"], candidate_id)
+
+        rolled_back = self.client.post(
+            f"/api/v1/config/prefilter_policy/revisions/{original}/rollback",
+            headers=self.headers,
+            json={"expected_generation": 2},
+        )
+
+        self.assertEqual(rolled_back.status_code, 200, rolled_back.text)
+        payload = rolled_back.json()
+        self.assertEqual(payload["generation"], 3)
+        self.assertFalse(payload["authority_cutover"])
+        self.assertEqual(payload["revision"]["id"], original)
+        summary = self.summary()
+        self.assertEqual(summary["active"]["prefilter_policy"]["id"], original)
+        self.assertEqual(summary["generation"], 3)
+        audit = self.db_rows(
+            """SELECT action, from_revision_id, to_revision_id
+               FROM operator_config_audit ORDER BY id DESC LIMIT 1"""
+        )[0]
+        self.assertEqual(audit, ("revision_rolled_back", candidate_id, original))
+
+        stale = self.client.post(
+            f"/api/v1/config/prefilter_policy/revisions/{candidate_id}/rollback",
+            headers=self.headers,
+            json={"expected_generation": 2},
+        )
+        self.assertEqual(stale.status_code, 409)
+
+    def test_runtime_bundle_loader_verifies_legacy_and_loads_database_authority(self):
         policy = PrefilterPolicy.from_document(
             json.loads(self.legacy.read_text(encoding="utf-8"))
         )
@@ -396,45 +470,47 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         )
         conn = sqlite3.connect(self.db_path)
         try:
-            bundle = operator_config.load_decision_bundle(
+            bundle = operator_config.load_configuration_bundle(
                 conn,
-                effective_prefilter_document=policy.to_document(),
-                effective_asset_revision=inventory.revision,
+                legacy_prefilter_policy=policy,
+                legacy_asset_inventory=inventory,
             )
             self.assertEqual(bundle.generation, 1)
             with self.assertRaisesRegex(
                 operator_config.OperatorConfigError,
                 "asset inventory",
             ):
-                operator_config.load_decision_bundle(
+                operator_config.load_configuration_bundle(
                     conn,
-                    effective_prefilter_document=policy.to_document(),
-                    effective_asset_revision="sha256:" + "0" * 64,
+                    legacy_prefilter_policy=policy,
+                    legacy_asset_inventory=AssetInventory.from_document(
+                        {"version": 1, "assets": []}
+                    ),
                 )
             conn.execute(
                 "UPDATE operator_config_state SET mode = 'database' WHERE id = 1"
             )
             conn.commit()
-            with self.assertRaisesRegex(
-                operator_config.OperatorConfigError,
-                "generation-aware consumers",
-            ):
-                operator_config.load_decision_bundle(
-                    conn,
-                    effective_prefilter_document=policy.to_document(),
-                    effective_asset_revision=inventory.revision,
-                )
+            database_bundle = operator_config.load_configuration_bundle(
+                conn,
+                legacy_prefilter_policy=PrefilterPolicy.empty(),
+                legacy_asset_inventory=AssetInventory.from_document(
+                    {"version": 1, "assets": []}
+                ),
+            )
+            self.assertEqual(database_bundle.mode, "database")
+            self.assertEqual(database_bundle.prefilter_policy.signature_ids, {1001})
         finally:
             conn.close()
 
 
-class DecisionBundleProvenanceTests(unittest.TestCase):
+class ConfigurationBundleProvenanceTests(unittest.TestCase):
     def test_shared_insert_persists_exact_bundle_tuple(self):
         conn = sqlite3.connect(":memory:")
         conn.executescript(
             (Path(__file__).resolve().parents[1] / "triagewall" / "schema.sql").read_text()
         )
-        bundle = operator_config.DecisionBundle(
+        bundle = SimpleNamespace(
             generation=7,
             prefilter_revision="sha256:" + "a" * 64,
             asset_revision="sha256:" + "b" * 64,
@@ -462,7 +538,7 @@ class DecisionBundleProvenanceTests(unittest.TestCase):
     def test_both_ingest_adapters_forward_the_verified_bundle(self):
         conn = sqlite3.connect(":memory:")
         conn.executescript((PROJECT_ROOT / "triagewall" / "schema.sql").read_text())
-        bundle = operator_config.DecisionBundle(
+        bundle = SimpleNamespace(
             generation=9,
             prefilter_revision="sha256:" + "c" * 64,
             asset_revision="sha256:" + "d" * 64,
@@ -475,6 +551,11 @@ class DecisionBundleProvenanceTests(unittest.TestCase):
                 "alert": {"signature_id": 42, "signature": "test"},
             }
         )
+        owner = type(
+            "Owner",
+            (),
+            {"bundle": bundle, "maybe_reload": lambda self, conn: False},
+        )()
         with patch.object(
             ingest,
             "get_asset_context",
@@ -482,7 +563,7 @@ class DecisionBundleProvenanceTests(unittest.TestCase):
         ), patch.object(ingest, "call_ollama", return_value=verdict), patch.object(
             ingest, "insert_with_retry", return_value=True
         ) as suricata_insert, patch.object(
-            ingest, "RUNTIME_CONFIG_BUNDLE", bundle
+            ingest, "RUNTIME_CONFIG_OWNER", owner
         ):
             ingest.process_line(conn, suricata)
         self.assertIs(suricata_insert.call_args.kwargs["config_bundle"], bundle)
@@ -505,7 +586,7 @@ class DecisionBundleProvenanceTests(unittest.TestCase):
         ), patch.object(
             wazuh_ingest, "insert_with_retry", return_value=True
         ) as wazuh_insert, patch.object(
-            wazuh_ingest, "RUNTIME_CONFIG_BUNDLE", bundle
+            wazuh_ingest, "RUNTIME_CONFIG_OWNER", owner
         ):
             wazuh_ingest.process_wazuh_record(
                 conn,

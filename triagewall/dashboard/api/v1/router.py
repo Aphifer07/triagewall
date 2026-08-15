@@ -595,6 +595,45 @@ def create_v1_router(
                     draft_id=draft_id,
                     expected_generation=body.expected_generation,
                     acknowledge_broad_rules=body.acknowledge_broad_rules,
+                    acknowledge_shipped_base_change=(
+                        body.acknowledge_shipped_base_change
+                    ),
+                    actor=auth_ctx.principal,
+                    auth_via=auth_ctx.via,
+                    request_id=request_id(request),
+                )
+        except config_repository.ConfigRepositoryError as exc:
+            raise repository_error(exc) from exc
+        return validated_json_response(
+            request,
+            payload,
+            model=ConfigActivationResponse,
+            max_age=0,
+            no_store=True,
+        )
+
+    @router.post(
+        "/config/{kind}/revisions/{revision_id}/rollback",
+        response_model=ConfigActivationResponse,
+    )
+    def rollback_config_revision(
+        request: Request,
+        kind: ConfigKind,
+        revision_id: int,
+        body: ConfigActivationRequest,
+        auth_ctx: AuthContext = Depends(require_config_mutation),
+    ):
+        try:
+            with db_factory() as conn:
+                payload = config_repository.rollback_revision(
+                    conn,
+                    kind=kind,
+                    revision_id=revision_id,
+                    expected_generation=body.expected_generation,
+                    acknowledge_broad_rules=body.acknowledge_broad_rules,
+                    acknowledge_shipped_base_change=(
+                        body.acknowledge_shipped_base_change
+                    ),
                     actor=auth_ctx.principal,
                     auth_via=auth_ctx.via,
                     request_id=request_id(request),

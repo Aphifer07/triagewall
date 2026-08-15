@@ -26,6 +26,7 @@ REQUIRED_TABLES = {
     "operator_config_revisions",
     "operator_config_state",
     "operator_config_audit",
+    "operator_config_consumers",
     "spc_ip_state",
     "spc_rate_buckets",
     "spc_seen_sids",
@@ -87,6 +88,17 @@ REQUIRED_CONFIG_COLUMNS = {
         "request_id",
         "action",
         "detail_json",
+    },
+    "operator_config_consumers": {
+        "consumer",
+        "loaded_generation",
+        "desired_generation",
+        "status",
+        "prefilter_revision",
+        "asset_revision",
+        "loaded_at",
+        "checked_at",
+        "last_error",
     },
 }
 
