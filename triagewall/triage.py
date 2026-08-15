@@ -458,14 +458,19 @@ def insert_triage_row(
     dest_asset_snapshot_id = _insert_asset_snapshot(
         conn, asset_context.get("destination")
     )
+    # Serialize the retained record once and store its exact UTF-8 length beside
+    # it. Readers that must bound how many bytes they pull out of the database
+    # can then consult the size without the engine materializing the body.
+    raw_alert_json = json.dumps(event.raw_event)
+    raw_alert_bytes = len(raw_alert_json.encode("utf-8"))
     cursor = conn.execute(
         """INSERT INTO triage_events (
             timestamp, flow_id, src_ip, src_port, dest_ip, dest_port, proto,
             in_iface, pkt_src, signature_id, signature, category, severity, action,
-            raw_alert, verdict, confidence, reasoning, model_used, processed_at,
-            src_asset_snapshot_id, dest_asset_snapshot_id, config_generation,
-            prefilter_revision, asset_revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            raw_alert, raw_alert_bytes, verdict, confidence, reasoning, model_used,
+            processed_at, src_asset_snapshot_id, dest_asset_snapshot_id,
+            config_generation, prefilter_revision, asset_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             format_utc_timestamp(event.timestamp),
             event.flow_id,
@@ -481,7 +486,8 @@ def insert_triage_row(
             event.category,
             event.severity,
             event.action,
-            json.dumps(event.raw_event),
+            raw_alert_json,
+            raw_alert_bytes,
             verdict["verdict"],
             verdict["confidence"],
             verdict["reasoning"],

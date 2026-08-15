@@ -318,6 +318,10 @@ anything. It compares only the newest eligible events, reports the examined coun
 and whether the sample was truncated, never calls Ollama, and never changes
 verdicts or checkpoints. The sample is bounded by rows and by aggregate alert
 bytes, and reaching the byte budget is reported as truncation with a warning.
+That budget is enforced from the alert size recorded beside each record at
+ingestion, so an oversized body is never read. A record retained before those
+sizes existed has no trusted length, so the sample stops there and reports it
+rather than reading an unmeasured body.
 Events retained before sensor context existed are included; only records
 positively identified as another sensor are excluded from a prefilter preview.
 Prefilter previews report suppression deltas, bounded event/signature examples,

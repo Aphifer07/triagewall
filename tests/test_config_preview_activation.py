@@ -164,6 +164,7 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         source="suricata",
         padding=0,
         padding_char="x",
+        record_size=True,
     ):
         raw = {
             "event_type": "alert",
@@ -175,20 +176,27 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         }
         if padding:
             raw["payload_printable"] = padding_char * padding
+        # Retained bodies are not guaranteed to be ASCII, so the fixture stores
+        # multibyte content verbatim to exercise byte-versus-character counting.
+        raw_alert = json.dumps(raw, ensure_ascii=False)
+        # Ingestion records the body's UTF-8 length beside it. `record_size`
+        # off reproduces a row retained before that column existed.
+        raw_alert_bytes = len(raw_alert.encode("utf-8")) if record_size else None
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(
                 """INSERT INTO triage_events (
                        timestamp, src_ip, dest_ip, proto, signature_id,
-                       signature, raw_alert, verdict, processed_at
-                   ) VALUES (?, ?, ?, 'TCP', ?, ?, ?, 'real', ?)""",
+                       signature, raw_alert, raw_alert_bytes, verdict, processed_at
+                   ) VALUES (?, ?, ?, 'TCP', ?, ?, ?, ?, 'real', ?)""",
                 (
                     raw["timestamp"],
                     src_ip,
                     dest_ip,
                     signature_id,
                     raw["alert"]["signature"],
-                    json.dumps(raw),
+                    raw_alert,
+                    raw_alert_bytes,
                     utc_now_iso(),
                 ),
             )
@@ -463,6 +471,222 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         self.assertEqual(response.json()["candidates_examined"], 0)
         self.assertTrue(response.json()["truncated"])
         self.assertEqual(captured, [[]])
+
+    def recorded_column_reads(self):
+        """Record every column SQLite reads, straight from its authorizer."""
+        reads = []
+        conn = sqlite3.connect(self.db_path)
+
+        def authorizer(action, arg1, arg2, *_rest):
+            if action == sqlite3.SQLITE_READ:
+                reads.append((arg1, arg2))
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(authorizer)
+        return conn, reads
+
+    def test_sizing_pass_never_reads_the_alert_body(self):
+        self.add_event(1, 1001, "10.0.0.1", "198.51.100.1", padding=4096)
+        conn, reads = self.recorded_column_reads()
+        try:
+            with patch.object(config_repository, "MAX_PREVIEW_SAMPLE_BYTES", 16):
+                sample = config_repository._sample_rows(
+                    conn,
+                    kind="prefilter_policy",
+                    window_start="2000-01-01T00:00:00.000000Z",
+                    candidate_limit=20,
+                )
+        finally:
+            conn.close()
+
+        # The engine is never asked for the body at all, so it cannot
+        # materialize one: only the recorded size is read.
+        self.assertNotIn(("triage_events", "raw_alert"), reads)
+        self.assertIn(("triage_events", "raw_alert_bytes"), reads)
+        self.assertEqual(sample.rows, [])
+        self.assertTrue(sample.truncated_by_bytes)
+
+    def test_an_accepted_row_reads_its_body_exactly_once(self):
+        self.add_event(1, 1001, "10.0.0.1", "198.51.100.1", padding=64)
+        conn, reads = self.recorded_column_reads()
+        try:
+            sample = config_repository._sample_rows(
+                conn,
+                kind="prefilter_policy",
+                window_start="2000-01-01T00:00:00.000000Z",
+                candidate_limit=20,
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(len(sample.rows), 1)
+        self.assertFalse(sample.truncated)
+        self.assertEqual(reads.count(("triage_events", "raw_alert")), 1)
+
+    def test_a_row_retained_before_sizes_were_recorded_stops_the_sample(self):
+        self.add_event(1, 1001, "10.0.0.1", "198.51.100.1", record_size=False)
+        draft_id, _, summary = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+        captured, spy = self.sampled_alert_bodies("_prefilter_preview")
+        conn, reads = self.recorded_column_reads()
+        try:
+            sample = config_repository._sample_rows(
+                conn,
+                kind="prefilter_policy",
+                window_start="2000-01-01T00:00:00.000000Z",
+                candidate_limit=20,
+            )
+        finally:
+            conn.close()
+
+        # An unrecorded size is never trusted, so the body is not fetched.
+        self.assertEqual(sample.rows, [])
+        self.assertTrue(sample.truncated)
+        self.assertTrue(sample.truncated_by_unsized)
+        self.assertFalse(sample.truncated_by_bytes)
+        self.assertNotIn(("triage_events", "raw_alert"), reads)
+
+        with spy:
+            response = self.client.post(
+                f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+                headers=self.headers,
+                json={"expected_generation": summary["generation"], "candidate_limit": 20},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["candidates_examined"], 0)
+        self.assertTrue(payload["truncated"])
+        self.assertIn(
+            "preview sample stopped at a retained alert with no recorded size",
+            payload["warnings"],
+        )
+        self.assertEqual(captured, [[]])
+        detail = json.loads(
+            self.db_rows(
+                """SELECT detail_json FROM operator_config_audit
+                   WHERE action = 'draft_previewed' ORDER BY id DESC LIMIT 1"""
+            )[0][0]
+        )
+        self.assertTrue(detail["truncated_by_unsized"])
+        self.assertFalse(detail["truncated_by_bytes"])
+
+    def test_asset_preview_is_unaffected_by_unrecorded_sizes(self):
+        migrated = self.add_event(
+            1, 5001, "10.0.0.1", "10.0.0.2", record_size=False
+        )
+        draft_id, _, summary = self.create_validate(
+            "asset_inventory",
+            asset_document(asset("firewall", "10.0.0.1")),
+        )
+        conn, reads = self.recorded_column_reads()
+        try:
+            sample = config_repository._sample_rows(
+                conn,
+                kind="asset_inventory",
+                window_start="2000-01-01T00:00:00.000000Z",
+                candidate_limit=20,
+            )
+        finally:
+            conn.close()
+
+        # Address comparison reads neither the body nor its size.
+        self.assertNotIn(("triage_events", "raw_alert"), reads)
+        self.assertNotIn(("triage_events", "raw_alert_bytes"), reads)
+        self.assertEqual(len(sample.rows), 1)
+        self.assertFalse(sample.truncated)
+
+        response = self.client.post(
+            f"/api/v1/config/asset_inventory/drafts/{draft_id}/preview",
+            headers=self.headers,
+            json={"expected_generation": summary["generation"], "candidate_limit": 20},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["candidates_examined"], 1)
+        self.assertEqual(
+            response.json()["summary"]["affected_event_ids"], [migrated]
+        )
+
+    def test_ingestion_records_the_exact_utf8_size_of_the_retained_alert(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            event = normalize_suricata_event(
+                {
+                    "event_type": "alert",
+                    "timestamp": "2026-08-15T00:00:00Z",
+                    "src_ip": "10.0.0.1",
+                    "proto": "tcp",
+                    "alert": {
+                        "signature_id": 4242,
+                        "signature": "Multibyte é signature",
+                    },
+                    "payload_printable": "é" * 100,
+                }
+            )
+            triage.insert_triage_row(
+                conn,
+                event,
+                {"verdict": "real", "confidence": 0.9, "reasoning": "test"},
+            )
+            conn.commit()
+            stored, recorded = conn.execute(
+                "SELECT raw_alert, raw_alert_bytes FROM triage_events"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertIsNotNone(recorded)
+        self.assertEqual(recorded, len(stored.encode("utf-8")))
+        self.assertEqual(json.loads(stored)["payload_printable"], "é" * 100)
+
+    def test_migration_adds_the_size_column_to_an_existing_database(self):
+        legacy_path = self.root / "legacy.db"
+        # The shipped schema with only this column removed is exactly the
+        # previous release's triage_events definition.
+        previous_schema = "\n".join(
+            line
+            for line in (
+                Path(PROJECT_ROOT / "triagewall" / "schema.sql")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
+            if "raw_alert_bytes" not in line
+        )
+        conn = sqlite3.connect(legacy_path)
+        try:
+            conn.executescript(previous_schema)
+            columns_before = {
+                row[1] for row in conn.execute("PRAGMA table_info('triage_events')")
+            }
+            conn.execute(
+                """INSERT INTO triage_events (timestamp, signature_id, signature, raw_alert)
+                   VALUES ('2026-08-15T00:00:00Z', 1, 'legacy', '{}')"""
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertNotIn("raw_alert_bytes", columns_before)
+
+        migrations.ensure_db_initialized(legacy_path)
+
+        conn = sqlite3.connect(legacy_path)
+        try:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info('triage_events')")
+            }
+            retained = conn.execute(
+                "SELECT raw_alert, raw_alert_bytes FROM triage_events"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertIn("raw_alert_bytes", columns)
+        # The migration adds the column without rewriting retained rows, so the
+        # historical row keeps its body and reports no size.
+        self.assertEqual(retained, ("{}", None))
+        self.assertIn("raw_alert_bytes", migrations.ADDED_EVENT_COLUMNS)
 
     def test_asset_preview_hands_the_evaluator_no_alert_bodies(self):
         self.add_event(1, 5001, "10.0.0.1", "10.0.0.2", padding=4096)

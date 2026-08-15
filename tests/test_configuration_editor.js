@@ -756,6 +756,146 @@ test("a failure from a superseded credential never reports over the newer one", 
   );
 });
 
+async function connectDeferred(harness) {
+  const connecting = connect(harness);
+  await harness.release();
+  await connecting;
+}
+
+async function openRuleEditor(harness) {
+  await harness.document.getElementById("configWorkspace").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-config-rule-edit]"
+          ? { dataset: { configRuleEdit: "0" } }
+          : null,
+    },
+  });
+}
+
+test("resetting the asset form keeps unfinished rule input through an older reload", async () => {
+  const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+  await connectDeferred(harness);
+
+  const reload = harness.editor.load(true);
+  await openRuleEditor(harness);
+  harness.document.getElementById("configRuleReason").value = "Half-typed rule";
+  await harness.document.getElementById("configRuleReason").dispatch("input");
+  // Cancelling the *asset* form must not declare the rule form finished.
+  await harness.document.getElementById("configAssetCancel").dispatch("click");
+  await harness.release();
+  await reload;
+
+  assert.equal(harness.document.getElementById("configRuleReason").value, "Half-typed rule");
+  assert.equal(harness.document.getElementById("configRuleIndex").value, "0");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "rule");
+});
+
+test("resetting the rule form keeps unfinished asset input through an older reload", async () => {
+  const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+  await connectDeferred(harness);
+
+  const reload = harness.editor.load(true);
+  harness.document.getElementById("configAssetHostname").value = "half-typed-host";
+  await harness.document.getElementById("configAssetHostname").dispatch("input");
+  await harness.document.getElementById("configRuleCancel").dispatch("click");
+  await harness.release();
+  await reload;
+
+  assert.equal(harness.document.getElementById("configAssetHostname").value, "half-typed-host");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "asset");
+});
+
+test("a change note survives resetting either structured form", async () => {
+  for (const cancelId of ["configRuleCancel", "configAssetCancel"]) {
+    const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+    await connectDeferred(harness);
+
+    const reload = harness.editor.load(true);
+    harness.document.getElementById("configChangeNote").value = "Why this change";
+    await harness.document.getElementById("configChangeNote").dispatch("input");
+    await harness.document.getElementById(cancelId).dispatch("click");
+    await harness.release();
+    await reload;
+
+    assert.equal(
+      harness.document.getElementById("configChangeNote").value,
+      "Why this change",
+      `${cancelId}: note discarded`,
+    );
+    assert.equal(harness.editor.state().dirtyForms.join(","), "note", `${cancelId}: scope`);
+  }
+});
+
+test("an older reload does not discard an unknown-asset alert seed", async () => {
+  const harness = runEditor({
+    defer: (url) => url === "/api/v1/config/audit?limit=25",
+    assetRows: [
+      {
+        hostname: "server",
+        role: "application",
+        ips: ["10.0.0.8"],
+        criticality: "low",
+        internet_facing: false,
+        exposed_ports: [],
+      },
+    ],
+  });
+  await connectDeferred(harness);
+
+  const reload = harness.editor.load(true);
+  // The seed lands while that reload is still in flight; it supersedes it.
+  const seeding = harness.editor.seedFromAlert({ src_ip: "203.0.113.7", asset_context: {} }, "asset-source");
+  await harness.release();
+  await Promise.all([reload, seeding]);
+
+  assert.equal(harness.document.getElementById("configAssetIps").value, "203.0.113.7");
+  assert.equal(harness.document.getElementById("configAssetIndex").value, "");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "asset");
+});
+
+test("an older reload does not discard a prefilter alert seed", async () => {
+  const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+  await connectDeferred(harness);
+
+  const reload = harness.editor.load(true);
+  const seeding = harness.editor.seedFromAlert(
+    { signature_id: 2024, signature: "Routine TLS alert", proto: "TCP", dest_port: 443 },
+    "prefilter",
+  );
+  await harness.release();
+  await Promise.all([reload, seeding]);
+
+  assert.equal(harness.document.getElementById("configRuleSignatures").value, "2024");
+  assert.equal(String(harness.document.getElementById("configRuleDestinationPorts").value), "443");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "rule");
+});
+
+test("typing an internal CIDR survives an older reload before it commits", async () => {
+  const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
+  await connectDeferred(harness);
+
+  const reload = harness.editor.load(true);
+  // Keystrokes only: the change event that commits the value has not fired.
+  harness.document.getElementById("configInternalCidrs").value = "10.7.7.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("input");
+  await harness.release();
+  await reload;
+
+  assert.equal(harness.document.getElementById("configInternalCidrs").value, "10.7.7.0/24");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "cidrs");
+  // The document itself is untouched until the change event commits it.
+  assert.equal(harness.editor.state().dirtyKinds.join(","), "");
+
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  assert.equal(harness.editor.state().dirtyKinds.join(","), "prefilter_policy");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "");
+  assert.match(
+    harness.document.getElementById("configExactDocument").textContent,
+    /10\.7\.7\.0\/24/,
+  );
+});
+
 test("an older reload does not discard unfinished rule form input", async () => {
   const harness = runEditor({ defer: (url) => url === "/api/v1/config/audit?limit=25" });
   const connecting = connect(harness);

@@ -977,6 +977,16 @@ def _preview_bounds(hours: int, candidate_limit: int) -> None:
         raise ConfigRepositoryError("preview candidate limit is out of range")
 
 
+@dataclass(frozen=True)
+class _PreviewSample:
+    """One bounded preview sample and why it stopped where it did."""
+
+    rows: list
+    truncated: bool
+    truncated_by_bytes: bool
+    truncated_by_unsized: bool
+
+
 def _sample_rows(
     conn: sqlite3.Connection,
     *,
@@ -992,26 +1002,24 @@ def _sample_rows(
     sensor are excluded from a prefilter preview.
 
     The row cap alone does not bound memory, because one retained alert may be
-    arbitrarily large. The scan therefore reads only each candidate's metadata
-    and its alert body *size*, measured in UTF-8 bytes by SQLite, and fetches a
-    body only once it is known to fit the remaining budget. No oversized body is
-    ever transferred into this process, so no oversized body can be retained or
-    decoded -- including the first one. The sample stops at whichever bound is
-    reached first and reports the truncation to the operator rather than
-    silently narrowing the comparison.
+    arbitrarily large. The scan therefore reads each candidate's metadata and
+    the size recorded beside its alert at ingestion -- never the body, and never
+    an expression over the body, because measuring one inside SQLite makes the
+    engine materialize it first. A body is fetched only once its recorded size
+    is known to fit the remaining budget, so no oversized body is materialized,
+    transferred, retained, or decoded, including the first one. The sample stops
+    at whichever bound is reached first and reports the truncation to the
+    operator rather than silently narrowing the comparison.
     """
     source_clause = (
         "AND (sensor.source_type IS NULL OR sensor.source_type = 'suricata')"
         if kind == PREFILTER_KIND
         else ""
     )
-    # An asset preview compares addresses only, so it never reads alert bodies
-    # and never spends the byte budget.
+    # An asset preview compares addresses only, so it never reads alert bodies,
+    # never spends the byte budget, and is unaffected by an unrecorded size.
     reads_alerts = kind == PREFILTER_KIND
-    # length() over a BLOB cast counts stored UTF-8 bytes, not characters.
-    size_column = (
-        "length(CAST(events.raw_alert AS BLOB))" if reads_alerts else "0"
-    )
+    size_column = "events.raw_alert_bytes" if reads_alerts else "NULL"
     cursor = conn.execute(
         f"""SELECT events.id, {size_column}, events.signature_id,
                    events.src_ip, events.dest_ip
@@ -1029,36 +1037,59 @@ def _sample_rows(
     remaining_bytes = MAX_PREVIEW_SAMPLE_BYTES
     truncated_by_rows = False
     truncated_by_bytes = False
+    truncated_by_unsized = False
     for event_id, alert_bytes, signature_id, src_ip, dest_ip in cursor:
         if len(rows) >= candidate_limit:
             truncated_by_rows = True
             break
         alert = None
         if reads_alerts:
-            size = int(alert_bytes or 0)
+            if alert_bytes is None:
+                # Retained before sizes were recorded. Fetching it would mean
+                # trusting an unknown length, so the sample stops here and says
+                # so instead of weakening the byte bound.
+                truncated_by_unsized = True
+                break
+            size = int(alert_bytes)
             if size > remaining_bytes:
                 truncated_by_bytes = True
                 break
-            alert = _bounded_alert_body(conn, int(event_id), remaining_bytes)
+            alert = _bounded_alert_body(conn, int(event_id), size)
             if alert is None:
                 # The row changed or vanished between the two reads; skipping it
                 # keeps the guarantee that nothing oversized is ever decoded.
                 continue
-            remaining_bytes -= size
+            # Charge what actually arrived. A recorded size that understates the
+            # body must not silently buy extra budget for later rows.
+            actual = len(alert.encode("utf-8"))
+            if actual > remaining_bytes:
+                truncated_by_bytes = True
+                break
+            remaining_bytes -= max(size, actual)
         rows.append((int(event_id), alert, signature_id, src_ip, dest_ip))
-    return rows, truncated_by_rows or truncated_by_bytes, truncated_by_bytes
+    return _PreviewSample(
+        rows=rows,
+        truncated=truncated_by_rows or truncated_by_bytes or truncated_by_unsized,
+        truncated_by_bytes=truncated_by_bytes,
+        truncated_by_unsized=truncated_by_unsized,
+    )
 
 
 def _bounded_alert_body(
     conn: sqlite3.Connection,
     event_id: int,
-    remaining_bytes: int,
+    recorded_bytes: int,
 ) -> str | None:
-    """Fetch one retained alert body only while it still fits the budget."""
+    """Fetch one retained alert body against its recorded size.
+
+    The size predicate is the trusted stored integer, never a measurement of the
+    body, so a row whose size changed under us is skipped rather than read.
+    """
     row = conn.execute(
         """SELECT raw_alert FROM triage_events
-           WHERE id = ? AND length(CAST(raw_alert AS BLOB)) <= ?""",
-        (event_id, remaining_bytes),
+           WHERE id = ? AND raw_alert_bytes IS NOT NULL
+             AND raw_alert_bytes = ?""",
+        (event_id, recorded_bytes),
     ).fetchone()
     if row is None or row[0] is None:
         return None
@@ -1253,12 +1284,14 @@ def preview_draft(
             )
     now = utc_now()
     window_start = format_utc_timestamp(now - timedelta(hours=hours))
-    sampled, truncated, truncated_by_bytes = _sample_rows(
+    sample = _sample_rows(
         conn,
         kind=kind,
         window_start=window_start,
         candidate_limit=candidate_limit,
     )
+    sampled = sample.rows
+    truncated = sample.truncated
     if kind == PREFILTER_KIND:
         _, active_asset_document = _active_document(conn, ASSET_KIND, state)
         summary, warnings = _prefilter_preview(
@@ -1273,8 +1306,12 @@ def preview_draft(
             candidate_document,
             sampled,
         )
-    if truncated_by_bytes:
+    if sample.truncated_by_bytes:
         warnings.append("preview sample reached its byte budget before its row limit")
+    if sample.truncated_by_unsized:
+        warnings.append(
+            "preview sample stopped at a retained alert with no recorded size"
+        )
     timestamp = occurred_at or utc_now_iso()
     with rejection:
         conn.execute("BEGIN IMMEDIATE")
@@ -1302,7 +1339,8 @@ def preview_draft(
                 "candidate_limit": candidate_limit,
                 "candidates_examined": len(sampled),
                 "truncated": truncated,
-                "truncated_by_bytes": truncated_by_bytes,
+                "truncated_by_bytes": sample.truncated_by_bytes,
+                "truncated_by_unsized": sample.truncated_by_unsized,
                 "warning_count": len(warnings),
             },
         )

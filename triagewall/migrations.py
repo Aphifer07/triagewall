@@ -51,6 +51,18 @@ REQUIRED_INDEXES = {
     "idx_spc_buckets_ip",
 }
 
+# Columns added to triage_events after its first release. Each is nullable so an
+# existing database can gain it without rewriting retained rows; readers must
+# therefore treat a NULL as "not recorded" rather than as a value.
+ADDED_EVENT_COLUMNS = {
+    "src_asset_snapshot_id": "INTEGER",
+    "dest_asset_snapshot_id": "INTEGER",
+    "config_generation": "INTEGER",
+    "prefilter_revision": "TEXT",
+    "asset_revision": "TEXT",
+    "raw_alert_bytes": "INTEGER",
+}
+
 REQUIRED_CONFIG_COLUMNS = {
     "operator_config_revisions": {
         "id",
@@ -141,20 +153,8 @@ def ensure_db_initialized(db_path: str | Path) -> None:
                     row[1]
                     for row in conn.execute("PRAGMA table_info('triage_events')")
                 }
-                for column_name in (
-                    "src_asset_snapshot_id",
-                    "dest_asset_snapshot_id",
-                    "config_generation",
-                    "prefilter_revision",
-                    "asset_revision",
-                ):
+                for column_name, column_type in ADDED_EVENT_COLUMNS.items():
                     if column_name not in event_columns:
-                        column_type = (
-                            "INTEGER"
-                            if column_name.endswith("_id")
-                            or column_name == "config_generation"
-                            else "TEXT"
-                        )
                         conn.execute(
                             f"ALTER TABLE triage_events "
                             f"ADD COLUMN {column_name} {column_type}"
@@ -257,13 +257,7 @@ def verify_db_initialized(db_path: str | Path) -> None:
 
     missing_tables = REQUIRED_TABLES - tables
     missing_indexes = REQUIRED_INDEXES - indexes
-    missing_columns = {
-        "src_asset_snapshot_id",
-        "dest_asset_snapshot_id",
-        "config_generation",
-        "prefilter_revision",
-        "asset_revision",
-    } - event_columns
+    missing_columns = set(ADDED_EVENT_COLUMNS) - event_columns
     if "source_type" not in failure_columns:
         missing_columns.add("ingest_failures.source_type")
     for table, required_columns in REQUIRED_CONFIG_COLUMNS.items():

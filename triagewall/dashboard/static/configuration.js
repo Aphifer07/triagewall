@@ -23,9 +23,12 @@
   let pendingSeed = null;
   let editingRule = null;
   let editingRuleForm = null;
-  // Unapplied input sitting in the rule or asset form. It is not a document
-  // change, but it is operator work that a background reload must not discard.
-  let formDirty = false;
+  // Which editor surfaces hold unapplied input. Tracked per surface, because
+  // resetting one form must not declare the operator's work in another form --
+  // or in the change note -- finished. None of these is a document change; each
+  // is operator work that a background reload must not discard.
+  const FORM_SCOPES = { rule: "rule", asset: "asset", note: "note", cidrs: "cidrs" };
+  let dirtyForms = new Set();
   // Monotonic epoch for everything an in-flight response could overwrite. A
   // response may only publish when the epoch it started under is still current,
   // so a slow reload can never resurrect stale bytes over a newer load, a local
@@ -41,13 +44,21 @@
     return stateEpoch;
   }
 
-  function noteFormActivity() {
-    // Opening or typing in an editor form is newer state than any reload
-    // already in flight, so that reload may no longer reset these fields. This
-    // deliberately does not mark the candidate document dirty: unapplied form
-    // input has not changed the document yet.
-    formDirty = true;
+  function noteFormActivity(scope) {
+    // Opening, typing in, or programmatically populating an editor surface is
+    // newer state than any reload already in flight, so that reload may no
+    // longer reset these fields. This deliberately does not mark the candidate
+    // document dirty: unapplied form input has not changed the document yet.
+    dirtyForms.add(scope);
     invalidateInFlightResponses();
+  }
+
+  function clearFormScope(scope) {
+    dirtyForms.delete(scope);
+  }
+
+  function hasUnappliedFormWork() {
+    return dirtyForms.size > 0;
   }
 
   function element(id) {
@@ -182,8 +193,10 @@
     "configAssetCriticality",
     "configAssetInternetFacing",
     "configAssetPorts",
-    "configChangeNote",
   ];
+  // The change note belongs to neither structured form: resetting either one
+  // must leave a half-written note alone.
+  const NOTE_FORM_INPUT_IDS = ["configChangeNote"];
   const RULE_FORM_MATCH_KEYS = [
     ...RULE_SELECT_FIELDS.map(([key]) => key),
     ...RULE_NUMBER_LIST_FIELDS.map(([key]) => key),
@@ -193,7 +206,9 @@
   function resetRuleForm() {
     editingRule = null;
     editingRuleForm = null;
-    formDirty = false;
+    // Only this form's work is finished; the asset form and the change note
+    // keep whatever unapplied input they hold.
+    clearFormScope(FORM_SCOPES.rule);
     element("configRuleIndex").value = "";
     element("configRuleSignatures").value = "";
     element("configRuleReason").value = "";
@@ -209,6 +224,19 @@
     element("configRulePreserved").textContent = "";
   }
 
+  function cancelRuleForm() {
+    // Cancelling is a deliberate action on this form only. It is newer than any
+    // reload in flight, which must therefore not go on to reset the asset form
+    // or the change note on this operator's behalf.
+    invalidateInFlightResponses();
+    resetRuleForm();
+  }
+
+  function cancelAssetForm() {
+    invalidateInFlightResponses();
+    resetAssetForm();
+  }
+
   function describePreservedConstraints(rule) {
     const match = rule?.match ?? {};
     const notes = Object.keys(match).sort().filter((key) => {
@@ -222,7 +250,7 @@
   }
 
   function resetAssetForm() {
-    formDirty = false;
+    clearFormScope(FORM_SCOPES.asset);
     element("configAssetIndex").value = "";
     element("configAssetHostname").value = "";
     element("configAssetRole").value = "";
@@ -373,7 +401,7 @@
     const match = rule.match ?? {};
     // The rule being edited is retained whole. The form represents only part of
     // a match, so applying it must narrow nothing the operator did not touch.
-    noteFormActivity();
+    noteFormActivity(FORM_SCOPES.rule);
     editingRule = clone(rule);
     element("configRuleIndex").value = String(index);
     element("configRuleSignatures").value = (rule.signature_ids ?? []).join(", ");
@@ -451,7 +479,7 @@
   function editAsset(index) {
     const asset = workingDocuments.asset_inventory?.assets?.[index];
     if (!asset) return;
-    noteFormActivity();
+    noteFormActivity(FORM_SCOPES.asset);
     element("configAssetIndex").value = String(index);
     element("configAssetHostname").value = asset.hostname ?? "";
     element("configAssetRole").value = asset.role ?? "";
@@ -520,6 +548,9 @@
       const validatedRevisionId = payload.resumed
         ? payload.validated_revision_id ?? null
         : null;
+      // The note has now been applied to an immutable draft, so it is no
+      // longer unapplied work.
+      clearFormScope(FORM_SCOPES.note);
       lifecycle = {
         kind: selectedKind,
         draftId: payload.draft.id,
@@ -666,6 +697,9 @@
       element("configRuleFlowDirection").value = ["to_server", "to_client"].includes(seed.flowDirection) ? seed.flowDirection : "";
       element("configRuleSourcePorts").value = seed.sourcePort ?? "";
       element("configRuleDestinationPorts").value = seed.destinationPort ?? "";
+      // Evidence the operator has not applied yet is unapplied work, whether
+      // they typed it or an alert handoff filled it in for them.
+      noteFormActivity(FORM_SCOPES.rule);
       setMessage("Alert evidence populated the rule form. Review its scope before applying it to the candidate.");
       element("configRuleReason").focus();
     } else {
@@ -693,6 +727,7 @@
       element("configAssetCriticality").value = seed.asset?.criticality ?? "medium";
       element("configAssetInternetFacing").checked = Boolean(seed.asset?.internet_facing);
       element("configAssetPorts").value = (seed.asset?.exposed_ports ?? []).map((port) => `${port.protocol}/${port.port}`).join(", ");
+      noteFormActivity(FORM_SCOPES.asset);
       setMessage(
         `Alert evidence populated the asset form. Review it before applying it to the candidate.${staleWarning}`,
         Boolean(staleWarning),
@@ -735,7 +770,7 @@
     // can be older than the active generation and would open Add for an
     // address the active inventory already owns.
     const decidesOwnership = action !== "prefilter";
-    const hasLocalWork = dirtyKinds.size > 0 || formDirty;
+    const hasLocalWork = dirtyKinds.size > 0 || hasUnappliedFormWork();
     if (decidesOwnership && loaded && !hasLocalWork) {
       // Nothing local to lose: refresh, then decide. The load applies the seed.
       return load(true);
@@ -786,6 +821,9 @@
       };
       auditEntries = snapshot.audit.entries;
       dirtyKinds = new Set();
+      // This load was never superseded, so every surface it is about to reset
+      // genuinely had no newer operator work in it.
+      dirtyForms = new Set();
       lifecycle = emptyLifecycle();
       clearRollbackSelection();
       loaded = true;
@@ -874,7 +912,7 @@
     revisions = {};
     auditEntries = [];
     dirtyKinds = new Set();
-    formDirty = false;
+    dirtyForms = new Set();
     lifecycle = emptyLifecycle();
     clearRollbackSelection();
     loaded = false;
@@ -931,26 +969,40 @@
     element("configWorkspace").addEventListener("click", handleWorkspaceClick);
     element("configPrefilterForm").addEventListener("submit", applyRule);
     element("configAssetForm").addEventListener("submit", applyAsset);
+    // Typing a CIDR is protected from the keystroke, before the change event
+    // commits it into the candidate document.
+    element("configInternalCidrs").addEventListener("input", () => {
+      noteFormActivity(FORM_SCOPES.cidrs);
+    });
     element("configInternalCidrs").addEventListener("change", () => {
       workingDocuments.prefilter_policy.internal_cidrs = csvStrings(element("configInternalCidrs").value);
       selectedKind = "prefilter_policy";
+      clearFormScope(FORM_SCOPES.cidrs);
       markDirty();
     });
-    element("configRuleCancel").addEventListener("click", resetRuleForm);
-    element("configAssetCancel").addEventListener("click", resetAssetForm);
+    element("configRuleCancel").addEventListener("click", cancelRuleForm);
+    element("configAssetCancel").addEventListener("click", cancelAssetForm);
     element("configForgetButton").addEventListener("click", forget);
     element("configReloadButton").addEventListener("click", () => {
       // An explicitly confirmed reload is allowed to discard both an edited
-      // candidate and unapplied form input; nothing else is.
+      // candidate and every surface's unapplied input; nothing else is.
       if (
-        (dirtyKinds.size || formDirty)
+        (dirtyKinds.size || hasUnappliedFormWork())
         && !global.confirm("Discard unsaved candidate changes and reload active configuration?")
       ) return undefined;
       return load(true);
     });
-    RULE_FORM_INPUT_IDS.concat(ASSET_FORM_INPUT_IDS).forEach((id) => {
-      element(id).addEventListener("input", noteFormActivity);
-      element(id).addEventListener("change", noteFormActivity);
+    const scopedInputs = [
+      [RULE_FORM_INPUT_IDS, FORM_SCOPES.rule],
+      [ASSET_FORM_INPUT_IDS, FORM_SCOPES.asset],
+      [NOTE_FORM_INPUT_IDS, FORM_SCOPES.note],
+    ];
+    scopedInputs.forEach(([ids, scope]) => {
+      ids.forEach((id) => {
+        const handler = () => noteFormActivity(scope);
+        element(id).addEventListener("input", handler);
+        element(id).addEventListener("change", handler);
+      });
     });
     element("configCreateDraft").addEventListener("click", createDraft);
     element("configValidateDraft").addEventListener("click", validateDraft);
@@ -974,6 +1026,7 @@
       generation: summary?.generation ?? null,
       lifecycle: { ...lifecycle },
       dirtyKinds: [...dirtyKinds],
+      dirtyForms: [...dirtyForms],
     }),
   };
 })(window);

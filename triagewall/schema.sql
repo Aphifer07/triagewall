@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS triage_events (
     action TEXT,                             -- allowed/blocked
     
     raw_alert TEXT NOT NULL,                 -- full JSON for re-processing
-    
+    raw_alert_bytes INTEGER,                 -- UTF-8 byte length of raw_alert
+
     -- Agent verdict
     verdict TEXT,                            -- 'real' | 'false_positive' | 'uncertain' | NULL until processed
     confidence REAL,
