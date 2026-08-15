@@ -195,10 +195,12 @@ class RelatedGroup(BaseModel):
 
 
 class RecurrenceSummary(BaseModel):
-    """Occurrences of this alert's (source type, signature id) in the window.
+    """Occurrences of this alert's group in the bounded candidate set.
 
     ``available`` is false when the row carries no signature_id: there is no
     group to belong to, and correlating on NULL would gather unrelated rows.
+    ``exact`` is true only when the candidate query exhausted the window;
+    otherwise ``truncated`` makes the partial count explicit.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -213,6 +215,10 @@ class RecurrenceSummary(BaseModel):
     false_positive_count: int
     uncertain_count: int
     unclassified_count: int
+    exact: bool
+    truncated: bool
+    candidate_limit: int | None = None
+    candidates_examined: int
 
 
 class NeighborAlert(BaseModel):

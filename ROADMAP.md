@@ -267,17 +267,20 @@ and no new sensor field were introduced.
   decoder context is presented separately from the Suricata flow envelope.
   Neither is forced into the other's labels.
 
-**Exact versus navigational.** Recurrence and the same-rule group are exact
-within the window: both are equality on `(source type, signature id)` served by
-the signature index. Qualifying by source type is required for correctness, not
-neatness — Suricata keeps its SID and Wazuh keeps `rule.id` in the same column.
+**Exact versus navigational.** All correlation views examine at most 2,000 of
+the newest events in the requested window, selected through the `processed_at`
+index. Recurrence and the same-rule group use equality on
+`(source type, signature id)` inside that candidate set. Qualifying by source
+type is required for correctness, not neatness — Suricata keeps its SID and
+Wazuh keeps `rule.id` in the same column. Their counts are exact only when the
+candidate query exhausts the window; otherwise they are partial.
 
-The address groups are navigational aids, not complete correlation.
-`src_ip`/`dest_ip` are unindexed, so matching runs inside a bounded set of the
-newest candidates in the window, selected through the `processed_at` index. The
-API returns `candidate_limit`, `candidates_examined`, and `truncated`, and the
-UI labels a truncated result as partial. Shared addressing is an observation
-about addressing; it does not establish a shared cause.
+The address groups are navigational aids, not complete correlation. They match
+exact `src_ip` or `dest_ip` values inside the same bounded candidate set and
+remain non-causal even when the window is exhausted. The API returns
+`candidate_limit`, `candidates_examined`, and `truncated`, and the UI labels a
+truncated result as partial. Shared addressing is an observation about
+addressing; it does not establish a shared cause.
 
 **Known data limitations.** These are shown as "not recorded" rather than
 inferred:

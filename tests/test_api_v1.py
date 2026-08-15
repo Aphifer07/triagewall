@@ -1106,6 +1106,8 @@ class InvestigationTests(unittest.TestCase):
     def test_suricata_recurrence_counts_only_suricata_rows(self):
         recurrence = self.investigate(1).json()["recurrence"]
         self.assertTrue(recurrence["available"])
+        self.assertTrue(recurrence["exact"])
+        self.assertFalse(recurrence["truncated"])
         self.assertEqual(recurrence["source_type"], "suricata")
         self.assertEqual(recurrence["signature_id"], 2001)
         # Events 1-4 are Suricata SID 2001. Event 5 is Wazuh rule 2001.
@@ -1152,7 +1154,9 @@ class InvestigationTests(unittest.TestCase):
 
     def test_same_rule_group_is_marked_exact_and_addresses_are_not(self):
         payload = self.investigate(1).json()
-        self.assertTrue(self.group(payload, "same_rule")["exact"])
+        same_rule = self.group(payload, "same_rule")
+        self.assertTrue(same_rule["exact"])
+        self.assertIn("examined candidates", same_rule["reason"])
         for relationship in ("same_source_ip", "same_destination_ip"):
             entry = self.group(payload, relationship)
             self.assertFalse(entry["exact"])
@@ -1203,8 +1207,13 @@ class InvestigationTests(unittest.TestCase):
         self.assertTrue(entry["truncated"])
         self.assertEqual(entry["candidate_limit"], 2)
         self.assertEqual(entry["candidates_examined"], 2)
-        # The exact group is unaffected by the candidate budget.
-        self.assertFalse(self.group(payload, "same_rule")["truncated"])
+        # Recurrence and same-rule activity share the same honest boundary.
+        recurrence = payload["recurrence"]
+        self.assertFalse(recurrence["exact"])
+        self.assertTrue(recurrence["truncated"])
+        self.assertEqual(recurrence["candidate_limit"], 2)
+        self.assertEqual(recurrence["candidates_examined"], 2)
+        self.assertTrue(self.group(payload, "same_rule")["truncated"])
 
     def test_candidate_budget_boundaries_report_truncation_honestly(self):
         # The window holds 7 events, the anchor included. Ordered newest first
@@ -1636,19 +1645,6 @@ class InvestigationScaleTests(unittest.TestCase):
         )
         self.assertNoUnboundedEventScan(steps)
 
-    def test_recurrence_is_bounded_by_the_processed_at_window(self):
-        window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
-        steps = self.plan_for(services._RECURRENCE_SQL, (window, 2001, "suricata"))
-        self.assertWindowDrivenPlan(steps, "recurrence")
-
-    def test_related_by_rule_is_bounded_by_the_processed_at_window(self):
-        window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
-        steps = self.plan_for(
-            services._RELATED_BY_RULE_SQL,
-            (window, 2001, "suricata", 1, services.MAX_RELATED_ALERTS),
-        )
-        self.assertWindowDrivenPlan(steps, "related-by-rule")
-
     def test_candidate_selection_is_driven_by_the_processed_at_index(self):
         window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
         steps = self.plan_for(
@@ -1665,6 +1661,16 @@ class InvestigationScaleTests(unittest.TestCase):
         payload = self.client.get(
             "/api/v1/verdicts/25/investigation", headers=self.host
         ).json()
+        recurrence = payload["recurrence"]
+        self.assertFalse(recurrence["exact"])
+        self.assertTrue(recurrence["truncated"])
+        self.assertEqual(
+            recurrence["candidates_examined"],
+            services.MAX_RELATED_CANDIDATE_ROWS,
+        )
+        self.assertLessEqual(
+            recurrence["occurrences"], services.MAX_RELATED_CANDIDATE_ROWS
+        )
         for entry in payload["related"]:
             self.assertLessEqual(len(entry["alerts"]), services.MAX_RELATED_ALERTS)
             if entry["candidates_examined"]:
@@ -1689,6 +1695,34 @@ class InvestigationScaleTests(unittest.TestCase):
             elapsed,
             budget_seconds,
             f"investigation took {elapsed:.2f}s over {self.ROW_COUNT} rows",
+        )
+
+    def investigation_progress_ticks(self, event_id):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        ticks = {"count": 0}
+
+        def handler():
+            ticks["count"] += 1
+            return 0
+
+        try:
+            conn.set_progress_handler(handler, 1000)
+            services.fetch_investigation(conn, event_id)
+        finally:
+            conn.close()
+        return ticks["count"]
+
+    def test_neighbor_work_does_not_scale_with_distance_from_newest(self):
+        near_newest = self.investigation_progress_ticks(25)
+        near_oldest = self.investigation_progress_ticks(self.ROW_COUNT - 25)
+        # Correlation examines the same fixed candidate budget for both. Queue
+        # navigation must add only bounded seeks, not a walk over the thousands
+        # of rows newer than the old anchor.
+        self.assertLess(
+            near_oldest,
+            max(near_newest * 2, near_newest + 30),
+            f"neighbor work scaled with queue distance ({near_newest} -> {near_oldest})",
         )
 
 
@@ -1871,35 +1905,19 @@ class LongRetentionRecurrenceTests(unittest.TestCase):
             conn.close()
         return ticks["count"]
 
-    def test_retained_history_does_not_add_proportional_work(self):
+    def test_retained_history_does_not_add_proportional_candidate_work(self):
         window = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
-        cases = (
-            ("recurrence", services._RECURRENCE_SQL, (window, self.SHARED_RULE_ID, "suricata")),
-            (
-                "related-by-rule",
-                services._RELATED_BY_RULE_SQL,
-                (
-                    window,
-                    self.SHARED_RULE_ID,
-                    "suricata",
-                    self.recent_ids["suricata"][0],
-                    services.MAX_RELATED_ALERTS,
-                ),
-            ),
+        sql = services._RELATED_CANDIDATES_SQL
+        params = (window, services.MAX_RELATED_CANDIDATE_ROWS + 1)
+        small = self.measure_steps(self.small_path, sql, params)
+        large = self.measure_steps(self.large_path, sql, params)
+        # Ten times the retained history. The processed_at range must keep old
+        # rows from adding proportional work to any investigation view.
+        self.assertLess(
+            large,
+            max(small * 2, small + 20),
+            f"candidate work scaled with retention ({small} -> {large})",
         )
-        for label, sql, params in cases:
-            with self.subTest(query=label):
-                small = self.measure_steps(self.small_path, sql, params)
-                large = self.measure_steps(self.large_path, sql, params)
-                # Ten times the retained history. If the signature index were
-                # driving, the work would scale with it; bounded by the window
-                # it must not. The allowance is deliberately loose so this
-                # cannot fail on incidental planner overhead.
-                self.assertLess(
-                    large,
-                    max(small * 2, small + 20),
-                    f"{label}: work scaled with retention ({small} -> {large})",
-                )
 
 
 if __name__ == "__main__":
