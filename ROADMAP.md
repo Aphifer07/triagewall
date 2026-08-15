@@ -252,20 +252,20 @@ workbench without weakening the production boundary.
   Persistence, authorization, immutable drafts, validation, bounded previews,
   atomic authority cutover, generation-aware last-known-good reload, audited
   rollback, truthful consumer health, and per-verdict bundle provenance are
-  delivered. The editors and release-hardening work remain separate milestones.
+  delivered alongside the operator editors and release-hardening coverage.
 - [x] **Dedicated configuration authorization.** Keep mutation disabled by
   default and require an attributable API key with `config:write`; the
   dashboard feedback cookie is not administrator authentication.
-- [ ] **Prefilter rule editor.** Draft scoped rules from an alert, preview the
+- [x] **Prefilter rule editor.** Draft scoped rules from an alert, preview the
   exact document and bounded historical impact, warn on broad matches, and
   require explicit activation for future events.
-- [ ] **Private asset-enrichment editor.** Manage exact-IP hostname, role,
+- [x] **Private asset-enrichment editor.** Manage exact-IP hostname, role,
   criticality, exposure, and port context while preserving immutable snapshots
   used by historical verdicts.
-- [ ] **Unified analyst actions.** Connect feedback, related-alert filtering,
+- [x] **Unified analyst actions.** Connect feedback, related-alert filtering,
   rule drafting, asset editing, and bounded evidence copying from the alert
   workbench.
-- [ ] **Release hardening.** Cover authorization, audit, concurrency, atomic
+- [x] **Release hardening.** Cover authorization, audit, concurrency, atomic
   activation, reload failure, rollback, both sensor paths, browser behaviour,
   field isolation, and canary regressions before tagging v0.4.
 

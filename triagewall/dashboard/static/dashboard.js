@@ -103,6 +103,7 @@ function initializeView() {
     "/overview": "overview",
     "/behavioral": "behavioral",
     "/integrity": "integrity",
+    "/configuration": "configuration",
   };
   const detailMatch = window.location.pathname.match(/^\/triage\/(\d+)$/);
   currentView = detailMatch ? "detail" : (viewByPath[window.location.pathname] ?? "triage");
@@ -111,6 +112,7 @@ function initializeView() {
     overview: "Overview",
     behavioral: "Behavioral signals",
     integrity: "Integrity",
+    configuration: "Configuration",
     detail: "Alert detail",
   };
 
@@ -501,6 +503,10 @@ async function load({ refreshDetail = true } = {}) {
       document.getElementById("timelineMeta").textContent = "Activity unavailable";
     }
 
+  }
+
+  if (origin.view === "configuration") {
+    await window.TriagewallConfigEditor?.load();
   }
 
   if (origin.view === "detail") {
@@ -941,6 +947,15 @@ function renderDetail(verdict) {
   const sourceAsset = verdict.asset_context?.source;
   const destinationAsset = verdict.asset_context?.destination;
   const isPolicy = verdict.model_used === "prefilter";
+  const configurationActions = mode === "demo" ? "" : `<section class="analysis-section">
+      <h3>Configuration actions</h3>
+      <p class="boundary-note">Start from this retained evidence. A separate in-memory <code>config:write</code> key is still required.</p>
+      <div class="detail-feedback-actions">
+        ${sensor === "suricata" && verdict.signature_id != null ? '<button class="action-btn" type="button" data-config-from-alert="prefilter">Draft scoped policy rule</button>' : ""}
+        ${verdict.src_ip ? '<button class="action-btn" type="button" data-config-from-alert="asset-source">Edit source asset</button>' : ""}
+        ${verdict.dest_ip ? '<button class="action-btn" type="button" data-config-from-alert="asset-destination">Edit destination asset</button>' : ""}
+      </div>
+    </section>`;
   const reviewSection = verdict.human_verdict
     ? `<section class="analysis-section">
         <h3>Operator review</h3>
@@ -1043,6 +1058,7 @@ function renderDetail(verdict) {
           <p class="boundary-note">This is current classifier posture, not a per-event attestation for historical rows.</p>
         </section>
 
+        ${configurationActions}
         ${reviewSection}
       </aside>
     </div>`;
@@ -1150,6 +1166,18 @@ function closeDetail() {
   window.history.pushState({}, "", `/triage${queueQueryString()}`);
   initializeView();
   load();
+}
+
+function openConfigurationFromAlert(action) {
+  if (!activeDetail || !["prefilter", "asset-source", "asset-destination"].includes(action)) return;
+  window.TriagewallConfigEditor?.seedFromAlert(activeDetail, action);
+  invalidateDetailNavigation();
+  activeDetail = null;
+  activeInvestigation = null;
+  window.history.pushState({}, "", "/configuration");
+  initializeView();
+  window.scrollTo({ top: 0, behavior: "instant" });
+  window.TriagewallConfigEditor?.load();
 }
 
 function focusAlert(index) {
@@ -1400,6 +1428,11 @@ document.getElementById("loadOlderButton").addEventListener("click", loadOlder);
 document.getElementById("returnLiveButton").addEventListener("click", returnToLive);
 
 document.getElementById("detailPageContent").addEventListener("click", async (event) => {
+  const configButton = event.target.closest("[data-config-from-alert]");
+  if (configButton) {
+    openConfigurationFromAlert(configButton.dataset.configFromAlert);
+    return;
+  }
   const feedbackButton = event.target.closest("[data-detail-feedback]");
   if (feedbackButton) {
     // Refuse a click on controls belonging to an alert that is no longer the

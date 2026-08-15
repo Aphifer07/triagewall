@@ -371,9 +371,20 @@ Status: implemented.
 
 ### Slice 5 — editors and release hardening
 
+Status: implemented.
+
 - Build the prefilter and asset editors on the proven lifecycle API.
 - Cover authorization, audit, concurrency, activation, reload, rollback,
   redaction, both sensors, browser behaviour, and production-shaped timing.
+
+The routed `/configuration` workspace keeps its dedicated administrator key in
+memory only and sends it exclusively as `X-API-Key`. It never places the key in
+URLs, request bodies, logs, browser storage, or the Triagewall database. The
+workspace exposes the exact canonical candidate, immutable draft creation,
+validation, bounded preview, broad-rule and shipped-base warnings, explicit
+activation, revision history, rollback, audit history, and consumer reload
+health. Alert-detail actions can seed a scoped Suricata rule or exact-IP asset
+record without carrying evidence or credentials in route state.
 
 ## Non-goals for the foundation
 

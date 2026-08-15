@@ -31,6 +31,9 @@
         <a href="/integrity" data-view-link="integrity">
           Integrity
         </a>
+        <a href="/configuration" data-view-link="configuration">
+          Configuration
+        </a>
       </nav>
 
       <div class="system-card" aria-label="System status">
@@ -307,6 +310,137 @@
         </div>
       </section>
 
+      <section class="view-panel configuration-page" data-view="configuration" aria-labelledby="configuration-title" hidden>
+        <header class="view-header">
+          <div>
+            <p class="view-context">OPERATOR CONTROL</p>
+            <h1 id="configuration-title">Configuration</h1>
+          </div>
+          <span class="view-status" id="configConnectionStatus">Credential required</span>
+        </header>
+
+        <div class="configuration-shell">
+          <section id="configCredentialPanel" class="panel config-credential-panel" aria-labelledby="config-credential-title">
+            <div>
+              <p class="section-kicker">PRIVATE ADMINISTRATION</p>
+              <h2 id="config-credential-title">Connect with a configuration key</h2>
+              <p id="configCredentialHelp">The key must carry <code>config:write</code>. It is kept only in this page's memory and is cleared on reload or disconnect.</p>
+            </div>
+            <form id="configCredentialForm" class="config-credential-form" autocomplete="off">
+              <label for="configApiKey">API key
+                <input id="configApiKey" type="password" autocomplete="new-password" spellcheck="false" required>
+              </label>
+              <button class="action-btn action-primary" type="submit">Connect</button>
+            </form>
+          </section>
+
+          <div id="configWorkspace" class="config-workspace hidden">
+            <section class="config-summary-grid" aria-label="Configuration status">
+              <article class="panel config-summary-card"><span>Authority</span><strong id="configMode">—</strong></article>
+              <article class="panel config-summary-card"><span>Generation</span><strong id="configGeneration">—</strong></article>
+              <article class="panel config-summary-card"><span>Runtime consumers</span><strong id="configConsumers">—</strong></article>
+              <article class="panel config-summary-card"><span>Mutation</span><strong id="configWrites">—</strong></article>
+            </section>
+
+            <div class="config-toolbar">
+              <div class="segmented" role="group" aria-label="Configuration document">
+                <button id="configPrefilterTab" class="config-kind-button active" type="button" data-config-kind="prefilter_policy">Prefilter policy</button>
+                <button id="configAssetTab" class="config-kind-button" type="button" data-config-kind="asset_inventory">Asset inventory</button>
+              </div>
+              <button id="configReloadButton" class="text-button" type="button">Reload active</button>
+              <button id="configForgetButton" class="text-button" type="button">Disconnect</button>
+            </div>
+
+            <div class="config-editor-grid">
+              <section class="panel config-editor-panel">
+                <div id="configPrefilterPane">
+                  <div class="panel-head">
+                    <div><p class="section-kicker">STRUCTURED EDITOR</p><h2>False-positive rules</h2></div>
+                    <span id="configRuleCount" class="view-meta">0 rules</span>
+                  </div>
+                  <label class="config-field" for="configInternalCidrs">Internal CIDRs <small>Comma-separated canonical networks</small>
+                    <input id="configInternalCidrs" type="text" spellcheck="false">
+                  </label>
+                  <div id="configRuleList" class="config-item-list"></div>
+                  <form id="configPrefilterForm" class="config-form">
+                    <input id="configRuleIndex" type="hidden" value="">
+                    <div class="config-form-head"><h3 id="configRuleFormTitle">Add scoped rule</h3><button id="configRuleCancel" class="text-button hidden" type="button">Cancel edit</button></div>
+                    <label class="config-field" for="configRuleSignatures">Signature IDs<input id="configRuleSignatures" type="text" inputmode="numeric" placeholder="2019102" required></label>
+                    <label class="config-field config-span-2" for="configRuleReason">Reason<textarea id="configRuleReason" maxlength="4096" required></textarea></label>
+                    <label class="config-field" for="configRuleProtocol">Protocol<select id="configRuleProtocol"><option value="">Any</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option><option value="icmpv6">ICMPv6</option></select></label>
+                    <label class="config-field" for="configRuleNetworkDirection">Network direction<select id="configRuleNetworkDirection"><option value="">Any</option><option value="internal_to_internal">Internal → internal</option><option value="internal_to_external">Internal → external</option><option value="external_to_internal">External → internal</option><option value="external_to_external">External → external</option></select></label>
+                    <label class="config-field" for="configRuleFlowDirection">Flow direction<select id="configRuleFlowDirection"><option value="">Any</option><option value="to_server">To server</option><option value="to_client">To client</option></select></label>
+                    <label class="config-field" for="configRuleSourcePorts">Source ports<input id="configRuleSourcePorts" type="text" inputmode="numeric" placeholder="443, 8443"></label>
+                    <label class="config-field" for="configRuleDestinationPorts">Destination ports<input id="configRuleDestinationPorts" type="text" inputmode="numeric" placeholder="53, 443"></label>
+                    <label class="config-field" for="configRuleSourceCidrs">Source CIDRs<input id="configRuleSourceCidrs" type="text" spellcheck="false"></label>
+                    <label class="config-field" for="configRuleDestinationCidrs">Destination CIDRs<input id="configRuleDestinationCidrs" type="text" spellcheck="false"></label>
+                    <button class="action-btn action-primary config-span-2" type="submit">Apply rule to candidate</button>
+                  </form>
+                </div>
+
+                <div id="configAssetPane" class="hidden">
+                  <div class="panel-head">
+                    <div><p class="section-kicker">STRUCTURED EDITOR</p><h2>Exact-IP assets</h2></div>
+                    <span id="configAssetCount" class="view-meta">0 assets</span>
+                  </div>
+                  <div id="configAssetList" class="config-item-list"></div>
+                  <form id="configAssetForm" class="config-form">
+                    <input id="configAssetIndex" type="hidden" value="">
+                    <div class="config-form-head config-span-2"><h3 id="configAssetFormTitle">Add asset</h3><button id="configAssetCancel" class="text-button hidden" type="button">Cancel edit</button></div>
+                    <label class="config-field" for="configAssetHostname">Hostname<input id="configAssetHostname" type="text" maxlength="64" required></label>
+                    <label class="config-field" for="configAssetRole">Role<input id="configAssetRole" type="text" maxlength="64" required></label>
+                    <label class="config-field config-span-2" for="configAssetIps">IP addresses <small>Comma-separated IPv4 or IPv6 addresses</small><input id="configAssetIps" type="text" spellcheck="false" required></label>
+                    <label class="config-field" for="configAssetCriticality">Criticality<select id="configAssetCriticality"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></label>
+                    <label class="config-check"><input id="configAssetInternetFacing" type="checkbox"> Internet facing</label>
+                    <label class="config-field config-span-2" for="configAssetPorts">Exposed ports <small>Comma-separated protocol/port pairs, for example tcp/443</small><input id="configAssetPorts" type="text" spellcheck="false"></label>
+                    <button class="action-btn action-primary config-span-2" type="submit">Apply asset to candidate</button>
+                  </form>
+                </div>
+              </section>
+
+              <aside class="config-lifecycle-column">
+                <section class="panel config-lifecycle-panel">
+                  <div class="panel-head"><div><p class="section-kicker">EXACT CANDIDATE</p><h2>Review and activate</h2></div><span id="configDirtyState" class="view-meta">Active document</span></div>
+                  <pre id="configExactDocument" class="config-document" aria-label="Exact candidate JSON"></pre>
+                  <label class="config-field" for="configChangeNote">Change note<textarea id="configChangeNote" maxlength="2000" placeholder="Why this change is needed"></textarea></label>
+                  <div class="config-lifecycle-actions">
+                    <button id="configCreateDraft" class="action-btn" type="button">1. Create draft</button>
+                    <button id="configValidateDraft" class="action-btn" type="button" disabled>2. Validate</button>
+                    <button id="configPreviewDraft" class="action-btn" type="button" disabled>3. Preview impact</button>
+                  </div>
+                  <div id="configPreviewResult" class="config-preview hidden" aria-live="polite"></div>
+                  <div id="configActivationGuard" class="config-activation-guard hidden">
+                    <label class="config-check"><input id="configConfirmActivate" type="checkbox"> I reviewed the exact candidate and bounded preview.</label>
+                    <label class="config-check"><input id="configAcknowledgeBroad" type="checkbox"> I acknowledge any unscoped signature-only rules.</label>
+                    <label class="config-check"><input id="configAcknowledgeBase" type="checkbox"> I reviewed this candidate against the newest shipped baseline.</label>
+                    <button id="configActivateDraft" class="action-btn action-primary" type="button" disabled>4. Activate for future events</button>
+                  </div>
+                  <p id="configLifecycleMessage" class="config-message" role="status"></p>
+                </section>
+              </aside>
+            </div>
+
+            <div class="config-history-grid">
+              <section class="panel config-history-panel">
+                <div class="panel-head"><div><p class="section-kicker">ROLLBACK</p><h2>Revision history</h2></div></div>
+                <div id="configRollbackGuard" class="config-rollback-guard hidden">
+                  <strong id="configRollbackTitle">Confirm rollback</strong>
+                  <p>Rollback creates a new generation for future records; it never rewrites history.</p>
+                  <label class="config-check"><input id="configRollbackAcknowledgeBroad" type="checkbox"> I acknowledge any unscoped signature-only rules.</label>
+                  <label class="config-check"><input id="configRollbackAcknowledgeBase" type="checkbox"> I reviewed this revision against the newest shipped baseline.</label>
+                  <div class="config-inline-actions">
+                    <button id="configConfirmRollback" class="action-btn action-primary" type="button">Confirm rollback</button>
+                    <button id="configCancelRollback" class="text-button" type="button">Cancel</button>
+                  </div>
+                </div>
+                <div id="configRevisionList" class="config-history-list"></div>
+              </section>
+              <section class="panel config-history-panel"><div class="panel-head"><div><p class="section-kicker">ATTRIBUTION</p><h2>Recent audit</h2></div></div><div id="configAuditList" class="config-history-list"></div></section>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="view-panel detail-page" data-view="detail" aria-labelledby="alert-page-title" hidden>
         <header class="detail-route-header">
           <a class="detail-back" href="/triage">← Triage queue</a>
@@ -334,6 +468,7 @@
 
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   <script src="/static/polling.js"></script>
+  <script src="/static/configuration.js"></script>
   <script src="/static/dashboard.js"></script>
 </body>
 </html>

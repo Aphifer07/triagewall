@@ -250,6 +250,17 @@ policy, so every endpoint below requires an `X-API-Key` carrying
 `config:write`. That requirement is independent of ordinary API read settings.
 Demo mode rejects configuration access even when such a key is supplied.
 
+The dashboard exposes these operations at `/configuration`. Its administrator
+key exists only in the current page's memory, is cleared from the password
+field after connection, and is sent only in `X-API-Key`; navigation, URLs,
+request bodies, logs, persistent browser storage, and the database never carry
+it. Disconnecting or reloading the page discards the key. The editor follows
+the API lifecycle explicitly: edit a structured candidate, inspect its exact
+canonical JSON, create an immutable draft, validate it, run a bounded preview,
+then confirm activation. Broad prefilter rules and candidates based on an older
+shipped baseline require their specific acknowledgement before activation or
+rollback.
+
 `GET /api/v1/config` returns the active revision metadata for both kinds,
 bundle generation, compatibility mode, revision counts, and per-consumer
 reload health. Health includes each consumer's desired and loaded generation,

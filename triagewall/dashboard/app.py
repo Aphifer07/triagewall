@@ -378,6 +378,8 @@ app.openapi = custom_openapi
 @app.head("/behavioral", include_in_schema=False)
 @app.get("/integrity", include_in_schema=False)
 @app.head("/integrity", include_in_schema=False)
+@app.get("/configuration", include_in_schema=False)
+@app.head("/configuration", include_in_schema=False)
 def index(event_id: int | None = None):
     response = FileResponse(STATIC_DIR / "index.html")
     # Same-origin CSRF resistance for the built-in UI, not a user login. See
