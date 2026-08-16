@@ -987,6 +987,20 @@ class _PreviewSample:
     truncated_by_unsized: bool
 
 
+def _usable_recorded_size(value) -> int | None:
+    """Return a recorded alert size only when it can describe a stored body.
+
+    A missing, non-integer, or negative value is not a length. Returning None
+    for those keeps them out of the comparison that decides whether a body may
+    be read, rather than letting a negative sail under the remaining budget.
+    """
+    if value is None or isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
 def _sample_rows(
     conn: sqlite3.Connection,
     *,
@@ -1005,11 +1019,20 @@ def _sample_rows(
     arbitrarily large. The scan therefore reads each candidate's metadata and
     the size recorded beside its alert at ingestion -- never the body, and never
     an expression over the body, because measuring one inside SQLite makes the
-    engine materialize it first. A body is fetched only once its recorded size
-    is known to fit the remaining budget, so no oversized body is materialized,
-    transferred, retained, or decoded, including the first one. The sample stops
-    at whichever bound is reached first and reports the truncation to the
-    operator rather than silently narrowing the comparison.
+    engine materialize it first.
+
+    Admission is therefore only as good as that metadata, which the sole
+    production writer stores in the same statement as the body it describes.
+    This sampler does not re-derive a body's length before reading it and cannot:
+    doing so would reintroduce the allocation the column exists to avoid. What it
+    does guarantee is that a body is read only when a usable recorded size says
+    it fits, and that a missing, non-integer, or negative size is treated as no
+    size at all. A recorded size that understates a body is trusted-database
+    corruption; the aggregate budget is still charged by what actually arrived,
+    so one such row cannot buy budget for the rows after it.
+
+    The sample stops at whichever bound is reached first and reports the
+    truncation to the operator rather than silently narrowing the comparison.
     """
     source_clause = (
         "AND (sensor.source_type IS NULL OR sensor.source_type = 'suricata')"
@@ -1044,13 +1067,14 @@ def _sample_rows(
             break
         alert = None
         if reads_alerts:
-            if alert_bytes is None:
-                # Retained before sizes were recorded. Fetching it would mean
-                # trusting an unknown length, so the sample stops here and says
-                # so instead of weakening the byte bound.
+            size = _usable_recorded_size(alert_bytes)
+            if size is None:
+                # Retained before sizes were recorded, or carrying a size that
+                # cannot describe a body. Fetching it would mean trusting an
+                # unknown length, so the sample stops here and says so instead
+                # of weakening the byte bound.
                 truncated_by_unsized = True
                 break
-            size = int(alert_bytes)
             if size > remaining_bytes:
                 truncated_by_bytes = True
                 break
@@ -1060,7 +1084,8 @@ def _sample_rows(
                 # keeps the guarantee that nothing oversized is ever decoded.
                 continue
             # Charge what actually arrived. A recorded size that understates the
-            # body must not silently buy extra budget for later rows.
+            # body is trusted-database corruption, and must not silently buy
+            # extra budget for the rows after it.
             actual = len(alert.encode("utf-8"))
             if actual > remaining_bytes:
                 truncated_by_bytes = True
@@ -1082,8 +1107,11 @@ def _bounded_alert_body(
 ) -> str | None:
     """Fetch one retained alert body against its recorded size.
 
-    The size predicate is the trusted stored integer, never a measurement of the
-    body, so a row whose size changed under us is skipped rather than read.
+    The predicate compares the stored integer written atomically with the body,
+    never a measurement of the body itself, so this does not prove the body's
+    length -- it pins the read to the exact metadata the caller admitted. A row
+    whose recorded size changed between the two statements is skipped rather
+    than read.
     """
     row = conn.execute(
         """SELECT raw_alert FROM triage_events
@@ -1310,7 +1338,7 @@ def preview_draft(
         warnings.append("preview sample reached its byte budget before its row limit")
     if sample.truncated_by_unsized:
         warnings.append(
-            "preview sample stopped at a retained alert with no recorded size"
+            "preview sample stopped at a retained alert with no usable recorded size"
         )
     timestamp = occurred_at or utc_now_iso()
     with rejection:

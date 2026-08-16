@@ -459,10 +459,16 @@ def insert_triage_row(
         conn, asset_context.get("destination")
     )
     # Serialize the retained record once and store its exact UTF-8 length beside
-    # it. Readers that must bound how many bytes they pull out of the database
-    # can then consult the size without the engine materializing the body.
-    raw_alert_json = json.dumps(event.raw_event)
-    raw_alert_bytes = len(raw_alert_json.encode("utf-8"))
+    # it, so readers that must bound how many bytes they pull out of the
+    # database can consult the size without the engine materializing the body.
+    #
+    # `ensure_ascii=True` is stated rather than left to the default because the
+    # measurement depends on it: an all-ASCII string is one byte per character,
+    # so its length is already the UTF-8 byte count. Encoding it to measure it
+    # would allocate a second copy of a record whose size is attacker-influenced
+    # and unbounded, which is exactly what this column exists to avoid.
+    raw_alert_json = json.dumps(event.raw_event, ensure_ascii=True)
+    raw_alert_bytes = len(raw_alert_json)
     cursor = conn.execute(
         """INSERT INTO triage_events (
             timestamp, flow_id, src_ip, src_port, dest_ip, dest_port, proto,

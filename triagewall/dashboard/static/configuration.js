@@ -265,7 +265,12 @@
   function renderPrefilter() {
     const document = workingDocuments.prefilter_policy ?? { version: 1, internal_cidrs: [], auto_false_positive: [] };
     const rules = Array.isArray(document.auto_false_positive) ? document.auto_false_positive : [];
-    element("configInternalCidrs").value = (document.internal_cidrs ?? []).join(", ");
+    // Re-rendering the editor must not retype this field under the operator.
+    // While it holds uncommitted keystrokes it belongs to them, not to the
+    // document being rendered.
+    if (!dirtyForms.has(FORM_SCOPES.cidrs)) {
+      element("configInternalCidrs").value = (document.internal_cidrs ?? []).join(", ");
+    }
     element("configRuleCount").textContent = `${rules.length} rule${rules.length === 1 ? "" : "s"}`;
     element("configRuleList").innerHTML = rules.length ? rules.map((rule, index) => {
       const scope = rule.match && Object.keys(rule.match).length
@@ -709,8 +714,11 @@
       // by an asset in the freshly loaded inventory is edited in place, with
       // every current field and every other address preserved; only an unknown
       // address opens Add.
+      // This says which inventory answered the ownership question. It must not
+      // claim anything was preserved: the form it is about to fill may have
+      // just been replaced with the operator's explicit consent.
       const staleWarning = seed.resolvedAgainstCandidate
-        ? " Unsaved changes were kept, so this used your local candidate, which may be older than the active configuration."
+        ? " This used your local inventory candidate, which may be older than the active configuration."
         : "";
       const existingIndex = assetIndexForAddress(seed.ip);
       if (existingIndex >= 0) {
@@ -765,6 +773,31 @@
       ip: side === "source" ? verdict?.src_ip : verdict?.dest_ip,
       asset: clone(verdict?.asset_context?.[side] ?? null),
     };
+    // A handoff fills the form it targets, so it replaces whatever unapplied
+    // input is already there. Only that form's own scope is asked about: a
+    // half-written change note, typed CIDRs, or work in the other editor are
+    // not this handoff's to discard, and must not raise a prompt either.
+    const targetScope = action === "prefilter" ? FORM_SCOPES.rule : FORM_SCOPES.asset;
+    if (loaded && dirtyForms.has(targetScope)) {
+      const label = action === "prefilter" ? "rule" : "asset";
+      const replace = global.confirm(
+        `Replace your unapplied ${label} form input with this alert's evidence?`,
+      );
+      if (!replace) {
+        // Declined: the form and its dirty marker stay exactly as they are, and
+        // the handoff is dropped rather than left queued to fire later. Keeping
+        // this input is itself a decision newer than any reload in flight, which
+        // may therefore no longer reset the form the operator just kept.
+        invalidateInFlightResponses();
+        pendingSeed = null;
+        setMessage(
+          `Kept your unapplied ${label} form input. The alert evidence was not applied.`,
+        );
+        return undefined;
+      }
+      // The operator authorized replacing this form's contents.
+      clearFormScope(targetScope);
+    }
     // Whether this address is already owned decides Add versus Edit, so that
     // question has to be asked of a current, coherent inventory. A cached one
     // can be older than the active generation and would open Add for an
@@ -776,9 +809,9 @@
       return load(true);
     }
     if (decidesOwnership && hasLocalWork) {
-      // Unsaved work is never silently discarded, so the decision is made
-      // against the working candidate and the operator is told it may be older
-      // than the active configuration.
+      // Other unsaved work is never discarded to answer this question, so the
+      // decision is made against the working candidate and the operator is told
+      // which inventory it used.
       pendingSeed.resolvedAgainstCandidate = true;
     }
     return applyPendingSeed();

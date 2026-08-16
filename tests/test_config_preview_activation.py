@@ -560,7 +560,7 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         self.assertEqual(payload["candidates_examined"], 0)
         self.assertTrue(payload["truncated"])
         self.assertIn(
-            "preview sample stopped at a retained alert with no recorded size",
+            "preview sample stopped at a retained alert with no usable recorded size",
             payload["warnings"],
         )
         self.assertEqual(captured, [[]])
@@ -572,6 +572,69 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         )
         self.assertTrue(detail["truncated_by_unsized"])
         self.assertFalse(detail["truncated_by_bytes"])
+
+    def test_a_negative_recorded_size_never_reads_the_alert_body(self):
+        event_id = self.add_event(1, 1001, "10.0.0.1", "198.51.100.1", padding=64)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # Only trusted database modification can produce this; the sampler
+            # must still refuse to read a body it cannot bound.
+            conn.execute(
+                "UPDATE triage_events SET raw_alert_bytes = -1 WHERE id = ?",
+                (event_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        draft_id, _, summary = self.create_validate(
+            "prefilter_policy",
+            prefilter_document(rule(2002)),
+        )
+        conn, reads = self.recorded_column_reads()
+        try:
+            sample = config_repository._sample_rows(
+                conn,
+                kind="prefilter_policy",
+                window_start="2000-01-01T00:00:00.000000Z",
+                candidate_limit=20,
+            )
+        finally:
+            conn.close()
+
+        self.assertNotIn(("triage_events", "raw_alert"), reads)
+        self.assertEqual(sample.rows, [])
+        self.assertTrue(sample.truncated_by_unsized)
+        self.assertFalse(sample.truncated_by_bytes)
+
+        response = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/preview",
+            headers=self.headers,
+            json={"expected_generation": summary["generation"], "candidate_limit": 20},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["candidates_examined"], 0)
+        self.assertTrue(payload["truncated"])
+        self.assertIn(
+            "preview sample stopped at a retained alert with no usable recorded size",
+            payload["warnings"],
+        )
+        detail = json.loads(
+            self.db_rows(
+                """SELECT detail_json FROM operator_config_audit
+                   WHERE action = 'draft_previewed' ORDER BY id DESC LIMIT 1"""
+            )[0][0]
+        )
+        self.assertTrue(detail["truncated_by_unsized"])
+
+    def test_a_recorded_size_that_is_not_a_length_is_refused(self):
+        for stored in (-1, "not-a-number", 1.5):
+            self.assertIsNone(config_repository._usable_recorded_size(stored))
+        self.assertIsNone(config_repository._usable_recorded_size(None))
+        self.assertIsNone(config_repository._usable_recorded_size(True))
+        self.assertEqual(config_repository._usable_recorded_size(0), 0)
+        self.assertEqual(config_repository._usable_recorded_size(1234), 1234)
 
     def test_asset_preview_is_unaffected_by_unrecorded_sizes(self):
         migrated = self.add_event(
@@ -640,6 +703,62 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         self.assertIsNotNone(recorded)
         self.assertEqual(recorded, len(stored.encode("utf-8")))
         self.assertEqual(json.loads(stored)["payload_printable"], "é" * 100)
+        # The stored representation escapes non-ASCII, which is what makes the
+        # character count an exact byte count.
+        self.assertTrue(stored.isascii())
+        self.assertIn("\\u00e9", stored)
+
+    def test_sizing_never_allocates_a_second_copy_of_the_retained_alert(self):
+        payload = "é" * 50_000
+        event = normalize_suricata_event(
+            {
+                "event_type": "alert",
+                "timestamp": "2026-08-15T00:00:00Z",
+                "src_ip": "10.0.0.1",
+                "proto": "tcp",
+                "alert": {"signature_id": 4242, "signature": "Large multibyte"},
+                "payload_printable": payload,
+            }
+        )
+        encodes = []
+        original_str_encode = str.encode
+
+        class _TrackedStr(str):
+            def encode(self, *args, **kwargs):
+                encodes.append(len(self))
+                return original_str_encode(self, *args, **kwargs)
+
+        real_dumps = triage.json.dumps
+
+        def tracking_dumps(*args, **kwargs):
+            # Hand the writer a string that reports any attempt to encode it.
+            return _TrackedStr(real_dumps(*args, **kwargs))
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with patch.object(triage.json, "dumps", tracking_dumps):
+                triage.insert_triage_row(
+                    conn,
+                    event,
+                    {"verdict": "real", "confidence": 0.9, "reasoning": "test"},
+                )
+            conn.commit()
+            stored, recorded = conn.execute(
+                "SELECT raw_alert, raw_alert_bytes FROM triage_events"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        # The retained body is large, and its size was recorded without ever
+        # copying it: nothing encoded a body-sized string.
+        self.assertGreater(recorded, 100_000)
+        self.assertEqual(recorded, len(stored.encode("utf-8")))
+        self.assertEqual(json.loads(stored)["payload_printable"], payload)
+        self.assertEqual(
+            [size for size in encodes if size >= len(stored)],
+            [],
+            "the serialized body was copied to measure it",
+        )
 
     def test_migration_adds_the_size_column_to_an_existing_database(self):
         legacy_path = self.root / "legacy.db"
@@ -1003,6 +1122,37 @@ class ConfigPreviewActivationTests(unittest.TestCase):
 
 
 class ConfigurationBundleProvenanceTests(unittest.TestCase):
+    def test_both_ingest_adapters_size_alerts_through_the_shared_writer(self):
+        # Only one writer records the size, so both adapters must reach it.
+        self.assertIs(wazuh_ingest.insert_with_retry, ingest.insert_with_retry)
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            (PROJECT_ROOT / "triagewall" / "schema.sql").read_text()
+        )
+        event = normalize_suricata_event(
+            {
+                "event_type": "alert",
+                "timestamp": "2026-08-15T00:00:00Z",
+                "alert": {"signature_id": 7, "signature": "shared writer"},
+            }
+        )
+        # The Suricata adapter's bound writer is the one that records sizes, and
+        # the Wazuh adapter reaches it through the same retry wrapper.
+        self.assertIs(ingest.insert_triage_row, triage.insert_triage_row)
+        try:
+            ingest.insert_with_retry(
+                conn,
+                event,
+                {"verdict": "real", "confidence": 0.9, "reasoning": "test"},
+            )
+            conn.commit()
+            stored, recorded = conn.execute(
+                "SELECT raw_alert, raw_alert_bytes FROM triage_events"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(recorded, len(stored.encode("utf-8")))
+
     def test_shared_insert_persists_exact_bundle_tuple(self):
         conn = sqlite3.connect(":memory:")
         conn.executescript(

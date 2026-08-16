@@ -65,6 +65,7 @@ function runEditor({
   assetRows = [],
   revisionRows = null,
   defer = null,
+  confirmReply = () => true,
 } = {}) {
   const elements = new Map();
   const calls = [];
@@ -218,10 +219,14 @@ function runEditor({
       throw new Error("persistent storage must not be accessed");
     },
   });
+  const prompts = [];
   const window = {
     document,
     fetch,
-    confirm: () => true,
+    confirm: (message) => {
+      prompts.push(String(message));
+      return confirmReply(String(message));
+    },
     localStorage: storageTrap,
     sessionStorage: storageTrap,
   };
@@ -234,6 +239,7 @@ function runEditor({
     editor: window.TriagewallConfigEditor,
     document,
     calls,
+    prompts,
     summary,
     prefilter,
     assets,
@@ -824,6 +830,160 @@ test("a change note survives resetting either structured form", async () => {
       `${cancelId}: note discarded`,
     );
     assert.equal(harness.editor.state().dirtyForms.join(","), "note", `${cancelId}: scope`);
+  }
+});
+
+const SEED_ASSET_ROWS = [
+  {
+    hostname: "server",
+    role: "application",
+    ips: ["10.0.0.8"],
+    criticality: "low",
+    internet_facing: false,
+    exposed_ports: [],
+  },
+];
+
+async function typeRuleReason(harness, value) {
+  await openRuleEditor(harness);
+  harness.document.getElementById("configRuleReason").value = value;
+  await harness.document.getElementById("configRuleReason").dispatch("input");
+}
+
+async function typeAssetHostname(harness, value) {
+  harness.document.getElementById("configAssetHostname").value = value;
+  await harness.document.getElementById("configAssetHostname").dispatch("input");
+}
+
+test("a declined prefilter handoff preserves the dirty rule form", async () => {
+  const harness = runEditor({ confirmReply: () => false });
+  await connect(harness);
+  await typeRuleReason(harness, "Half-typed reason");
+  harness.document.getElementById("configRuleSourcePorts").value = "8443";
+  await harness.document.getElementById("configRuleSourcePorts").dispatch("input");
+
+  await harness.editor.seedFromAlert(
+    { signature_id: 2024, signature: "Routine TLS alert", proto: "TCP", dest_port: 443 },
+    "prefilter",
+  );
+
+  assert.equal(harness.prompts.length, 1);
+  assert.match(harness.prompts[0], /unapplied rule form input/);
+  assert.equal(harness.document.getElementById("configRuleReason").value, "Half-typed reason");
+  assert.equal(harness.document.getElementById("configRuleSourcePorts").value, "8443");
+  // Still the rule the operator opened, never the alert's signature.
+  assert.equal(harness.document.getElementById("configRuleSignatures").value, "1001");
+  assert.equal(harness.document.getElementById("configRuleIndex").value, "0");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "rule");
+  assert.match(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    /Kept your unapplied rule form input/,
+  );
+});
+
+test("an accepted prefilter handoff applies the seed", async () => {
+  const harness = runEditor({ confirmReply: () => true });
+  await connect(harness);
+  await typeRuleReason(harness, "Half-typed reason");
+
+  await harness.editor.seedFromAlert(
+    { signature_id: 2024, signature: "Routine TLS alert", proto: "TCP", dest_port: 443 },
+    "prefilter",
+  );
+
+  assert.equal(harness.prompts.length, 1);
+  assert.equal(harness.document.getElementById("configRuleSignatures").value, "2024");
+  assert.match(harness.document.getElementById("configRuleReason").value, /Routine TLS alert/);
+  assert.equal(harness.editor.state().dirtyForms.join(","), "rule");
+});
+
+test("a declined asset handoff preserves the dirty asset form", async () => {
+  const harness = runEditor({ confirmReply: () => false, assetRows: SEED_ASSET_ROWS });
+  await connect(harness);
+  await typeAssetHostname(harness, "half-typed-host");
+  harness.document.getElementById("configAssetIps").value = "10.9.9.9";
+  await harness.document.getElementById("configAssetIps").dispatch("input");
+  const callsBefore = harness.calls.length;
+
+  await harness.editor.seedFromAlert({ src_ip: "203.0.113.7", asset_context: {} }, "asset-source");
+
+  assert.equal(harness.prompts.length, 1);
+  assert.match(harness.prompts[0], /unapplied asset form input/);
+  assert.equal(harness.document.getElementById("configAssetHostname").value, "half-typed-host");
+  assert.equal(harness.document.getElementById("configAssetIps").value, "10.9.9.9");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "asset");
+  // A declined handoff resolves nothing, so it must not refresh either.
+  assert.equal(harness.calls.length, callsBefore);
+});
+
+test("an accepted asset handoff applies the seed", async () => {
+  const harness = runEditor({ confirmReply: () => true, assetRows: SEED_ASSET_ROWS });
+  await connect(harness);
+  await typeAssetHostname(harness, "half-typed-host");
+
+  await harness.editor.seedFromAlert({ src_ip: "203.0.113.7", asset_context: {} }, "asset-source");
+
+  assert.equal(harness.prompts.length, 1);
+  assert.equal(harness.document.getElementById("configAssetIps").value, "203.0.113.7");
+  assert.equal(harness.document.getElementById("configAssetIndex").value, "");
+  assert.equal(harness.editor.state().dirtyForms.join(","), "asset");
+});
+
+test("a handoff never prompts about an unrelated dirty scope and never erases it", async () => {
+  const harness = runEditor({
+    confirmReply: () => {
+      throw new Error("a handoff must not prompt about an unrelated scope");
+    },
+    assetRows: SEED_ASSET_ROWS,
+  });
+  await connect(harness);
+  // Dirty: the change note, the CIDR field, and the *other* editor's form.
+  harness.document.getElementById("configChangeNote").value = "Why this change";
+  await harness.document.getElementById("configChangeNote").dispatch("input");
+  harness.document.getElementById("configInternalCidrs").value = "10.7.7.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("input");
+  await typeRuleReason(harness, "Half-typed reason");
+
+  await harness.editor.seedFromAlert({ src_ip: "203.0.113.7", asset_context: {} }, "asset-source");
+
+  assert.equal(harness.prompts.length, 0);
+  assert.equal(harness.document.getElementById("configAssetIps").value, "203.0.113.7");
+  // Every unrelated surface survives untouched.
+  assert.equal(harness.document.getElementById("configChangeNote").value, "Why this change");
+  assert.equal(harness.document.getElementById("configInternalCidrs").value, "10.7.7.0/24");
+  assert.equal(harness.document.getElementById("configRuleReason").value, "Half-typed reason");
+  assert.equal(
+    harness.editor.state().dirtyForms.slice().sort().join(","),
+    "asset,cidrs,note,rule",
+  );
+});
+
+test("a delayed load cannot overwrite a retained form or an accepted seed", async () => {
+  for (const [name, reply, expected] of [
+    ["declined", () => false, "Half-typed reason"],
+    ["accepted", () => true, "Reviewed false positive: Routine TLS alert"],
+  ]) {
+    const harness = runEditor({
+      confirmReply: reply,
+      defer: (url) => url === "/api/v1/config/audit?limit=25",
+    });
+    await connectDeferred(harness);
+    await typeRuleReason(harness, "Half-typed reason");
+
+    const reload = harness.editor.load(true);
+    const seeding = harness.editor.seedFromAlert(
+      { signature_id: 2024, signature: "Routine TLS alert", proto: "TCP", dest_port: 443 },
+      "prefilter",
+    );
+    await harness.release();
+    await Promise.all([reload, seeding]);
+
+    assert.equal(
+      harness.document.getElementById("configRuleReason").value,
+      expected,
+      `${name}: the delayed load overwrote the rule form`,
+    );
+    assert.equal(harness.editor.state().dirtyForms.join(","), "rule", `${name}: scope`);
   }
 });
 
