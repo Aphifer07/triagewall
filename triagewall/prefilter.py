@@ -8,7 +8,10 @@ import json
 from pathlib import Path
 import re
 
-from asset_inventory import is_valid_asset_snapshot
+try:
+    from .asset_inventory import is_valid_asset_snapshot
+except ImportError:  # Direct script-style imports used by ingest entrypoints.
+    from asset_inventory import is_valid_asset_snapshot
 
 
 MAX_CONFIG_BYTES = 1024 * 1024
@@ -300,6 +303,48 @@ def _parse_match(value, label, internal_cidrs):
     )
 
 
+def _asset_selector_document(selector):
+    document = {}
+    if selector.matched is not None:
+        document["matched"] = selector.matched
+    if selector.hostnames:
+        document["hostnames"] = list(selector.hostnames)
+    if selector.roles:
+        document["roles"] = list(selector.roles)
+    if selector.criticalities:
+        document["criticalities"] = list(selector.criticalities)
+    if selector.internet_facing is not None:
+        document["internet_facing"] = selector.internet_facing
+    return document
+
+
+def _rule_match_document(match):
+    document = {}
+    if match.network_directions:
+        document["network_directions"] = list(match.network_directions)
+    if match.flow_directions:
+        document["flow_directions"] = list(match.flow_directions)
+    if match.protocols:
+        document["protocols"] = list(match.protocols)
+    if match.source_ports:
+        document["source_ports"] = list(match.source_ports)
+    if match.destination_ports:
+        document["destination_ports"] = list(match.destination_ports)
+    if match.source_cidrs:
+        document["source_cidrs"] = [str(value) for value in match.source_cidrs]
+    if match.destination_cidrs:
+        document["destination_cidrs"] = [
+            str(value) for value in match.destination_cidrs
+        ]
+    if match.source_asset is not None:
+        document["source_asset"] = _asset_selector_document(match.source_asset)
+    if match.destination_asset is not None:
+        document["destination_asset"] = _asset_selector_document(
+            match.destination_asset
+        )
+    return document
+
+
 @dataclass(frozen=True)
 class PrefilterRule:
     signature_ids: tuple[int, ...]
@@ -408,6 +453,23 @@ class PrefilterPolicy:
     @property
     def signature_ids(self):
         return frozenset(self.rules_by_sid)
+
+    def to_document(self):
+        """Return the normalized, versioned policy represented by this object."""
+        rules = []
+        for rule in self.rules:
+            document = {
+                "signature_ids": list(rule.signature_ids),
+                "reason": rule.reason,
+            }
+            if rule.match is not None:
+                document["match"] = _rule_match_document(rule.match)
+            rules.append(document)
+        return {
+            "version": 1,
+            "internal_cidrs": [str(value) for value in self.internal_cidrs],
+            "auto_false_positive": rules,
+        }
 
     def match_reason(self, alert, asset_context=None):
         if not isinstance(alert, dict):

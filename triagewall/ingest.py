@@ -25,9 +25,16 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from asset_inventory import configured_inventory_path
+from config_bootstrap import packaged_prefilter_path
 from database import connect_database
 from environment import parse_boolean
 from migrations import verify_db_initialized
+from operator_config import (
+    ConfigurationBundleOwner,
+    OperatorConfigError,
+    synchronize_legacy_configuration,
+)
 from time_utils import format_utc_timestamp, utc_now_iso
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -61,7 +68,14 @@ _load_dotenv(override=False)
 
 # Reuse the existing triage code
 sys.path.insert(0, str(Path(__file__).parent))
-from triage import call_ollama, get_asset_context, insert_triage_row, MODEL
+from triage import (
+    MODEL,
+    PREFILTER_CONFIG_PATH,
+    call_ollama,
+    get_asset_context,
+    insert_triage_row,
+    set_configuration_bundle_owner,
+)
 from sensor_event import (
     SuricataValidationError,
     normalize_suricata_event,
@@ -151,6 +165,64 @@ class IngestCheckpointError(EveCheckpointError):
 
 # Graceful shutdown
 _stop = False
+RUNTIME_CONFIG_OWNER = None
+
+CONFIG_RELOAD_INTERVAL_SECONDS = float(
+    os.environ.get("TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS", "5")
+)
+if not 1 <= CONFIG_RELOAD_INTERVAL_SECONDS <= 300:
+    raise RuntimeError(
+        "TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS must be from 1 to 300"
+    )
+
+
+def start_configuration_owner(
+    conn,
+    *,
+    consumer,
+    db_path=None,
+    reload_interval_seconds=None,
+):
+    """Synchronize legacy mounts, then publish one verified immutable bundle.
+
+    The one-shot bootstrap container runs before the first consumer start, but
+    it does not rerun when a single consumer restarts, so a valid host-side edit
+    to a mounted document would otherwise leave the durable active revision
+    stale and fail this consumer's start closed on every restart. Mirroring the
+    mounts here -- through the same serialized, fail-closed transaction -- keeps
+    the durable record truthful for every consumer start, and publishing the
+    exact objects that synchronization validated means one read of each mount
+    backs both the durable revision and the runtime bundle. Under `database`
+    authority no file is read at all: recording a changed packaged default
+    belongs to the one-shot bootstrap, and a consumer must be able to start from
+    a valid durable bundle on a host that installs no packaged default.
+    """
+    snapshot = synchronize_legacy_configuration(
+        db_path or DB_PATH,
+        packaged_prefilter_path=packaged_prefilter_path(),
+        legacy_prefilter_path=PREFILTER_CONFIG_PATH,
+        asset_inventory_path=configured_inventory_path(),
+        discover_shipped_baseline=False,
+    )
+    log.info(
+        "Configuration authority: mode=%s generation=%s",
+        snapshot.mode,
+        snapshot.generation,
+    )
+    owner = ConfigurationBundleOwner(
+        consumer=consumer,
+        legacy_prefilter_policy=snapshot.prefilter_policy,
+        legacy_asset_inventory=snapshot.asset_inventory,
+        reload_interval_seconds=(
+            reload_interval_seconds
+            if reload_interval_seconds is not None
+            else CONFIG_RELOAD_INTERVAL_SECONDS
+        ),
+    )
+    owner.start(conn)
+    return owner
+
+
 def _handle_signal(signum, frame):
     global _stop
     _stop = True
@@ -574,6 +646,7 @@ def insert_with_retry(
     event,
     verdict,
     asset_context=None,
+    config_bundle=None,
     max_retries=3,
     base_backoff_ms=100,
 ):
@@ -588,6 +661,7 @@ def insert_with_retry(
                 event,
                 verdict,
                 asset_context=asset_context,
+                config_bundle=config_bundle,
             )
             conn.commit()
             return True
@@ -617,6 +691,8 @@ def insert_with_retry(
 
 def process_line(conn, line):
     """Parse one line and return whether it was processed and may be checkpointed."""
+    if RUNTIME_CONFIG_OWNER is not None:
+        RUNTIME_CONFIG_OWNER.maybe_reload(conn)
     raw_line = line.rstrip("\r\n")
     line = raw_line.strip()
     if not line:
@@ -663,11 +739,14 @@ def process_line(conn, line):
             classification_event,
             asset_context=asset_context,
         )
+        insert_kwargs = {"asset_context": asset_context}
+        if RUNTIME_CONFIG_OWNER is not None:
+            insert_kwargs["config_bundle"] = RUNTIME_CONFIG_OWNER.bundle
         if not insert_with_retry(
             conn,
             normalized_event,
             verdict,
-            asset_context=asset_context,
+            **insert_kwargs,
         ):
             log.error(
                 f"Failed to persist alert ({sig}); retrying without advancing checkpoint"
@@ -701,6 +780,7 @@ def process_line(conn, line):
 
 
 def demo_loop():
+    global RUNTIME_CONFIG_OWNER
     fixtures_path = Path(__file__).parent.parent / "tests" / "fixtures" / "diverse_alerts.json"
     if not fixtures_path.exists():
         log.error(f"Demo fixtures not found at {fixtures_path}")
@@ -723,6 +803,15 @@ def demo_loop():
     conn = connect_database(DB_PATH)
 
     try:
+        try:
+            RUNTIME_CONFIG_OWNER = start_configuration_owner(
+                conn,
+                consumer="suricata",
+            )
+        except OperatorConfigError as exc:
+            log.critical(f"Ingest configuration startup failed: {exc}")
+            sys.exit(1)
+        set_configuration_bundle_owner(RUNTIME_CONFIG_OWNER)
         while not _stop:
             for line in demo_lines:
                 if _stop:
@@ -730,11 +819,14 @@ def demo_loop():
                 process_line(conn, line)
                 time.sleep(random.uniform(2, 8))
     finally:
+        set_configuration_bundle_owner(None)
+        RUNTIME_CONFIG_OWNER = None
         conn.close()
 
 
 def tail_file():
     """Main loop: poll the file, process new lines."""
+    global RUNTIME_CONFIG_OWNER
     if EVE_PATH.is_dir():
         log.error(f"{EVE_PATH} is a directory, not a file.")
         log.error("Either:")
@@ -763,6 +855,15 @@ def tail_file():
             return None
 
     try:
+        try:
+            RUNTIME_CONFIG_OWNER = start_configuration_owner(
+                conn,
+                consumer="suricata",
+            )
+        except OperatorConfigError as exc:
+            log.critical(f"Ingest configuration startup failed: {exc}")
+            sys.exit(1)
+        set_configuration_bundle_owner(RUNTIME_CONFIG_OWNER)
         while not _stop:
             try:
                 # Warn if we haven't seen new eve.json lines recently (rate-limited).
@@ -953,6 +1054,8 @@ def tail_file():
                 log.error(f"Loop error: {type(e).__name__}: {e}")
                 time.sleep(POLL_INTERVAL)
     finally:
+        set_configuration_bundle_owner(None)
+        RUNTIME_CONFIG_OWNER = None
         conn.close()
         log.info("Ingest daemon stopped cleanly")
 

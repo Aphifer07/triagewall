@@ -43,11 +43,15 @@ jobs:
           python -m unittest
           tests.test_api_v1
           tests.test_asset_inventory
+          tests.test_config_api
+          tests.test_config_preview_activation
+          tests.test_config_runtime
           tests.test_database
           tests.test_db_startup
           tests.test_dashboard_stats
           tests.test_gold_gate
           tests.test_ingest_checkpoint
+          tests.test_operator_config
           tests.test_prefilter
           tests.test_retention
           tests.test_retention_cycle
@@ -64,8 +68,8 @@ jobs:
       - name: Run SPC regressions
         run: PYTHONPATH=. python tests/test_spc.py
 
-      - name: Run dashboard polling regressions
-        run: node --test tests/test_dashboard_polling.js
+      - name: Run dashboard browser regressions
+        run: node --test tests/test_dashboard_polling.js tests/test_configuration_editor.js
 
       - name: Compile Python sources
         run: python -m compileall -q triagewall tests scripts

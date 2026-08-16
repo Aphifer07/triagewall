@@ -21,6 +21,36 @@ services:
     network_mode: none
     restart: "no"
 
+  config-bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command:
+      - python3
+      - triagewall/config_bootstrap.py
+    environment:
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONDONTWRITEBYTECODE: "1"
+      DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
+      PACKAGED_PREFILTER_PATH: /app/triagewall/defaults/prefilter.json
+      LEGACY_PREFILTER_PATH: /var/lib/triagewall-config/prefilter.json
+      ASSET_INVENTORY_PATH: /var/lib/triagewall-config/assets.json
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+      - ./triagewall/config/prefilter.json:/var/lib/triagewall-config/prefilter.json:ro
+      - ${HOST_ASSET_INVENTORY:-./triagewall/config/assets.example.json}:/var/lib/triagewall-config/assets.json:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   ingest:
     build:
       context: .
@@ -36,6 +66,7 @@ services:
       EVE_PATH: ${EVE_PATH:-/var/log/suricata/eve.json}
       POSITION_PATH: ${POSITION_PATH:-/var/lib/triagewall/position.json}
       POLL_INTERVAL: ${POLL_INTERVAL:-10}
+      TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS: ${TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS:-5}
 
       OLLAMA_HOST: ${OLLAMA_HOST:-http://localhost:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M}
@@ -49,7 +80,7 @@ services:
       - ./triagewall/config/prefilter.json:/app/triagewall/config/prefilter.json:ro
       - ${HOST_ASSET_INVENTORY:-./triagewall/config/assets.example.json}:/app/triagewall/config/assets.json:ro
     depends_on:
-      migrate:
+      config-bootstrap:
         condition: service_completed_successfully
     restart: unless-stopped
 
@@ -71,6 +102,13 @@ services:
       DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
       MODE: ${MODE:-}
       DEMO_MODE: ${DEMO_MODE:-false}
+      TRIAGEWALL_API_KEYS: ${TRIAGEWALL_API_KEYS:-}
+      TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS: ${TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS:-true}
+      TRIAGEWALL_DASHBOARD_WRITE_SECRET: ${TRIAGEWALL_DASHBOARD_WRITE_SECRET:-}
+      TRIAGEWALL_DASHBOARD_COOKIE_SECURE: ${TRIAGEWALL_DASHBOARD_COOKIE_SECURE:-false}
+      TRIAGEWALL_API_REDACT_IPS: ${TRIAGEWALL_API_REDACT_IPS:-false}
+      TRIAGEWALL_API_IP_HASH_SECRET: ${TRIAGEWALL_API_IP_HASH_SECRET:-}
+      TRIAGEWALL_CONFIG_WRITES_ENABLED: ${TRIAGEWALL_CONFIG_WRITES_ENABLED:-false}
       DASHBOARD_HOST: ${DASHBOARD_HOST:-0.0.0.0}
       DASHBOARD_PORT: ${DASHBOARD_PORT:-8084}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost}
@@ -79,7 +117,7 @@ services:
     ports:
       - "${DASHBOARD_PORT:-8084}:${DASHBOARD_PORT:-8084}"
     depends_on:
-      migrate:
+      config-bootstrap:
         condition: service_completed_successfully
       ingest:
         condition: service_started

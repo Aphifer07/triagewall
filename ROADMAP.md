@@ -233,20 +233,41 @@ applications. See
   separation, CI, upgrade, rollback, backup, removal, and user-documentation
   gates pass. Archive the private incubation repository after import.
 
-### v0.4 — September–October 2026
+### v0.4 — Analyst workbench — September–October 2026
 
-The awareness layer turns disconnected sensor findings into a concise
-explanation of what changed and what deserves attention.
+Turn the alert queue into a source-aware investigation and configuration
+workbench without weakening the production boundary.
 
-- [ ] Dashboard UI refresh and visual polish, preserving the existing
-  source-aware API and security contracts
-- [ ] **Daily digest** of material events, changes, and trends
-- [ ] **Coverage-gap detection** between known assets and enrolled sensors
-- [ ] **Cross-sensor correlation** for related IPs, domains, agents, and time
-  windows
-- [ ] **Assisted prefilter suggestions** requiring explicit human approval
-- [ ] **Constrained MITRE ATT&CK mapping** backed by controlled references
-- [ ] Operator-controlled webhooks for selected high-confidence findings
+- [x] **Dashboard UI foundation.** Ship the routed overview, triage,
+  behavioural, integrity, and alert-detail surfaces while preserving the
+  source-aware API and security contracts.
+- [x] **Investigation context and correlation.** Add bounded recurrence,
+  related activity, source-specific evidence, and queue-aware navigation as
+  detailed below.
+- [x] **Versioned operator-configuration foundation.** Separate immutable
+  shipped defaults from operator revisions and add drafts, validation, bounded
+  impact preview, atomic activation, optimistic locking, last-known-good
+  recovery, rollback, and audit history. See
+  [Operator configuration foundation](docs/operator-configuration-foundation.md).
+  Persistence, authorization, immutable drafts, validation, bounded previews,
+  atomic authority cutover, generation-aware last-known-good reload, audited
+  rollback, truthful consumer health, and per-verdict bundle provenance are
+  delivered alongside the operator editors and release-hardening coverage.
+- [x] **Dedicated configuration authorization.** Keep mutation disabled by
+  default and require an attributable API key with `config:write`; the
+  dashboard feedback cookie is not administrator authentication.
+- [x] **Prefilter rule editor.** Draft scoped rules from an alert, preview the
+  exact document and bounded historical impact, warn on broad matches, and
+  require explicit activation for future events.
+- [x] **Private asset-enrichment editor.** Manage exact-IP hostname, role,
+  criticality, exposure, and port context while preserving immutable snapshots
+  used by historical verdicts.
+- [x] **Unified analyst actions.** Connect feedback, related-alert filtering,
+  rule drafting, asset editing, and bounded evidence copying from the alert
+  workbench.
+- [x] **Release hardening.** Cover authorization, audit, concurrency, atomic
+  activation, reload failure, rollback, both sensor paths, browser behaviour,
+  field isolation, and canary regressions before tagging v0.4.
 
 #### Analyst investigation context — delivered
 
@@ -302,15 +323,36 @@ operator-configuration subsystem, which must land with its own authorization
 and audit story rather than riding along with a read-only investigation
 surface.
 
-### v0.5 — Late 2026
+### v0.5 — Lab to production — Late 2026
 
-Vulnerability prioritization.
+Measure candidate behaviour in an isolated Lab, then promote an approved
+revision into Core through an explicit audited boundary.
 
-- [ ] Ingest Wazuh vulnerability findings and optionally OpenVAS results
-- [ ] Explain CVEs, prioritize by asset exposure and criticality, and provide
+- [ ] Complete the replay provenance needed to reproduce a decision.
+- [ ] Specify and validate sanitized event-bundle v1.
+- [ ] Build the isolated Lab runtime for replay, comparison, injection tests,
+  and gold-set evaluation without live Core access.
+- [ ] Compare baseline and candidate outcomes without collapsing distinct
+  safety and performance signals into one score.
+- [ ] Require an authenticated operator action to promote a passing candidate;
+  Lab never self-promotes.
+- [ ] Retain the previous production revision, rollback path, and audit history.
+- [ ] Prove Core-only, Lab-only, and combined installation modes.
+
+### Later awareness and vulnerability work — no release commitment
+
+- **Daily digest** of material events, changes, and trends
+- **Coverage-gap detection** between known assets and enrolled sensors
+- **Cross-sensor narratives** for related IPs, domains, agents, and time windows
+- **Assisted prefilter suggestions** requiring explicit human approval
+- **Constrained MITRE ATT&CK mapping** backed by controlled references
+- Operator-controlled webhooks for selected high-confidence findings
+- Ingest Wazuh vulnerability findings and optionally OpenVAS results
+- Explain CVEs, prioritize by asset exposure and criticality, and provide
   plain-language remediation
-- Triagewall reasons on top of mature scanners; it does not become a
-  vulnerability scanner.
+
+Triagewall reasons on top of mature sensors and scanners; it does not become a
+SIEM or vulnerability scanner.
 
 ### v1.0 — Early 2027
 

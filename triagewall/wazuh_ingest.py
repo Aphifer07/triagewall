@@ -24,9 +24,16 @@ from ingest import (
     RETRY_LINE,
     insert_with_retry,
     quarantine_line,
+    start_configuration_owner,
 )
 from migrations import verify_db_initialized
-from triage import MODEL, call_ollama_wazuh, get_asset_context
+from operator_config import OperatorConfigError
+from triage import (
+    MODEL,
+    call_ollama_wazuh,
+    get_asset_context,
+    set_configuration_bundle_owner,
+)
 from wazuh_event import (
     WazuhValidationError,
     normalize_wazuh_event,
@@ -62,6 +69,15 @@ logging.basicConfig(
 log = logging.getLogger("wazuh-ingest")
 
 _stop = False
+RUNTIME_CONFIG_OWNER = None
+
+CONFIG_RELOAD_INTERVAL_SECONDS = float(
+    os.environ.get("TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS", "5")
+)
+if not 1 <= CONFIG_RELOAD_INTERVAL_SECONDS <= 300:
+    raise RuntimeError(
+        "TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS must be from 1 to 300"
+    )
 
 
 class WazuhCheckpointError(RuntimeError):
@@ -282,6 +298,8 @@ def is_duplicate(conn, event) -> bool:
 
 
 def process_wazuh_record(conn, raw: bytes):
+    if RUNTIME_CONFIG_OWNER is not None:
+        RUNTIME_CONFIG_OWNER.maybe_reload(conn)
     try:
         text = raw.rstrip(b"\r\n").decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -322,8 +340,14 @@ def process_wazuh_record(conn, raw: bytes):
             format_wazuh_for_llm(alert),
             asset_context=asset_context,
         )
+        insert_kwargs = {"asset_context": asset_context}
+        if RUNTIME_CONFIG_OWNER is not None:
+            insert_kwargs["config_bundle"] = RUNTIME_CONFIG_OWNER.bundle
         if not insert_with_retry(
-            conn, event, verdict, asset_context=asset_context
+            conn,
+            event,
+            verdict,
+            **insert_kwargs,
         ):
             return RETRY_LINE
     except sqlite3.IntegrityError as exc:
@@ -418,11 +442,10 @@ def _process_stream(
                     complete=False,
                 )
 
-            result = (
-                _quarantine_oversized(conn, record)
-                if record.oversized_size is not None
-                else process_wazuh_record(conn, record.raw)
-            )
+            if record.oversized_size is not None:
+                result = _quarantine_oversized(conn, record)
+            else:
+                result = process_wazuh_record(conn, record.raw)
             if not result.checkpoint:
                 return StreamResult(
                     scanned=scanned,
@@ -479,7 +502,11 @@ def process_available(conn, state: dict) -> StreamResult:
             )
         try:
             result = _process_stream(
-                conn, archive, state, checkpoint_date, inode=None
+                conn,
+                archive,
+                state,
+                checkpoint_date,
+                inode=None,
             )
         except (OSError, EOFError, gzip.BadGzipFile) as exc:
             raise WazuhCheckpointError(
@@ -523,6 +550,7 @@ def process_available(conn, state: dict) -> StreamResult:
 
 
 def tail_wazuh() -> int:
+    global RUNTIME_CONFIG_OWNER
     try:
         validate_config()
         verify_db_initialized(DB_PATH)
@@ -546,6 +574,17 @@ def tail_wazuh() -> int:
 
     conn = connect_database(DB_PATH)
     try:
+        try:
+            RUNTIME_CONFIG_OWNER = start_configuration_owner(
+                conn,
+                consumer="wazuh",
+                db_path=DB_PATH,
+                reload_interval_seconds=CONFIG_RELOAD_INTERVAL_SECONDS,
+            )
+            set_configuration_bundle_owner(RUNTIME_CONFIG_OWNER)
+        except (OperatorConfigError, OSError, sqlite3.Error) as exc:
+            log.critical("Wazuh ingest configuration startup failed: %s", exc)
+            return 1
         while not _stop:
             try:
                 result = process_available(conn, state)
@@ -571,6 +610,8 @@ def tail_wazuh() -> int:
                 )
             time.sleep(POLL_INTERVAL)
     finally:
+        set_configuration_bundle_owner(None)
+        RUNTIME_CONFIG_OWNER = None
         conn.close()
     log.info("Wazuh ingest stopped cleanly")
     return 0

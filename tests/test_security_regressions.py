@@ -310,7 +310,7 @@ class DashboardBoundaryTests(unittest.TestCase):
         )
 
     def test_named_dashboard_views_serve_the_operator_console(self):
-        for path in ("/triage", "/overview", "/behavioral"):
+        for path in ("/triage", "/overview", "/behavioral", "/configuration"):
             with self.subTest(path=path):
                 response = self.client.get(path, headers={"host": "localhost"})
                 self.assertEqual(response.status_code, 200)

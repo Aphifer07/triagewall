@@ -223,6 +223,11 @@ class AssetInventory:
             document = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AssetInventoryError("asset inventory must be valid UTF-8 JSON") from exc
+        return cls.from_document(document)
+
+    @classmethod
+    def from_document(cls, document: Any) -> "AssetInventory":
+        """Validate an already decoded inventory document."""
         if not isinstance(document, dict):
             raise AssetInventoryError("asset inventory root must be an object")
         _require_exact_fields(document, TOP_LEVEL_FIELDS, "asset inventory")
@@ -251,6 +256,10 @@ class AssetInventory:
             canonical_json(canonical_document).encode("utf-8")
         ).hexdigest()
         return cls(version=version, assets=assets, revision=revision, _by_ip=by_ip)
+
+    def to_document(self) -> dict[str, Any]:
+        """Return the normalized document represented by this inventory."""
+        return {"version": self.version, "assets": list(self.assets)}
 
     @property
     def count(self) -> int:

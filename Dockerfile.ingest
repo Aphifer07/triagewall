@@ -4,4 +4,9 @@ WORKDIR /app
 
 COPY . /app/
 
+# Preserve an immutable packaged default even when Compose bind-mounts the
+# legacy operator policy over triagewall/config/prefilter.json at runtime.
+RUN mkdir -p /app/triagewall/defaults /var/lib/triagewall-config \
+    && cp /app/triagewall/config/prefilter.json /app/triagewall/defaults/prefilter.json
+
 CMD ["python3", "triagewall/ingest.py"]

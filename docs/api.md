@@ -15,9 +15,10 @@ scheduled for removal on **2026-12-31**. Prefer `/api/v1/*` and the field
 | Header | `X-API-Key: <plaintext>` |
 | Storage | Keys are configured as **PBKDF2-HMAC-SHA256** digests only
   (`TRIAGEWALL_API_KEYS`). Plaintext keys are never stored or logged. |
-| Scopes | `read`, `feedback:write` |
+| Scopes | `read`, `feedback:write`, `config:write` |
 | Reads | Allowed without a key when `TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true` (**default**). Set to `false` to require a key with `read` (or `feedback:write`) for read endpoints and `/metrics`. |
-| Writes | **Always** require a credential: an API key with `feedback:write`, or the same-origin dashboard write cookie. |
+| Feedback writes | **Always** require a credential: an API key with `feedback:write`, or the same-origin dashboard write cookie. |
+| Configuration | Every configuration endpoint requires an attributable API key with `config:write`; anonymous reads, `read`, `feedback:write`, the dashboard cookie, and demo mode never grant access. Draft mutations also require `TRIAGEWALL_CONFIG_WRITES_ENABLED=true`. |
 | Dashboard cookie | Serving `GET /` sets HttpOnly `SameSite=Strict` cookie `tw_dash_write` derived from `TRIAGEWALL_DASHBOARD_WRITE_SECRET`. The built-in UI does not need JS changes. External clients must use `X-API-Key`. |
 | Health | `GET /api/v1/health` is always unauthenticated and omits storage metrics. |
 
@@ -45,9 +46,10 @@ python -c "from triagewall.dashboard.api.auth import hash_api_key; import secret
 ```
 
 ```env
-TRIAGEWALL_API_KEYS=kiosk:pbkdf2_sha256$210000$<salt>$<digest>:read,operator:pbkdf2_sha256$210000$<salt>$<digest>:read|feedback:write
+TRIAGEWALL_API_KEYS=kiosk:pbkdf2_sha256$210000$<salt>$<digest>:read,operator:pbkdf2_sha256$210000$<salt>$<digest>:read|feedback:write,config-admin:pbkdf2_sha256$210000$<salt>$<digest>:config:write
 TRIAGEWALL_DASHBOARD_WRITE_SECRET=<long-random-string>
 TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true
+TRIAGEWALL_CONFIG_WRITES_ENABLED=false
 ```
 
 ### Recommended production settings
@@ -241,6 +243,152 @@ curl -sS -X POST -H 'Host: localhost' -H "X-API-Key: $KEY" \
   http://127.0.0.1:8084/api/v1/feedback/1
 ```
 
+### Operator configuration
+
+Configuration documents may contain private asset inventory and suppression
+policy, so every endpoint below requires an `X-API-Key` carrying
+`config:write`. That requirement is independent of ordinary API read settings.
+Demo mode rejects configuration access even when such a key is supplied.
+
+The dashboard exposes these operations at `/configuration`. Its administrator
+key exists only in the current page's memory, is cleared from the password
+field after connection, and is sent only in `X-API-Key`; navigation, URLs,
+request bodies, logs, persistent browser storage, and the database never carry
+it. Disconnecting or reloading the page discards the key. The editor follows
+the API lifecycle explicitly: edit a structured candidate, inspect its exact
+canonical JSON, create an immutable draft, validate it, run a bounded preview,
+then confirm activation. Broad prefilter rules and candidates based on an older
+shipped baseline require their specific acknowledgement before activation or
+rollback.
+
+`GET /api/v1/config` returns the active revision metadata for both kinds,
+bundle generation, compatibility mode, revision counts, and per-consumer
+reload health. Health includes each consumer's desired and loaded generation,
+loaded revision pair, status age, and a bounded generic error. A missing Wazuh
+row means the optional Wazuh ingest has not started; it is not synthesized as
+healthy. `GET /api/v1/config/{kind}` returns the active canonical document for
+`prefilter_policy` or `asset_inventory`. `GET /api/v1/config/{kind}/revisions`
+lists newest-first revision metadata without documents; it accepts `state`,
+`limit` (1–100), and an opaque `cursor`. The per-revision endpoint,
+`GET /api/v1/config/{kind}/revisions/{id}`, retrieves one immutable document.
+
+Draft mutation is disabled unless:
+
+```env
+TRIAGEWALL_CONFIG_WRITES_ENABLED=true
+```
+
+Enabling this without at least one configured `config:write` key fails process
+startup. Draft creation requires the current active revision and generation:
+
+```bash
+curl -sS -X POST -H 'Host: localhost' -H "X-API-Key: $CONFIG_KEY" \
+  -H 'X-Request-ID: change-2026-08-15-01' \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"version":1,"internal_cidrs":[],"auto_false_positive":[]},"parent_revision_id":1,"expected_generation":1,"note":"candidate"}' \
+  http://127.0.0.1:8084/api/v1/config/prefilter_policy/drafts
+```
+
+Revision content is unique per kind, so an identical resubmission cannot create
+a second row. When the existing revision is still an unactivated candidate off
+the very parent named in the request, creation returns that revision with
+`"resumed": true` and `200` instead of `201`, which lets an operator who lost
+editor state resume it. That covers a `draft`, a `validated` revision, and a
+draft that validation normalized; resubmitting the canonical form of a
+normalized candidate returns the same submitted handle, found by exact pointer
+match rather than by scanning recent history, so ordinary activation and
+rollback churn against the same parent cannot bury it. `validated_revision_id`
+names the validated result when there already is one, so a resumed candidate
+continues at preview. Any other existing state, and any candidate raised against
+a different parent, stay a `409`.
+
+`POST /api/v1/config/{kind}/drafts/{id}/validate` applies the production
+validator. An invalid candidate becomes an immutable `rejected` revision with
+a structured validation result. When normalization changes the effective
+document, validation preserves the submitted draft and creates a canonical
+`validated` child, or reuses the existing revision that already holds that exact
+canonical content. Because content and digests are immutable, a reused revision
+keeps its own lineage and state; the response reports the submitted draft's
+`candidate_parent_revision_id`, and preview and activation are addressed by the
+submitted draft id, which carries that parent relationship forward. Neither
+operation activates configuration or changes the bundle generation.
+
+`POST /api/v1/config/{kind}/drafts/{id}/preview` accepts
+`expected_generation`, a capped time window, and a candidate limit up to
+2,000. It refuses a candidate whose parent is no longer active before sampling
+anything. It compares only the newest eligible events, reports the examined count
+and whether the sample was truncated, never calls Ollama, and never changes
+verdicts or checkpoints. The sample is bounded by rows and by aggregate alert
+bytes, and reaching the byte budget is reported as truncation with a warning.
+That budget is enforced from the alert size recorded beside each record at
+ingestion, so an oversized body is never read. A record retained before those
+sizes existed has no trusted length, so the sample stops there and reports it
+rather than reading an unmeasured body.
+Events retained before sensor context existed are included; only records
+positively identified as another sensor are excluded from a prefilter preview.
+Prefilter previews report suppression deltas, bounded event/signature examples,
+unmatched rules, and unscoped-rule warnings. Asset previews report exact-IP
+match and context changes with bounded examples in `summary.counts`, and report
+suppression separately in `summary.suppression`: an inventory edit also moves
+deterministic verdicts when the active policy scopes rules by `source_asset` or
+`destination_asset`, so the active policy is evaluated against both inventories
+for each eligible Suricata record in the same bounded sample. A policy with no
+asset-scoped rule cannot move a decision, so that analysis is complete without
+reading any alert body. `summary.suppression.complete` is false when truncation
+or an unreadable record left an asset-scoped rule unevaluated.
+
+`POST /api/v1/config/{kind}/drafts/{id}/activate` requires the current
+`expected_generation`. Prefilter candidates containing signature-only rules
+also require `acknowledge_broad_rules=true`. While asset-scoped prefilter rules
+are active, an asset inventory activates only on evidence of a preview that
+actually evaluated them at this generation, or on an explicit
+`acknowledge_incomplete_asset_preview=true`; a rollback has no preview of its
+own and always requires that acknowledgement. An enrichment-only summary is
+never presented as the whole change. Activation revalidates stored
+content under `BEGIN IMMEDIATE`, checks the draft parent is still active, moves
+the old and new revision states, updates both previous-bundle pointers, and
+increments generation in one transaction. While the deployment remains in
+`legacy` authority mode, the first successful activation atomically changes
+authority to `database`; both ingest processes observe the new complete bundle
+between records. A candidate based on an older packaged prefilter baseline also
+requires `acknowledge_shipped_base_change=true`.
+
+`POST /api/v1/config/{kind}/revisions/{id}/rollback` reactivates a previously
+active superseded revision through the same validation, acknowledgement,
+optimistic-generation, transaction, audit, and runtime-reload path. Rollback
+creates a new bundle generation; it never rewrites revision content or restores
+files. A superseded draft that validation normalized was never active and is
+refused with `409`; the editor does not offer it as a rollback target.
+
+Refused mutations are themselves evidence. A stale generation, a parent that is
+no longer active, a missing acknowledgement, and a refused rollback each append
+one bounded, attributable audit record naming the reason, which survives the
+rollback of the refused change. These records never contain document content,
+notes, or credentials.
+
+`GET /api/v1/config/audit` returns newest-first audit records with `limit`
+(1–100, default 50), optional `kind`, and an opaque `cursor`. Audit details are
+bounded lifecycle metadata and never contain configuration documents or API
+keys. All configuration responses use `Cache-Control: private, no-store` and
+emit no ETag.
+
+New verdict rows also store `config_generation`, `prefilter_revision`, and
+`asset_revision`. Both ingest adapters load both documents as one immutable
+bundle. While authority remains `legacy`, each consumer start mirrors the
+mounted documents into the durable bundle through the same serialized,
+fail-closed transaction the one-shot bootstrap uses, then publishes exactly what
+it mirrored. Every authoritative read happens inside that transaction, so two
+consumers starting at once cannot commit mount snapshots out of order. When a
+peer has already mirrored a newer generation, the other consumer adopts those
+durable documents rather than classifying on its obsolete start-time snapshot,
+and records one bounded audit event naming the adopted generation, so both
+consumers converge on one immutable bundle. In `database` mode, no file is read
+at all, so a missing or malformed mount, or a host with no packaged default,
+cannot block a start from a valid durable bundle. Startup fails closed without a
+valid complete bundle; a later reload failure retains the last-known-good bundle,
+reports degraded health, records bounded audit evidence, and retries with
+bounded backoff.
+
 ### `GET /api/v1/timeline`
 
 Hourly buckets. Query: `hours` (1–168, default 24), `interval` (typed enum;
@@ -291,10 +439,12 @@ so it always matches the bytes actually served. Send `If-None-Match` to receive
 HTTP 304 when unchanged. Stats/timeline/SPC results also use short in-process
 TTL caches. Payloads include `generated_at` (UTC).
 
-The verdict endpoints are the exception. `GET /api/v1/verdicts`,
+The verdict and configuration endpoints are the exception. `GET /api/v1/verdicts`,
 `GET /api/v1/verdicts/{event_id}` and
 `GET /api/v1/verdicts/{event_id}/investigation` emit
 `Cache-Control: private, no-store` and **no** `ETag`, and never answer 304.
+The `/api/v1/config*` family uses the same no-store policy because its private
+documents and lifecycle state must not be retained by intermediaries.
 Saving operator feedback rewrites the underlying row, so a stored or
 revalidated copy would report a reviewed alert as unreviewed. Stats, timeline,
 SPC and health keep their existing caching, as does the deprecated
