@@ -68,6 +68,7 @@ function runEditor({
   confirmReply = () => true,
   draftIds = null,
   previewResponse = null,
+  assetRevisionRows = null,
 } = {}) {
   const remainingDraftIds = draftIds ? [...draftIds] : null;
   const elements = new Map();
@@ -151,7 +152,19 @@ function runEditor({
       };
     }
     if (url === "/api/v1/config/asset_inventory/revisions?limit=25") {
-      return { revisions: [revision(2, "asset_inventory")] };
+      return {
+        revisions: assetRevisionRows
+          ? [revision(2, "asset_inventory"), ...assetRevisionRows]
+          : [revision(2, "asset_inventory")],
+      };
+    }
+    const assetRevision = /^\/api\/v1\/config\/asset_inventory\/revisions\/(\d+)$/.exec(url);
+    if (assetRevision) {
+      return {
+        generation: summary.generation,
+        revision: revision(Number(assetRevision[1]), "asset_inventory", "superseded"),
+        document: { version: 1, assets: [] },
+      };
     }
     if (url === "/api/v1/config/audit?limit=25") {
       return { entries: [{ action: "bootstrap_activated", actor: "system", occurred_at: "2026-08-15T00:00:00Z" }] };
@@ -1568,6 +1581,347 @@ test("reports optimistic-lock conflicts without auto-retrying a mutation", async
   assert.equal(harness.calls.filter((call) => call.url.endsWith("/drafts")).length, 1);
 });
 
+async function beginDraft(harness, cidr = "10.0.1.0/24") {
+  harness.document.getElementById("configInternalCidrs").value = cidr;
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  await harness.document.getElementById("configCreateDraft").dispatch("click");
+}
+
+// Returns the pending validation without awaiting it, so a test can disturb
+// the lifecycle while the request is still in flight.
+function startValidation(harness) {
+  return harness.document.getElementById("configValidateDraft").dispatch("click");
+}
+
+test("a stale validation response cannot overwrite a newer candidate", async () => {
+  const harness = runEditor({ defer: (url) => url.endsWith("/drafts/3/validate") });
+  await connect(harness);
+  await beginDraft(harness);
+  const validation = startValidation(harness);
+
+  // The operator keeps editing the same kind while validation is in flight.
+  harness.document.getElementById("configInternalCidrs").value = "10.0.9.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  await harness.release();
+  await validation;
+
+  assert.equal(harness.editor.state().lifecycle.validatedId, null);
+  assert.equal(harness.editor.state().lifecycle.draftId, null);
+  assert.equal(harness.editor.state().dirtyKinds.join(","), "prefilter_policy");
+  assert.match(
+    harness.document.getElementById("configExactDocument").textContent,
+    /10\.0\.9\.0\/24/,
+  );
+  // The canonical document of the superseded draft is never requested.
+  assert.equal(
+    harness.calls.some((call) => call.url.includes("/revisions/4")),
+    false,
+  );
+});
+
+test("a validation superseded by a kind switch fetches no canonical revision", async () => {
+  const harness = runEditor({ defer: (url) => url.endsWith("/drafts/3/validate") });
+  await connect(harness);
+  await beginDraft(harness);
+  const validation = startValidation(harness);
+
+  await harness.document.getElementById("configWorkspace").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-config-kind]"
+          ? { dataset: { configKind: "asset_inventory" } }
+          : null,
+    },
+  });
+  await harness.release();
+  await validation;
+
+  assert.equal(harness.editor.state().selectedKind, "asset_inventory");
+  assert.equal(harness.editor.state().lifecycle.validatedId, null);
+  // Neither kind's revision endpoint is asked for the canonical document.
+  assert.equal(
+    harness.calls.some((call) => /\/revisions\/4$/.test(call.url)),
+    false,
+  );
+});
+
+test("a stale canonical revision response cannot replace newer work", async () => {
+  const harness = runEditor({ defer: (url) => /\/revisions\/4$/.test(url) });
+  await connect(harness);
+  await beginDraft(harness);
+  const validation = startValidation(harness);
+  // Validation resolved; its canonical fetch is the request still in flight.
+  harness.document.getElementById("configInternalCidrs").value = "10.0.9.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  await harness.release();
+  await validation;
+
+  assert.equal(harness.editor.state().lifecycle.validatedId, null);
+  assert.match(
+    harness.document.getElementById("configExactDocument").textContent,
+    /10\.0\.9\.0\/24/,
+  );
+});
+
+test("reload and disconnect invalidate a pending validation", async () => {
+  for (const [name, disturb, expectConnected] of [
+    ["reload", async (harness) => {
+      const reload = harness.editor.load(true);
+      await harness.release();
+      await reload;
+    }, true],
+    ["disconnect", async (harness) => {
+      await harness.document.getElementById("configForgetButton").dispatch("click");
+    }, false],
+  ]) {
+    const harness = runEditor({ defer: (url) => url.endsWith("/drafts/3/validate") });
+    await connect(harness);
+    await beginDraft(harness);
+  const validation = startValidation(harness);
+
+    await disturb(harness);
+    await harness.release();
+    await validation;
+
+    assert.equal(
+      harness.editor.state().lifecycle.validatedId,
+      null,
+      `${name}: a superseded validation published`,
+    );
+    assert.equal(harness.editor.state().connected, expectConnected, `${name}: session`);
+  }
+});
+
+test("a stale validation failure cannot replace newer status", async () => {
+  const harness = runEditor({
+    defer: (url) => url.endsWith("/drafts/3/validate"),
+    fail: (url) => url.endsWith("/drafts/3/validate"),
+  });
+  await connect(harness);
+  await beginDraft(harness);
+  const validation = startValidation(harness);
+  harness.document.getElementById("configInternalCidrs").value = "10.0.9.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  const statusBefore = harness.document.getElementById("configLifecycleMessage").textContent;
+
+  await harness.release();
+  await validation;
+
+  assert.equal(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    statusBefore,
+  );
+});
+
+test("a stale canonical-fetch failure cannot replace newer status", async () => {
+  const harness = runEditor({
+    defer: (url) => /\/revisions\/4$/.test(url),
+    fail: (url) => /\/revisions\/4$/.test(url),
+  });
+  await connect(harness);
+  await beginDraft(harness);
+  const validation = startValidation(harness);
+  harness.document.getElementById("configInternalCidrs").value = "10.0.9.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  const statusBefore = harness.document.getElementById("configLifecycleMessage").textContent;
+
+  await harness.release();
+  await validation;
+
+  assert.equal(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    statusBefore,
+  );
+});
+
+test("a current validation publishes through the correct kind and proceeds", async () => {
+  const harness = runEditor();
+  await connect(harness);
+  await beginDraft(harness);
+  await startValidation(harness);
+
+  const canonical = harness.calls.find((call) => /\/revisions\/4$/.test(call.url));
+  assert.ok(canonical);
+  assert.match(canonical.url, /\/prefilter_policy\/revisions\/4$/);
+  assert.equal(harness.editor.state().lifecycle.validatedId, 4);
+  assert.match(
+    harness.document.getElementById("configExactDocument").textContent,
+    /10\.0\.1\.0\/24/,
+  );
+
+  await harness.document.getElementById("configPreviewDraft").dispatch("click");
+  harness.document.getElementById("configConfirmActivate").checked = true;
+  await harness.document.getElementById("configConfirmActivate").dispatch("change");
+  await harness.document.getElementById("configActivateDraft").dispatch("click");
+  assert.equal(
+    harness.calls.filter((call) => call.url.endsWith("/activate")).length,
+    1,
+  );
+});
+
+const ASSET_ROLLBACK_ROWS = [
+  {
+    id: 21,
+    kind: "asset_inventory",
+    revision: `sha256:${"21".padStart(64, "0")}`,
+    source: "operator",
+    parent_revision_id: 2,
+    shipped_base_revision: null,
+    state: "superseded",
+    validation: { status: "valid" },
+    created_at: "2026-08-16T00:00:00Z",
+    created_by: "operator",
+    note: null,
+  },
+];
+
+function rollbackClick(id) {
+  return {
+    target: {
+      closest: (selector) =>
+        selector === "[data-config-rollback]"
+          ? { dataset: { configRollback: String(id) } }
+          : null,
+    },
+  };
+}
+
+async function selectAssetRollback(harness, id = 21) {
+  await harness.document.getElementById("configWorkspace").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-config-kind]"
+          ? { dataset: { configKind: "asset_inventory" } }
+          : null,
+    },
+  });
+  await harness.document.getElementById("configWorkspace").dispatch("click", rollbackClick(id));
+}
+
+test("an asset rollback requires its own acknowledgement before confirming", async () => {
+  const harness = runEditor({ assetRevisionRows: ASSET_ROLLBACK_ROWS });
+  await connect(harness);
+
+  await selectAssetRollback(harness);
+
+  // The dedicated control appears once the exact target document is on screen.
+  assert.match(
+    harness.document.getElementById("configRollbackDocument").textContent,
+    /assets/,
+  );
+  assert.equal(
+    harness.document.getElementById("configRollbackAssetGuard").classList.contains("hidden"),
+    false,
+  );
+  assert.equal(harness.document.getElementById("configConfirmRollback").disabled, true);
+
+  // A forced click before acknowledgement sends nothing.
+  await harness.document.getElementById("configConfirmRollback").dispatch("click");
+  assert.equal(harness.calls.some((call) => call.url.endsWith("/rollback")), false);
+  assert.match(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    /Acknowledge the rollback conditions/,
+  );
+
+  harness.document.getElementById("configConfirmRollbackAssetPreview").checked = true;
+  await harness.document.getElementById("configConfirmRollbackAssetPreview").dispatch("change");
+  assert.equal(harness.document.getElementById("configConfirmRollback").disabled, false);
+  await harness.document.getElementById("configConfirmRollback").dispatch("click");
+
+  const call = harness.calls.find((entry) => entry.url.endsWith("/rollback"));
+  assert.ok(call);
+  assert.match(call.url, /\/asset_inventory\/revisions\/21\/rollback$/);
+  assert.deepEqual(JSON.parse(call.options.body), {
+    expected_generation: 1,
+    acknowledge_broad_rules: false,
+    acknowledge_shipped_base_change: false,
+    acknowledge_incomplete_asset_preview: true,
+  });
+});
+
+test("an asset rollback acknowledgement never survives a change of context", async () => {
+  for (const [name, disturb] of [
+    ["cancel", async (harness) => {
+      await harness.document.getElementById("configCancelRollback").dispatch("click");
+      await selectAssetRollback(harness);
+    }],
+    ["another target", async (harness) => {
+      await harness.document.getElementById("configWorkspace").dispatch("click", rollbackClick(21));
+    }],
+    ["reload", async (harness) => {
+      await harness.editor.load(true);
+      await selectAssetRollback(harness);
+    }],
+    ["kind switch", async (harness) => {
+      await harness.document.getElementById("configWorkspace").dispatch("click", {
+        target: {
+          closest: (selector) =>
+            selector === "[data-config-kind]"
+              ? { dataset: { configKind: "prefilter_policy" } }
+              : null,
+        },
+      });
+      await selectAssetRollback(harness);
+    }],
+  ]) {
+    const harness = runEditor({ assetRevisionRows: ASSET_ROLLBACK_ROWS });
+    await connect(harness);
+    await selectAssetRollback(harness);
+    harness.document.getElementById("configConfirmRollbackAssetPreview").checked = true;
+    await harness.document.getElementById("configConfirmRollbackAssetPreview").dispatch("change");
+
+    await disturb(harness);
+
+    assert.equal(
+      harness.document.getElementById("configConfirmRollbackAssetPreview").checked,
+      false,
+      `${name}: the acknowledgement survived`,
+    );
+    assert.equal(
+      harness.document.getElementById("configConfirmRollback").disabled,
+      true,
+      `${name}: confirmation stayed enabled`,
+    );
+  }
+});
+
+test("a disconnect clears the asset rollback acknowledgement", async () => {
+  const harness = runEditor({ assetRevisionRows: ASSET_ROLLBACK_ROWS });
+  await connect(harness);
+  await selectAssetRollback(harness);
+  harness.document.getElementById("configConfirmRollbackAssetPreview").checked = true;
+  await harness.document.getElementById("configConfirmRollbackAssetPreview").dispatch("change");
+
+  await harness.document.getElementById("configForgetButton").dispatch("click");
+
+  assert.equal(harness.editor.state().connected, false);
+  assert.equal(
+    harness.document.getElementById("configConfirmRollbackAssetPreview").checked,
+    false,
+  );
+});
+
+test("activation and rollback acknowledgements are independent", async () => {
+  const harness = runEditor({ assetRevisionRows: ASSET_ROLLBACK_ROWS });
+  await connect(harness);
+  await selectAssetRollback(harness);
+  harness.document.getElementById("configConfirmRollbackAssetPreview").checked = true;
+  await harness.document.getElementById("configConfirmRollbackAssetPreview").dispatch("change");
+
+  // Checking the rollback acknowledgement never satisfies the activation one.
+  assert.equal(
+    harness.document.getElementById("configConfirmAssetPreview").checked,
+    false,
+  );
+  harness.document.getElementById("configConfirmAssetPreview").checked = true;
+  await harness.document.getElementById("configCancelRollback").dispatch("click");
+  // Cancelling a rollback never clears activation state either.
+  assert.equal(
+    harness.document.getElementById("configConfirmAssetPreview").checked,
+    true,
+  );
+});
+
 test("rollback requires an explicit selection and forwards dedicated acknowledgements", async () => {
   const harness = runEditor();
   await connect(harness);
@@ -1592,5 +1946,12 @@ test("rollback requires an explicit selection and forwards dedicated acknowledge
     expected_generation: 1,
     acknowledge_broad_rules: true,
     acknowledge_shipped_base_change: true,
+    // A prefilter rollback never asserts an asset acknowledgement it was not
+    // asked for, and its control stays hidden.
+    acknowledge_incomplete_asset_preview: false,
   });
+  assert.equal(
+    harness.document.getElementById("configRollbackAssetGuard").classList.contains("hidden"),
+    true,
+  );
 });
