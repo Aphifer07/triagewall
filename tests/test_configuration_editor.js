@@ -66,7 +66,10 @@ function runEditor({
   revisionRows = null,
   defer = null,
   confirmReply = () => true,
+  draftIds = null,
+  previewResponse = null,
 } = {}) {
+  const remainingDraftIds = draftIds ? [...draftIds] : null;
   const elements = new Map();
   const calls = [];
   const document = {
@@ -153,8 +156,11 @@ function runEditor({
     if (url === "/api/v1/config/audit?limit=25") {
       return { entries: [{ action: "bootstrap_activated", actor: "system", occurred_at: "2026-08-15T00:00:00Z" }] };
     }
-    if (url === "/api/v1/config/prefilter_policy/drafts" && method === "POST") {
-      return draftResponse ?? { draft: revision(3, "prefilter_policy", "draft"), resumed: false };
+    const draftsPost = /^\/api\/v1\/config\/([a-z_]+)\/drafts$/.exec(url);
+    if (draftsPost && method === "POST") {
+      if (draftResponse) return draftResponse;
+      const id = remainingDraftIds?.length ? remainingDraftIds.shift() : 3;
+      return { draft: revision(id, draftsPost[1], "draft"), resumed: false };
     }
     if (url === "/api/v1/config/prefilter_policy/drafts/3/validate" && method === "POST") {
       return validateResponse ?? {
@@ -168,6 +174,7 @@ function runEditor({
     }
     if (url === "/api/v1/config/prefilter_policy/drafts/3/preview" && method === "POST") {
       return {
+        draft_id: 3,
         window_hours: 24,
         candidates_examined: 12,
         truncated: false,
@@ -188,6 +195,31 @@ function runEditor({
       };
     }
     if (url === "/api/v1/config/prefilter_policy/revisions/9/rollback" && method === "POST") {
+      return { generation: 2 };
+    }
+    // Any other draft handle follows the same lifecycle shape, so a test can
+    // drive two drafts of the same kind at once.
+    const lifecycle = /^\/api\/v1\/config\/([a-z_]+)\/drafts\/(\d+)\/(validate|preview|activate)$/.exec(url);
+    if (lifecycle && method === "POST") {
+      const id = Number(lifecycle[2]);
+      if (lifecycle[3] === "validate") {
+        return {
+          revision: revision(id + 1, lifecycle[1], "validated"),
+          validation: { status: "valid" },
+          candidate_parent_revision_id: 1,
+        };
+      }
+      if (lifecycle[3] === "preview") {
+        if (previewResponse) return { draft_id: id, ...previewResponse };
+        return {
+          draft_id: id,
+          window_hours: 24,
+          candidates_examined: id,
+          truncated: false,
+          warnings: [],
+          summary: { counts: { newly_suppressed: 0 } },
+        };
+      }
       return { generation: 2 };
     }
     return {};
@@ -831,6 +863,205 @@ test("a change note survives resetting either structured form", async () => {
     );
     assert.equal(harness.editor.state().dirtyForms.join(","), "note", `${cancelId}: scope`);
   }
+});
+
+async function driveDraft(harness, cidr) {
+  harness.document.getElementById("configInternalCidrs").value = cidr;
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  await harness.document.getElementById("configCreateDraft").dispatch("click");
+  await harness.document.getElementById("configValidateDraft").dispatch("click");
+}
+
+test("a stale preview response is never attached to a newer draft", async () => {
+  const harness = runEditor({
+    draftIds: [3, 13],
+    defer: (url) => url.endsWith("/drafts/3/preview"),
+  });
+  await connect(harness);
+
+  // Draft A: preview starts and stays in flight.
+  await driveDraft(harness, "10.0.1.0/24");
+  const previewA = harness.document.getElementById("configPreviewDraft").dispatch("click");
+
+  // The operator edits the same kind and drives draft B to validated.
+  await driveDraft(harness, "10.0.2.0/24");
+  assert.equal(harness.editor.state().lifecycle.draftId, 13);
+  assert.equal(harness.editor.state().lifecycle.validatedId, 14);
+
+  // A resolves only now.
+  await harness.release();
+  await previewA;
+
+  // A's analysis is neither rendered nor attached to B.
+  assert.equal(harness.editor.state().lifecycle.preview, null);
+  assert.equal(
+    harness.document.getElementById("configPreviewResult").textContent,
+    "",
+  );
+  assert.equal(
+    harness.document.getElementById("configActivationGuard").classList.contains("hidden"),
+    true,
+  );
+
+  // B cannot be activated on A's analysis, even with confirmation checked.
+  harness.document.getElementById("configConfirmActivate").checked = true;
+  await harness.document.getElementById("configConfirmActivate").dispatch("change");
+  assert.equal(harness.document.getElementById("configActivateDraft").disabled, true);
+  await harness.document.getElementById("configActivateDraft").dispatch("click");
+  assert.equal(harness.calls.some((call) => call.url.endsWith("/activate")), false);
+
+  // B's own preview then renders and activates normally.
+  await harness.document.getElementById("configPreviewDraft").dispatch("click");
+  assert.equal(harness.editor.state().lifecycle.preview.draft_id, 13);
+  assert.match(
+    harness.document.getElementById("configPreviewResult").textContent,
+    /"candidates_examined": 13/,
+  );
+  harness.document.getElementById("configConfirmActivate").checked = true;
+  await harness.document.getElementById("configConfirmActivate").dispatch("change");
+  await harness.document.getElementById("configActivateDraft").dispatch("click");
+  const activation = harness.calls.filter((call) => call.url.endsWith("/activate"));
+  assert.equal(activation.length, 1);
+  assert.match(activation[0].url, /\/drafts\/13\/activate$/);
+});
+
+test("a stale preview failure cannot overwrite a newer draft's status", async () => {
+  const harness = runEditor({
+    draftIds: [3, 13],
+    defer: (url) => url.endsWith("/drafts/3/preview"),
+    fail: (url) => url.endsWith("/drafts/3/preview"),
+  });
+  await connect(harness);
+
+  await driveDraft(harness, "10.0.1.0/24");
+  const previewA = harness.document.getElementById("configPreviewDraft").dispatch("click");
+  await driveDraft(harness, "10.0.2.0/24");
+  const statusBefore = harness.document.getElementById("configLifecycleMessage").textContent;
+
+  await harness.release();
+  await previewA;
+
+  assert.equal(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    statusBefore,
+  );
+  assert.doesNotMatch(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    /stale/,
+  );
+  assert.equal(harness.editor.state().lifecycle.draftId, 13);
+});
+
+test("a pending preview is discarded on reload, disconnect, and kind switch", async () => {
+  for (const [name, disturb] of [
+    ["reload", async (harness) => {
+      const reload = harness.editor.load(true);
+      await harness.release();
+      await reload;
+    }],
+    ["disconnect", async (harness) => {
+      await harness.document.getElementById("configForgetButton").dispatch("click");
+    }],
+    ["kind switch", async (harness) => {
+      await harness.document.getElementById("configWorkspace").dispatch("click", {
+        target: {
+          closest: (selector) =>
+            selector === "[data-config-kind]"
+              ? { dataset: { configKind: "asset_inventory" } }
+              : null,
+        },
+      });
+    }],
+  ]) {
+    const harness = runEditor({ defer: (url) => url.endsWith("/drafts/3/preview") });
+    await connect(harness);
+    await driveDraft(harness, "10.0.1.0/24");
+    const preview = harness.document.getElementById("configPreviewDraft").dispatch("click");
+
+    await disturb(harness);
+    await harness.release();
+    await preview;
+
+    assert.equal(
+      harness.editor.state().lifecycle.preview,
+      null,
+      `${name}: a superseded preview was published`,
+    );
+    assert.equal(
+      harness.document.getElementById("configPreviewResult").textContent,
+      "",
+      `${name}: a superseded preview was rendered`,
+    );
+  }
+});
+
+test("an incomplete asset preview needs its own acknowledgement to activate", async () => {
+  const harness = runEditor({
+    assetRows: [
+      {
+        hostname: "server",
+        role: "application",
+        ips: ["10.0.0.8"],
+        criticality: "low",
+        internet_facing: false,
+        exposed_ports: [],
+      },
+    ],
+    previewResponse: {
+      window_hours: 24,
+      candidates_examined: 4,
+      truncated: true,
+      warnings: ["asset preview could not evaluate every asset-dependent prefilter rule; activation requires acknowledging it"],
+      summary: {
+        counts: { newly_matched_addresses: 1 },
+        suppression: {
+          asset_dependent_rule_count: 1,
+          complete: false,
+          evaluated_candidates: 1,
+          unevaluated_candidates: 0,
+          counts: { newly_suppressed: 1 },
+          affected_event_ids: [7],
+          affected_signature_ids: [1001],
+        },
+      },
+    },
+  });
+  await connect(harness);
+  // Work on the asset inventory and dirty its candidate.
+  await harness.document.getElementById("configWorkspace").dispatch("click", {
+    target: {
+      closest: (selector) =>
+        selector === "[data-config-asset-remove]"
+          ? { dataset: { configAssetRemove: "0" } }
+          : null,
+    },
+  });
+  await harness.document.getElementById("configCreateDraft").dispatch("click");
+  await harness.document.getElementById("configValidateDraft").dispatch("click");
+  await harness.document.getElementById("configPreviewDraft").dispatch("click");
+
+  // The dedicated acknowledgement appears and gates activation on its own.
+  assert.equal(
+    harness.document.getElementById("configAcknowledgeAssetPreview").classList.contains("hidden"),
+    false,
+  );
+  harness.document.getElementById("configConfirmActivate").checked = true;
+  await harness.document.getElementById("configConfirmActivate").dispatch("change");
+  assert.equal(harness.document.getElementById("configActivateDraft").disabled, true);
+  await harness.document.getElementById("configActivateDraft").dispatch("click");
+  assert.equal(harness.calls.some((call) => call.url.endsWith("/activate")), false);
+
+  harness.document.getElementById("configConfirmAssetPreview").checked = true;
+  await harness.document.getElementById("configConfirmAssetPreview").dispatch("change");
+  assert.equal(harness.document.getElementById("configActivateDraft").disabled, false);
+  await harness.document.getElementById("configActivateDraft").dispatch("click");
+
+  const activation = harness.calls.find((call) => call.url.endsWith("/activate"));
+  assert.ok(activation);
+  assert.equal(
+    JSON.parse(activation.options.body).acknowledge_incomplete_asset_preview,
+    true,
+  );
 });
 
 const SEED_ASSET_ROWS = [

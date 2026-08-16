@@ -714,6 +714,161 @@ class ConfigApiTests(unittest.TestCase):
             [(1,)],
         )
 
+    def test_sqlite_runtime_provides_the_json_functions_the_lookup_needs(self):
+        # The normalization-handle lookup is an equality filter over JSON
+        # metadata; a runtime without JSON1 would silently break resume.
+        rows = self.db_rows(
+            "SELECT json_valid('{\"a\": 1}'), "
+            "json_extract('{\"normalized_revision_id\": 7}', "
+            "'$.normalized_revision_id')"
+        )
+        self.assertEqual(rows, [(1, 7)])
+        self.assertEqual(self.db_rows("SELECT json_valid('not json')"), [(0,)])
+
+    def test_canonical_resume_survives_lifecycle_churn_against_one_parent(self):
+        self.activate(prefilter_document(signature_id=2002))
+        self.activate(prefilter_document(signature_id=3003))
+        noncanonical = prefilter_document(signature_id=2002, protocol="TCP")
+        created = self.create_draft(noncanonical)
+        handle_id = created.json()["draft"]["id"]
+        validated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{handle_id}/validate",
+            headers=self.config_headers,
+        )
+        self.assertEqual(validated.status_code, 200, validated.text)
+        canonical_id = validated.json()["revision"]["id"]
+        parent = self.summary()["active"]["prefilter_policy"]["id"]
+
+        # Ordinary activate/rollback churn leaves many newer superseded rows
+        # hanging off the same parent, burying the normalization handle.
+        for index in range(55):
+            generation = self.summary()["generation"]
+            churn = self.activate(prefilter_document(signature_id=5000 + index))
+            rolled_back = self.client.post(
+                f"/api/v1/config/prefilter_policy/revisions/{parent}/rollback",
+                headers=self.config_headers,
+                json={
+                    "expected_generation": generation + 1,
+                    "acknowledge_broad_rules": True,
+                    "acknowledge_shipped_base_change": True,
+                },
+            )
+            self.assertEqual(rolled_back.status_code, 200, rolled_back.text)
+            self.assertTrue(churn)
+        self.assertEqual(
+            self.summary()["active"]["prefilter_policy"]["id"], parent
+        )
+        siblings = self.db_rows(
+            """SELECT COUNT(*) FROM operator_config_revisions
+               WHERE kind = 'prefilter_policy' AND state = 'superseded'
+                 AND parent_revision_id = ?""",
+            (parent,),
+        )[0][0]
+        self.assertGreater(siblings, 50)
+
+        # The draft handle is lost; both submitted forms must still resume it.
+        canonical = self.create_draft(prefilter_document(signature_id=2002))
+        resumed_noncanonical = self.create_draft(noncanonical)
+
+        for response in (canonical, resumed_noncanonical):
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["resumed"])
+            self.assertEqual(response.json()["draft"]["id"], handle_id)
+            self.assertEqual(response.json()["validated_revision_id"], canonical_id)
+
+        generation = self.summary()["generation"]
+        previewed = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{handle_id}/preview",
+            headers=self.config_headers,
+            json={"expected_generation": generation},
+        )
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{handle_id}/activate",
+            headers=self.config_headers,
+            json={
+                "expected_generation": generation,
+                "acknowledge_shipped_base_change": True,
+            },
+        )
+
+        self.assertEqual(previewed.status_code, 200, previewed.text)
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(
+            self.summary()["active"]["prefilter_policy"]["id"], canonical_id
+        )
+
+    def test_the_normalization_handle_lookup_is_exact_and_deterministic(self):
+        self.activate(prefilter_document(signature_id=2002))
+        self.activate(prefilter_document(signature_id=3003))
+        created = self.create_draft(
+            prefilter_document(signature_id=2002, protocol="TCP")
+        )
+        handle_id = created.json()["draft"]["id"]
+        self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{handle_id}/validate",
+            headers=self.config_headers,
+        )
+        parent = self.summary()["active"]["prefilter_policy"]["id"]
+        canonical_id = self.db_rows(
+            """SELECT json_extract(validation_json, '$.normalized_revision_id')
+               FROM operator_config_revisions WHERE id = ?""",
+            (handle_id,),
+        )[0][0]
+
+        lookup = config_repository._handle_for_canonical_revision
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # A second eligible handle resolves deterministically to the newest.
+            conn.execute(
+                """INSERT INTO operator_config_revisions (
+                       kind, revision, document_json, source, parent_revision_id,
+                       shipped_base_revision, state, validation_json, created_at,
+                       created_by
+                   ) SELECT kind, 'sha256:' || substr(revision, 8, 63) || 'f',
+                            document_json, source, parent_revision_id,
+                            shipped_base_revision, state, validation_json,
+                            created_at, created_by
+                     FROM operator_config_revisions WHERE id = ?""",
+                (handle_id,),
+            )
+            newest_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            # A row whose validation metadata is unreadable is skipped, not fatal.
+            conn.execute(
+                """INSERT INTO operator_config_revisions (
+                       kind, revision, document_json, source, parent_revision_id,
+                       shipped_base_revision, state, validation_json, created_at,
+                       created_by
+                   ) VALUES ('prefilter_policy', 'sha256:' || hex(randomblob(32)),
+                             '{}', 'operator', ?, NULL, 'superseded',
+                             'not json', '2026-08-16T00:00:00.000000Z', 'operator')""",
+                (parent,),
+            )
+            conn.commit()
+
+            deterministic = lookup(
+                conn, kind="prefilter_policy", canonical_id=canonical_id,
+                parent_revision_id=parent,
+            )
+            wrong_parent = lookup(
+                conn, kind="prefilter_policy", canonical_id=canonical_id,
+                parent_revision_id=parent + 1000,
+            )
+            wrong_kind = lookup(
+                conn, kind="asset_inventory", canonical_id=canonical_id,
+                parent_revision_id=parent,
+            )
+            wrong_pointer = lookup(
+                conn, kind="prefilter_policy", canonical_id=canonical_id + 9999,
+                parent_revision_id=parent,
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(int(deterministic[0]), newest_id)
+        self.assertIsNone(wrong_parent)
+        self.assertIsNone(wrong_kind)
+        self.assertIsNone(wrong_pointer)
+
     def test_normalization_input_is_not_a_rollback_target(self):
         self.activate(prefilter_document(signature_id=2002))
         created = self.create_draft(

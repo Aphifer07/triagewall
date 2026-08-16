@@ -52,6 +52,15 @@ def rule(signature_id, *, protocol="tcp", scoped=True):
     return value
 
 
+def asset_scoped_rule(signature_id, *, side="source", roles=("gateway",)):
+    """A rule whose verdict depends on the asset inventory."""
+    return {
+        "signature_ids": [signature_id],
+        "reason": f"Reviewed {side} asset rule {signature_id}",
+        "match": {f"{side}_asset": {"roles": list(roles)}},
+    }
+
+
 def asset_document(*assets):
     return {"version": 1, "assets": list(assets)}
 
@@ -273,6 +282,256 @@ class ConfigPreviewActivationTests(unittest.TestCase):
             conn.close()
         self.assertEqual(audit[:4], ("operator", "api_key", "slice-3-test", "draft_previewed"))
         self.assertNotIn("Reviewed rule", audit[4])
+
+    def activate_policy(self, document):
+        """Make one prefilter policy the active one and return the generation."""
+        summary = self.summary()
+        created = self.client.post(
+            "/api/v1/config/prefilter_policy/drafts",
+            headers=self.headers,
+            json={
+                "document": document,
+                "parent_revision_id": summary["active"]["prefilter_policy"]["id"],
+                "expected_generation": summary["generation"],
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        draft_id = created.json()["draft"]["id"]
+        validated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/validate",
+            headers=self.headers,
+        )
+        self.assertEqual(validated.status_code, 200, validated.text)
+        activated = self.client.post(
+            f"/api/v1/config/prefilter_policy/drafts/{draft_id}/activate",
+            headers=self.headers,
+            json={
+                "expected_generation": summary["generation"],
+                "acknowledge_broad_rules": True,
+                "acknowledge_shipped_base_change": True,
+            },
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        return activated.json()["generation"]
+
+    def asset_preview(self, candidate, *, candidate_limit=20):
+        draft_id, _, summary = self.create_validate("asset_inventory", candidate)
+        response = self.client.post(
+            f"/api/v1/config/asset_inventory/drafts/{draft_id}/preview",
+            headers=self.headers,
+            json={
+                "expected_generation": summary["generation"],
+                "candidate_limit": candidate_limit,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return draft_id, summary["generation"], response.json()
+
+    def test_asset_preview_reports_newly_suppressed_source_asset_alerts(self):
+        event_id = self.add_event(1, 1001, "10.0.0.5", "198.51.100.1")
+        self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
+
+        _, _, payload = self.asset_preview(
+            asset_document(asset("router", "10.0.0.1"), asset("edge", "10.0.0.5"))
+        )
+
+        suppression = payload["summary"]["suppression"]
+        self.assertEqual(suppression["asset_dependent_rule_count"], 1)
+        self.assertTrue(suppression["complete"])
+        self.assertEqual(suppression["counts"]["newly_suppressed"], 1)
+        self.assertEqual(suppression["counts"]["no_longer_suppressed"], 0)
+        self.assertEqual(suppression["affected_event_ids"], [event_id])
+        self.assertEqual(suppression["affected_signature_ids"], [1001])
+        # Enrichment and suppression are reported separately.
+        self.assertIn("counts", payload["summary"])
+        self.assertEqual(payload["summary"]["counts"]["newly_matched_addresses"], 1)
+
+    def test_asset_preview_reports_suppression_lost_when_an_asset_stops_matching(self):
+        event_id = self.add_event(1, 1001, "10.0.0.1", "198.51.100.1")
+        self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
+
+        # The active inventory owns 10.0.0.1 as a gateway; the candidate makes
+        # it an endpoint, so the rule stops matching.
+        _, _, payload = self.asset_preview(
+            asset_document(asset("router", "10.0.0.1", role="endpoint"))
+        )
+
+        suppression = payload["summary"]["suppression"]
+        self.assertEqual(suppression["counts"]["no_longer_suppressed"], 1)
+        self.assertEqual(suppression["counts"]["newly_suppressed"], 0)
+        self.assertEqual(suppression["affected_event_ids"], [event_id])
+
+    def test_asset_preview_reports_destination_asset_suppression(self):
+        event_id = self.add_event(1, 1001, "198.51.100.9", "10.0.0.7")
+        self.activate_policy(
+            prefilter_document(asset_scoped_rule(1001, side="destination"))
+        )
+
+        _, _, payload = self.asset_preview(
+            asset_document(asset("router", "10.0.0.1"), asset("target", "10.0.0.7"))
+        )
+
+        suppression = payload["summary"]["suppression"]
+        self.assertEqual(suppression["counts"]["newly_suppressed"], 1)
+        self.assertEqual(suppression["affected_event_ids"], [event_id])
+
+    def test_asset_preview_separates_enrichment_only_changes(self):
+        self.add_event(1, 1001, "10.0.0.1", "198.51.100.1")
+        self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
+
+        # Same role, so the rule still matches; only the hostname changed.
+        _, _, payload = self.asset_preview(
+            asset_document(asset("renamed", "10.0.0.1"))
+        )
+
+        suppression = payload["summary"]["suppression"]
+        self.assertTrue(suppression["complete"])
+        self.assertEqual(suppression["counts"]["newly_suppressed"], 0)
+        self.assertEqual(suppression["counts"]["no_longer_suppressed"], 0)
+        self.assertEqual(suppression["counts"]["unchanged_suppressed"], 1)
+        self.assertEqual(suppression["affected_event_ids"], [])
+        # The enrichment half still reports the change.
+        self.assertEqual(payload["summary"]["counts"]["changed_context_addresses"], 1)
+
+    def test_asset_preview_excludes_non_applicable_sources_from_suppression(self):
+        self.add_event(1, 1001, "10.0.0.5", "198.51.100.1", source="wazuh")
+        self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
+        conn, reads = self.recorded_column_reads()
+        try:
+            sample = config_repository._sample_rows(
+                conn,
+                kind="asset_inventory",
+                window_start="2000-01-01T00:00:00.000000Z",
+                candidate_limit=20,
+                read_alerts=True,
+            )
+        finally:
+            conn.close()
+
+        # The Wazuh row is compared by address, but its body is never read and
+        # the policy is never evaluated against it.
+        self.assertEqual(len(sample.rows), 1)
+        self.assertIsNone(sample.rows[0][1])
+        self.assertNotIn(("triage_events", "raw_alert"), reads)
+
+        _, _, payload = self.asset_preview(
+            asset_document(asset("router", "10.0.0.1"), asset("edge", "10.0.0.5"))
+        )
+        suppression = payload["summary"]["suppression"]
+        self.assertEqual(suppression["evaluated_candidates"], 0)
+        self.assertEqual(suppression["counts"]["newly_suppressed"], 0)
+        self.assertTrue(suppression["complete"])
+        # The address change is still reported by the enrichment half.
+        self.assertEqual(payload["summary"]["counts"]["newly_matched_addresses"], 1)
+
+    def test_asset_preview_without_asset_rules_reads_no_alert_bodies(self):
+        self.add_event(1, 1001, "10.0.0.5", "198.51.100.1", padding=4096)
+        conn, reads = self.recorded_column_reads()
+        try:
+            _, _, payload = self.asset_preview(
+                asset_document(asset("router", "10.0.0.1"), asset("edge", "10.0.0.5"))
+            )
+        finally:
+            conn.close()
+
+        suppression = payload["summary"]["suppression"]
+        # The active policy is scoped by protocol only, so no inventory edit can
+        # move a decision and nothing needs reading to prove it.
+        self.assertEqual(suppression["asset_dependent_rule_count"], 0)
+        self.assertTrue(suppression["complete"])
+        self.assertEqual(suppression["evaluated_candidates"], 0)
+        self.assertNotIn(("triage_events", "raw_alert"), reads)
+
+    def test_asset_preview_marks_a_truncated_suppression_analysis_incomplete(self):
+        for index in range(3):
+            self.add_event(
+                index + 1, 1001, f"10.0.0.{index + 5}", "198.51.100.1", padding=2048
+            )
+        self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
+
+        with patch.object(config_repository, "MAX_PREVIEW_SAMPLE_BYTES", 3_000):
+            draft_id, generation, payload = self.asset_preview(
+                asset_document(asset("router", "10.0.0.1"), asset("edge", "10.0.0.5"))
+            )
+
+        self.assertTrue(payload["truncated"])
+        suppression = payload["summary"]["suppression"]
+        self.assertFalse(suppression["complete"])
+        self.assertIn(
+            "asset preview could not evaluate every asset-dependent "
+            "prefilter rule; activation requires acknowledging it",
+            payload["warnings"],
+        )
+        detail = json.loads(
+            self.db_rows(
+                """SELECT detail_json FROM operator_config_audit
+                   WHERE action = 'draft_previewed' ORDER BY id DESC LIMIT 1"""
+            )[0][0]
+        )
+        self.assertFalse(detail["suppression_complete"])
+        self.assertEqual(detail["asset_dependent_rules"], 1)
+
+        # Fail closed: an incomplete analysis cannot activate unacknowledged.
+        blocked = self.client.post(
+            f"/api/v1/config/asset_inventory/drafts/{draft_id}/activate",
+            headers=self.headers,
+            json={"expected_generation": generation},
+        )
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertIn("complete asset preview", blocked.text)
+        rejection = json.loads(
+            self.db_rows(
+                """SELECT detail_json FROM operator_config_audit
+                   WHERE action = 'revision_activation_rejected'
+                   ORDER BY id DESC LIMIT 1"""
+            )[0][0]
+        )
+        self.assertEqual(rejection["reason"], "incomplete_asset_preview")
+
+        acknowledged = self.client.post(
+            f"/api/v1/config/asset_inventory/drafts/{draft_id}/activate",
+            headers=self.headers,
+            json={
+                "expected_generation": generation,
+                "acknowledge_incomplete_asset_preview": True,
+            },
+        )
+        self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
+
+    def test_a_complete_asset_preview_activates_without_extra_acknowledgement(self):
+        self.add_event(1, 1001, "10.0.0.5", "198.51.100.1")
+        self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
+
+        draft_id, generation, payload = self.asset_preview(
+            asset_document(asset("router", "10.0.0.1"), asset("edge", "10.0.0.5"))
+        )
+        self.assertTrue(payload["summary"]["suppression"]["complete"])
+
+        activated = self.client.post(
+            f"/api/v1/config/asset_inventory/drafts/{draft_id}/activate",
+            headers=self.headers,
+            json={"expected_generation": generation},
+        )
+
+        self.assertEqual(activated.status_code, 200, activated.text)
+
+    def test_activating_an_asset_inventory_without_any_preview_fails_closed(self):
+        self.add_event(1, 1001, "10.0.0.5", "198.51.100.1")
+        self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
+        draft_id, _, summary = self.create_validate(
+            "asset_inventory",
+            asset_document(asset("router", "10.0.0.1"), asset("edge", "10.0.0.5")),
+        )
+
+        blocked = self.client.post(
+            f"/api/v1/config/asset_inventory/drafts/{draft_id}/activate",
+            headers=self.headers,
+            json={"expected_generation": summary["generation"]},
+        )
+
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertIn("complete asset preview", blocked.text)
+        self.assertEqual(self.summary()["generation"], summary["generation"])
 
     def test_preview_includes_migrated_events_without_sensor_context(self):
         migrated = self.add_event(1, 1001, "10.0.0.1", "198.51.100.1", source=None)

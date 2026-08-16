@@ -58,7 +58,6 @@ MAX_PREVIEW_SIGNATURES = 100
 # Row and time bounds alone do not bound memory: one alert may be up to the
 # document limit, so the sample also stops at an aggregate byte budget.
 MAX_PREVIEW_SAMPLE_BYTES = 8 * 1024 * 1024
-MAX_RESUME_HANDLE_SCAN = 50
 
 
 class ConfigRepositoryError(RuntimeError):
@@ -691,22 +690,31 @@ def _handle_for_canonical_revision(
     Resubmitting the already canonical form of a normalized candidate collides
     with the canonical row, whose own lineage may be historical. The submitted
     draft that produced it is the handle that carries the caller's parent, so it
-    is the only safe thing to resume. The scan is bounded to the newest handles
-    raised against that parent.
+    is the only safe thing to resume.
+
+    The pointer is matched by equality rather than by scanning recent history:
+    ordinary activation and rollback churn leaves former active revisions
+    superseded under the same parent, and any newest-N window over those would
+    eventually push the real handle out and refuse a resume that is safe. The
+    extraction is guarded by `json_valid` so a row with unreadable validation
+    metadata is skipped rather than failing the lookup, and the result is still
+    re-verified in Python before it is returned.
     """
-    rows = conn.execute(
+    row = conn.execute(
         """SELECT id, kind, revision, document_json, source,
                   parent_revision_id, shipped_base_revision, state,
                   validation_json, created_at, created_by, note
            FROM operator_config_revisions
            WHERE kind = ? AND parent_revision_id = ? AND state = 'superseded'
-           ORDER BY id DESC LIMIT ?""",
-        (kind, parent_revision_id, MAX_RESUME_HANDLE_SCAN),
-    ).fetchall()
-    for row in rows:
-        if _normalized_revision_id(row) == canonical_id:
-            return row
-    return None
+             AND (CASE WHEN json_valid(validation_json)
+                       THEN json_extract(validation_json, '$.normalized_revision_id')
+                  END) = ?
+           ORDER BY id DESC LIMIT 1""",
+        (kind, parent_revision_id, canonical_id),
+    ).fetchone()
+    if row is None or _normalized_revision_id(row) != canonical_id:
+        return None
+    return row
 
 
 def validate_draft(
@@ -985,6 +993,38 @@ class _PreviewSample:
     truncated: bool
     truncated_by_bytes: bool
     truncated_by_unsized: bool
+    # Rows whose body vanished or changed between the two reads. They are still
+    # compared by address, but no policy result could be derived for them.
+    unreadable_rows: int = 0
+
+
+def _has_complete_asset_preview(
+    conn: sqlite3.Connection,
+    *,
+    handle_revision_id: int | None,
+    expected_generation: int,
+) -> bool:
+    """Report whether this handle has complete asset-preview evidence.
+
+    Only a preview that actually evaluated every asset-dependent rule, at the
+    generation now being activated, counts. Anything else -- no preview, a
+    truncated one, or one taken against an older generation -- is not evidence.
+    """
+    if handle_revision_id is None:
+        return False
+    row = conn.execute(
+        """SELECT detail_json FROM operator_config_audit
+           WHERE action = 'draft_previewed' AND kind = ? AND revision_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (ASSET_KIND, handle_revision_id),
+    ).fetchone()
+    if row is None:
+        return False
+    detail = _decode_object(row[0], "audit detail")
+    return (
+        detail.get("suppression_complete") is True
+        and detail.get("expected_generation") == expected_generation
+    )
 
 
 def _usable_recorded_size(value) -> int | None:
@@ -1001,12 +1041,39 @@ def _usable_recorded_size(value) -> int | None:
     return value
 
 
+def _classifiable_by_prefilter(source_type) -> bool:
+    """Report whether the prefilter policy applies to this retained record.
+
+    Records predating sensor provenance carry no source and are Suricata by
+    construction; anything positively identified as another sensor is never
+    classified by this policy and is excluded from every policy comparison.
+    """
+    return source_type is None or str(source_type) == "suricata"
+
+
+def _asset_dependent_rule_count(policy: PrefilterPolicy) -> int:
+    """Count rules whose match consults asset context.
+
+    Only these can change their verdict because the inventory changed; if a
+    policy has none, an inventory edit cannot move any suppression decision.
+    """
+    return sum(
+        rule.match is not None
+        and (
+            rule.match.source_asset is not None
+            or rule.match.destination_asset is not None
+        )
+        for rule in policy.rules
+    )
+
+
 def _sample_rows(
     conn: sqlite3.Connection,
     *,
     kind: str,
     window_start: str,
     candidate_limit: int,
+    read_alerts: bool | None = None,
 ):
     """Read one bounded preview sample: rows, window, and aggregate bytes.
 
@@ -1034,18 +1101,20 @@ def _sample_rows(
     The sample stops at whichever bound is reached first and reports the
     truncation to the operator rather than silently narrowing the comparison.
     """
+    # A prefilter preview classifies alerts, so it only ever samples records
+    # this policy could classify. An asset preview also compares addresses seen
+    # by other sensors, so it samples every source and excludes non-applicable
+    # rows from the policy half alone.
     source_clause = (
         "AND (sensor.source_type IS NULL OR sensor.source_type = 'suricata')"
         if kind == PREFILTER_KIND
         else ""
     )
-    # An asset preview compares addresses only, so it never reads alert bodies,
-    # never spends the byte budget, and is unaffected by an unrecorded size.
-    reads_alerts = kind == PREFILTER_KIND
+    reads_alerts = kind == PREFILTER_KIND if read_alerts is None else read_alerts
     size_column = "events.raw_alert_bytes" if reads_alerts else "NULL"
     cursor = conn.execute(
         f"""SELECT events.id, {size_column}, events.signature_id,
-                   events.src_ip, events.dest_ip
+                   events.src_ip, events.dest_ip, sensor.source_type
             FROM triage_events AS events
             LEFT JOIN sensor_event_context AS sensor
               ON sensor.triage_event_id = events.id
@@ -1061,12 +1130,15 @@ def _sample_rows(
     truncated_by_rows = False
     truncated_by_bytes = False
     truncated_by_unsized = False
-    for event_id, alert_bytes, signature_id, src_ip, dest_ip in cursor:
+    unreadable_rows = 0
+    for event_id, alert_bytes, signature_id, src_ip, dest_ip, source_type in cursor:
         if len(rows) >= candidate_limit:
             truncated_by_rows = True
             break
         alert = None
-        if reads_alerts:
+        # A body is only worth its budget for a record the policy could
+        # classify; a row from another sensor is compared by address alone.
+        if reads_alerts and _classifiable_by_prefilter(source_type):
             size = _usable_recorded_size(alert_bytes)
             if size is None:
                 # Retained before sizes were recorded, or carrying a size that
@@ -1082,6 +1154,7 @@ def _sample_rows(
             if alert is None:
                 # The row changed or vanished between the two reads; skipping it
                 # keeps the guarantee that nothing oversized is ever decoded.
+                unreadable_rows += 1
                 continue
             # Charge what actually arrived. A recorded size that understates the
             # body is trusted-database corruption, and must not silently buy
@@ -1091,12 +1164,15 @@ def _sample_rows(
                 truncated_by_bytes = True
                 break
             remaining_bytes -= max(size, actual)
-        rows.append((int(event_id), alert, signature_id, src_ip, dest_ip))
+        rows.append(
+            (int(event_id), alert, signature_id, src_ip, dest_ip, source_type)
+        )
     return _PreviewSample(
         rows=rows,
         truncated=truncated_by_rows or truncated_by_bytes or truncated_by_unsized,
         truncated_by_bytes=truncated_by_bytes,
         truncated_by_unsized=truncated_by_unsized,
+        unreadable_rows=unreadable_rows,
     )
 
 
@@ -1208,6 +1284,89 @@ def _asset_value(inventory: AssetInventory, address: str):
     return {key: value for key, value in snapshot.items() if key != "inventory_revision"}
 
 
+def _asset_suppression_preview(
+    active_policy_document,
+    active_document,
+    candidate_document,
+    rows,
+    *,
+    sample_complete: bool,
+):
+    """Report how an inventory edit moves deterministic policy decisions.
+
+    An inventory change is not only an enrichment change: a rule scoped by
+    `source_asset` or `destination_asset` reads exactly the context this
+    document defines, so reassigning an address can start or stop suppressing
+    future alerts for it. The active policy is evaluated twice per eligible
+    record -- once against each inventory -- through the same deterministic
+    evaluator ingest uses, never a second matcher written for previews.
+    """
+    policy = PrefilterPolicy.from_document(active_policy_document)
+    asset_dependent_rules = _asset_dependent_rule_count(policy)
+    active = AssetInventory.from_document(active_document)
+    candidate = AssetInventory.from_document(candidate_document)
+    counts = {
+        "newly_suppressed": 0,
+        "no_longer_suppressed": 0,
+        "unchanged_suppressed": 0,
+        "unchanged_unsuppressed": 0,
+        "skipped_invalid_records": 0,
+    }
+    affected_event_ids: list[int] = []
+    affected_signature_ids: set[int] = set()
+    evaluated = 0
+    unevaluated = 0
+    for row in rows:
+        if not _classifiable_by_prefilter(row[5]):
+            continue
+        if row[1] is None:
+            # Eligible, but its body was not available to evaluate.
+            unevaluated += 1
+            continue
+        try:
+            alert = json.loads(str(row[1]))
+        except json.JSONDecodeError:
+            counts["skipped_invalid_records"] += 1
+            continue
+        if not isinstance(alert, dict):
+            counts["skipped_invalid_records"] += 1
+            continue
+        before = policy.match_reason(alert, active.resolve_alert(alert)) is not None
+        after = policy.match_reason(alert, candidate.resolve_alert(alert)) is not None
+        evaluated += 1
+        if not before and after:
+            bucket = "newly_suppressed"
+        elif before and not after:
+            bucket = "no_longer_suppressed"
+        elif before:
+            bucket = "unchanged_suppressed"
+        else:
+            bucket = "unchanged_unsuppressed"
+        counts[bucket] += 1
+        if before != after:
+            if len(affected_event_ids) < MAX_PREVIEW_EXAMPLES:
+                affected_event_ids.append(int(row[0]))
+            if (
+                isinstance(row[2], int)
+                and len(affected_signature_ids) < MAX_PREVIEW_SIGNATURES
+            ):
+                affected_signature_ids.add(int(row[2]))
+    # A policy with no asset-scoped rule cannot move a decision, so that
+    # analysis is complete without examining anything.
+    complete = asset_dependent_rules == 0 or (
+        sample_complete and unevaluated == 0
+    )
+    return {
+        "asset_dependent_rule_count": asset_dependent_rules,
+        "complete": complete,
+        "evaluated_candidates": evaluated,
+        "unevaluated_candidates": unevaluated,
+        "counts": counts,
+        "affected_event_ids": affected_event_ids,
+        "affected_signature_ids": sorted(affected_signature_ids),
+    }
+
+
 def _asset_preview(active_document, candidate_document, rows):
     active = AssetInventory.from_document(active_document)
     candidate = AssetInventory.from_document(candidate_document)
@@ -1312,11 +1471,23 @@ def preview_draft(
             )
     now = utc_now()
     window_start = format_utc_timestamp(now - timedelta(hours=hours))
+    if kind == PREFILTER_KIND:
+        active_policy_document = active_document
+    else:
+        _, active_policy_document = _active_document(conn, PREFILTER_KIND, state)
+    # Reading bodies for an asset preview is only worth its budget when the
+    # active policy actually consults asset context.
+    asset_dependent_rules = _asset_dependent_rule_count(
+        PrefilterPolicy.from_document(active_policy_document)
+    )
     sample = _sample_rows(
         conn,
         kind=kind,
         window_start=window_start,
         candidate_limit=candidate_limit,
+        read_alerts=(
+            True if kind == PREFILTER_KIND else asset_dependent_rules > 0
+        ),
     )
     sampled = sample.rows
     truncated = sample.truncated
@@ -1334,6 +1505,20 @@ def preview_draft(
             candidate_document,
             sampled,
         )
+        # An inventory edit also moves deterministic suppression decisions, so
+        # the same sample is evaluated against the active policy twice.
+        summary["suppression"] = _asset_suppression_preview(
+            active_policy_document,
+            active_document,
+            candidate_document,
+            sampled,
+            sample_complete=not sample.truncated and sample.unreadable_rows == 0,
+        )
+        if not summary["suppression"]["complete"]:
+            warnings.append(
+                "asset preview could not evaluate every asset-dependent "
+                "prefilter rule; activation requires acknowledging it"
+            )
     if sample.truncated_by_bytes:
         warnings.append("preview sample reached its byte budget before its row limit")
     if sample.truncated_by_unsized:
@@ -1369,6 +1554,13 @@ def preview_draft(
                 "truncated": truncated,
                 "truncated_by_bytes": sample.truncated_by_bytes,
                 "truncated_by_unsized": sample.truncated_by_unsized,
+                "unreadable_rows": sample.unreadable_rows,
+                # Activation reads this back: an asset preview that could not
+                # evaluate every asset-dependent rule is not complete evidence.
+                "suppression_complete": bool(
+                    summary.get("suppression", {}).get("complete", True)
+                ),
+                "asset_dependent_rules": asset_dependent_rules,
                 "warning_count": len(warnings),
             },
         )
@@ -1401,6 +1593,7 @@ def activate_draft(
     actor: str,
     auth_via: str,
     request_id: str | None,
+    acknowledge_incomplete_asset_preview: bool = False,
     occurred_at: str | None = None,
 ) -> dict[str, Any]:
     """Atomically activate one validated draft and cut over legacy authority."""
@@ -1454,6 +1647,8 @@ def activate_draft(
             expected_generation=expected_generation,
             acknowledge_broad_rules=acknowledge_broad_rules,
             acknowledge_shipped_base_change=acknowledge_shipped_base_change,
+            acknowledge_incomplete_asset_preview=acknowledge_incomplete_asset_preview,
+            preview_handle_revision_id=draft_id,
             actor=actor,
             auth_via=auth_via,
             request_id=request_id,
@@ -1475,6 +1670,8 @@ def _activate_revision_locked(
     expected_generation: int,
     acknowledge_broad_rules: bool,
     acknowledge_shipped_base_change: bool,
+    acknowledge_incomplete_asset_preview: bool,
+    preview_handle_revision_id: int | None,
     actor: str,
     auth_via: str,
     request_id: str | None,
@@ -1485,6 +1682,30 @@ def _activate_revision_locked(
     active = _revision_row(conn, active_id)
     _validate_active_row(active, kind)
     broad_rule_count = 0
+    asset_dependent_rules = 0
+    if kind == ASSET_KIND:
+        # Asset-scoped rules read exactly this document, so changing it moves
+        # suppression as well as enrichment. Activating without a preview that
+        # actually evaluated those rules is allowed only when the operator says
+        # so explicitly: an unacknowledged incomplete analysis fails closed
+        # rather than presenting an enrichment-only summary as the whole story.
+        _, active_policy_document = _active_document(conn, PREFILTER_KIND, state)
+        asset_dependent_rules = _asset_dependent_rule_count(
+            PrefilterPolicy.from_document(active_policy_document)
+        )
+        if asset_dependent_rules and not acknowledge_incomplete_asset_preview:
+            if not _has_complete_asset_preview(
+                conn,
+                handle_revision_id=preview_handle_revision_id,
+                expected_generation=expected_generation,
+            ):
+                raise _conflict(
+                    "activation requires a complete asset preview or its "
+                    "acknowledgement while asset-scoped rules are active",
+                    reason="incomplete_asset_preview",
+                    expected_generation=expected_generation,
+                    asset_dependent_rules=asset_dependent_rules,
+                )
     if kind == PREFILTER_KIND:
         policy = PrefilterPolicy.from_document(document)
         broad_rule_count = sum(rule.match is None for rule in policy.rules)
@@ -1611,6 +1832,7 @@ def rollback_revision(
     actor: str,
     auth_via: str,
     request_id: str | None,
+    acknowledge_incomplete_asset_preview: bool = False,
     occurred_at: str | None = None,
 ) -> dict[str, Any]:
     """Reactivate one superseded revision through the guarded activation path."""
@@ -1679,6 +1901,10 @@ def rollback_revision(
             expected_generation=expected_generation,
             acknowledge_broad_rules=acknowledge_broad_rules,
             acknowledge_shipped_base_change=acknowledge_shipped_base_change,
+            acknowledge_incomplete_asset_preview=acknowledge_incomplete_asset_preview,
+            # A rollback has no candidate preview of its own, so it always
+            # needs the explicit acknowledgement while asset rules are active.
+            preview_handle_revision_id=None,
             actor=actor,
             auth_via=auth_via,
             request_id=request_id,

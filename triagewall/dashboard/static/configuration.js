@@ -311,7 +311,18 @@
     element("configPreviewDraft").disabled = !writesEnabled || !ownsKind || !lifecycle.validatedId;
     const hasPreview = ownsKind && lifecycle.preview;
     element("configActivationGuard").classList.toggle("hidden", !hasPreview);
-    element("configActivateDraft").disabled = !hasPreview || !element("configConfirmActivate").checked;
+    // An asset preview that could not evaluate every asset-scoped prefilter
+    // rule is incomplete evidence, so activation needs that stated explicitly.
+    const incompleteAssetPreview = Boolean(
+      hasPreview && lifecycle.preview.summary?.suppression?.complete === false
+    );
+    element("configAcknowledgeAssetPreview").classList.toggle(
+      "hidden",
+      !incompleteAssetPreview,
+    );
+    element("configActivateDraft").disabled = !hasPreview
+      || !element("configConfirmActivate").checked
+      || (incompleteAssetPreview && !element("configConfirmAssetPreview").checked);
     if (!hasPreview) {
       element("configPreviewResult").classList.add("hidden");
       element("configPreviewResult").textContent = "";
@@ -377,6 +388,7 @@
     element("configConfirmActivate").checked = false;
     element("configAcknowledgeBroad").checked = false;
     element("configAcknowledgeBase").checked = false;
+    element("configConfirmAssetPreview").checked = false;
     setMessage(message);
   }
 
@@ -593,12 +605,38 @@
     }
   }
 
+  function lifecycleIdentity() {
+    // Everything that decides which change an impact analysis describes. A
+    // response may only be published while all of it still holds.
+    return {
+      epoch: stateEpoch,
+      kind: lifecycle.kind,
+      selectedKind,
+      draftId: lifecycle.draftId,
+      validatedId: lifecycle.validatedId,
+      generation: summary?.generation ?? null,
+      parentRevisionId: summary?.active?.[selectedKind]?.id ?? null,
+    };
+  }
+
+  function ownsCurrentLifecycle(identity) {
+    const current = lifecycleIdentity();
+    return Object.keys(identity).every((key) => identity[key] === current[key]);
+  }
+
   async function previewDraft() {
+    // An impact analysis is only meaningful for the exact draft, revision,
+    // generation, and parent it was requested for. A slow response must never
+    // be attached to whatever the editor happens to be holding when it lands:
+    // that is what would let one draft be activated while another draft's
+    // impact is on screen.
+    const identity = lifecycleIdentity();
     try {
-      const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.draftId}/preview`, {
+      const payload = await configRequest(`/api/v1/config/${identity.selectedKind}/drafts/${identity.draftId}/preview`, {
         method: "POST",
-        body: JSON.stringify({ expected_generation: summary.generation }),
+        body: JSON.stringify({ expected_generation: identity.generation }),
       });
+      if (!ownsCurrentLifecycle(identity)) return;
       lifecycle.preview = payload;
       const host = element("configPreviewResult");
       host.classList.remove("hidden");
@@ -612,12 +650,28 @@
       setMessage("Preview complete. Activation affects only future records.");
       renderLifecycle();
     } catch (error) {
+      // A failure belongs to the lifecycle that asked for it, so a superseded
+      // one reports nothing over newer work.
+      if (!ownsCurrentLifecycle(identity)) return;
       setMessage(error.status === 409 ? `${error.message} Reload active configuration before retrying.` : error.message, true);
     }
   }
 
   async function activateDraft() {
     if (!element("configConfirmActivate").checked || !lifecycle.preview) return;
+    // The disabled control is the visible guard; this is the real one. An
+    // incomplete asset analysis is never activated on the general confirmation
+    // alone, whatever state the button is in.
+    if (
+      lifecycle.preview.summary?.suppression?.complete === false
+      && !element("configConfirmAssetPreview").checked
+    ) {
+      setMessage(
+        "This preview could not evaluate every asset-scoped prefilter rule. Acknowledge that before activating.",
+        true,
+      );
+      return;
+    }
     try {
       const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.draftId}/activate`, {
         method: "POST",
@@ -625,6 +679,7 @@
           expected_generation: summary.generation,
           acknowledge_broad_rules: element("configAcknowledgeBroad").checked,
           acknowledge_shipped_base_change: element("configAcknowledgeBase").checked,
+          acknowledge_incomplete_asset_preview: element("configConfirmAssetPreview").checked,
         }),
       });
       await load(true);
@@ -1042,6 +1097,7 @@
     element("configPreviewDraft").addEventListener("click", previewDraft);
     element("configActivateDraft").addEventListener("click", activateDraft);
     element("configConfirmActivate").addEventListener("change", renderLifecycle);
+    element("configConfirmAssetPreview").addEventListener("change", renderLifecycle);
     element("configConfirmRollback").addEventListener("click", () => {
       if (pendingRollbackId != null) return rollbackRevision(pendingRollbackId);
     });

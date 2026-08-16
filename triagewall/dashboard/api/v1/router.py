@@ -600,6 +600,9 @@ def create_v1_router(
                     acknowledge_shipped_base_change=(
                         body.acknowledge_shipped_base_change
                     ),
+                    acknowledge_incomplete_asset_preview=(
+                        body.acknowledge_incomplete_asset_preview
+                    ),
                     actor=auth_ctx.principal,
                     auth_via=auth_ctx.via,
                     request_id=request_id(request),
@@ -635,6 +638,9 @@ def create_v1_router(
                     acknowledge_broad_rules=body.acknowledge_broad_rules,
                     acknowledge_shipped_base_change=(
                         body.acknowledge_shipped_base_change
+                    ),
+                    acknowledge_incomplete_asset_preview=(
+                        body.acknowledge_incomplete_asset_preview
                     ),
                     actor=auth_ctx.principal,
                     auth_via=auth_ctx.via,

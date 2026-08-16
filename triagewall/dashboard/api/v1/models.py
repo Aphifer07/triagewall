@@ -474,6 +474,9 @@ class ConfigActivationRequest(BaseModel):
     expected_generation: int = Field(gt=0, strict=True)
     acknowledge_broad_rules: bool = False
     acknowledge_shipped_base_change: bool = False
+    # Required only for an asset inventory while asset-scoped prefilter rules
+    # are active and no complete preview evaluated them.
+    acknowledge_incomplete_asset_preview: bool = False
 
 
 class ConfigActivationResponse(BaseModel):

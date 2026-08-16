@@ -295,7 +295,9 @@ the very parent named in the request, creation returns that revision with
 `"resumed": true` and `200` instead of `201`, which lets an operator who lost
 editor state resume it. That covers a `draft`, a `validated` revision, and a
 draft that validation normalized; resubmitting the canonical form of a
-normalized candidate returns the same submitted handle. `validated_revision_id`
+normalized candidate returns the same submitted handle, found by exact pointer
+match rather than by scanning recent history, so ordinary activation and
+rollback churn against the same parent cannot bury it. `validated_revision_id`
 names the validated result when there already is one, so a resumed candidate
 continues at preview. Any other existing state, and any candidate raised against
 a different parent, stay a `409`.
@@ -325,13 +327,24 @@ rather than reading an unmeasured body.
 Events retained before sensor context existed are included; only records
 positively identified as another sensor are excluded from a prefilter preview.
 Prefilter previews report suppression deltas, bounded event/signature examples,
-unmatched rules, and unscoped-rule warnings. Asset previews compare addresses
-only, never reading retained alert bodies, and report exact-IP match and context
-changes with bounded examples.
+unmatched rules, and unscoped-rule warnings. Asset previews report exact-IP
+match and context changes with bounded examples in `summary.counts`, and report
+suppression separately in `summary.suppression`: an inventory edit also moves
+deterministic verdicts when the active policy scopes rules by `source_asset` or
+`destination_asset`, so the active policy is evaluated against both inventories
+for each eligible Suricata record in the same bounded sample. A policy with no
+asset-scoped rule cannot move a decision, so that analysis is complete without
+reading any alert body. `summary.suppression.complete` is false when truncation
+or an unreadable record left an asset-scoped rule unevaluated.
 
 `POST /api/v1/config/{kind}/drafts/{id}/activate` requires the current
 `expected_generation`. Prefilter candidates containing signature-only rules
-also require `acknowledge_broad_rules=true`. Activation revalidates stored
+also require `acknowledge_broad_rules=true`. While asset-scoped prefilter rules
+are active, an asset inventory activates only on evidence of a preview that
+actually evaluated them at this generation, or on an explicit
+`acknowledge_incomplete_asset_preview=true`; a rollback has no preview of its
+own and always requires that acknowledgement. An enrichment-only summary is
+never presented as the whole change. Activation revalidates stored
 content under `BEGIN IMMEDIATE`, checks the draft parent is still active, moves
 the old and new revision states, updates both previous-bundle pointers, and
 increments generation in one transaction. While the deployment remains in
