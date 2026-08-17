@@ -360,13 +360,50 @@
     element("configRollbackDocument").textContent = target
       ? JSON.stringify(target.document, null, 2)
       : "";
-    // Nothing may be confirmed until the exact target document is on screen.
-    element("configConfirmRollback").disabled = target == null;
+    // A rollback carries no impact preview at all, so an inventory rollback
+    // cannot show what it does to asset-scoped prefilter decisions. The backend
+    // refuses one without that acknowledgement whenever such rules are active;
+    // asking for it on every inventory rollback keeps the operator's answer
+    // conservative and needs no extra endpoint to discover the policy shape.
+    const needsAssetAcknowledgement = selectedKind === "asset_inventory";
+    element("configRollbackAssetGuard").classList.toggle(
+      "hidden",
+      !needsAssetAcknowledgement || pendingRollbackId == null,
+    );
+    // Nothing may be confirmed until the exact target document is on screen and
+    // every acknowledgement this target actually needs is checked.
+    element("configConfirmRollback").disabled = target == null
+      || !rollbackAcknowledgementsSatisfied(target);
+  }
+
+  function rollbackTargetHasBroadRules(target) {
+    const rules = target?.document?.auto_false_positive;
+    return Array.isArray(rules) && rules.some((rule) => rule?.match == null);
+  }
+
+  function rollbackAcknowledgementsSatisfied(target) {
+    if (target == null) return false;
+    if (
+      selectedKind === "asset_inventory"
+      && !element("configConfirmRollbackAssetPreview").checked
+    ) return false;
+    // Unscoped rules are visible in the exact document already on screen, so
+    // the same acknowledgement activation requires is required here too.
+    if (
+      rollbackTargetHasBroadRules(target)
+      && !element("configRollbackAcknowledgeBroad").checked
+    ) return false;
+    return true;
   }
 
   function clearRollbackSelection() {
     pendingRollbackId = null;
     rollbackTarget = null;
+    // Rollback acknowledgements are this selection's own state and never carry
+    // over to another target, another kind, or the activation guard.
+    element("configRollbackAcknowledgeBroad").checked = false;
+    element("configRollbackAcknowledgeBase").checked = false;
+    element("configConfirmRollbackAssetPreview").checked = false;
   }
 
   function renderEditor() {
@@ -584,8 +621,18 @@
   }
 
   async function validateDraft() {
+    // Validation spans two requests and ends by replacing the working document,
+    // so it needs the same ownership proof a preview does. Without it, a
+    // response that lands after the operator edited, switched kinds, reloaded,
+    // or started a newer draft would overwrite that newer work with the old
+    // draft's canonical content -- and could fetch it through the wrong kind.
+    const identity = lifecycleIdentity();
     try {
-      const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.draftId}/validate`, { method: "POST" });
+      const payload = await configRequest(
+        `/api/v1/config/${identity.selectedKind}/drafts/${identity.draftId}/validate`,
+        { method: "POST" },
+      );
+      if (!ownsCurrentLifecycle(identity)) return;
       // Validation status is the verdict. Canonical content can normalize onto
       // an existing immutable revision whose own state is historical; that is a
       // valid candidate, and the submitted draft still carries its lineage.
@@ -595,12 +642,22 @@
         renderLifecycle();
         return;
       }
+      // The canonical document is read through the kind this validation was
+      // started for, never through whichever kind is selected when it returns.
+      const canonical = await configRequest(
+        `/api/v1/config/${identity.selectedKind}/revisions/${payload.revision.id}`,
+      );
+      // Ownership is re-proved after the second await, and only then are the
+      // validated id and the canonical document published together.
+      if (!ownsCurrentLifecycle(identity)) return;
       lifecycle.validatedId = payload.revision.id;
-      const canonical = await configRequest(`/api/v1/config/${selectedKind}/revisions/${payload.revision.id}`);
-      workingDocuments[selectedKind] = canonical.document;
+      workingDocuments[identity.selectedKind] = canonical.document;
       setMessage(`Validated revision #${payload.revision.id}. Review its bounded impact next.`);
       renderEditor();
     } catch (error) {
+      // A failure belongs to the lifecycle that asked for it, so a superseded
+      // one reports nothing over newer work.
+      if (!ownsCurrentLifecycle(identity)) return;
       setMessage(error.message, true);
     }
   }
@@ -696,6 +753,15 @@
       setMessage(`Load revision #${revisionId} before confirming rollback.`, true);
       return;
     }
+    // The disabled control is the visible guard; this is the real one. A forced
+    // click without the acknowledgements this target needs sends nothing.
+    if (!rollbackAcknowledgementsSatisfied(rollbackTarget)) {
+      setMessage(
+        `Acknowledge the rollback conditions for revision #${revisionId} before confirming.`,
+        true,
+      );
+      return;
+    }
     try {
       const payload = await configRequest(`/api/v1/config/${selectedKind}/revisions/${revisionId}/rollback`, {
         method: "POST",
@@ -703,6 +769,7 @@
           expected_generation: summary.generation,
           acknowledge_broad_rules: element("configRollbackAcknowledgeBroad").checked,
           acknowledge_shipped_base_change: element("configRollbackAcknowledgeBase").checked,
+          acknowledge_incomplete_asset_preview: element("configConfirmRollbackAssetPreview").checked,
         }),
       });
       await load(true);
@@ -714,10 +781,10 @@
 
   async function selectRollbackRevision(revisionId) {
     const epoch = stateEpoch;
+    // Clear first, then claim this selection: a previous target's
+    // acknowledgements never carry over to a new one.
+    clearRollbackSelection();
     pendingRollbackId = revisionId;
-    rollbackTarget = null;
-    element("configRollbackAcknowledgeBroad").checked = false;
-    element("configRollbackAcknowledgeBase").checked = false;
     renderHistory();
     setMessage(`Loading revision #${revisionId} for review…`);
     try {
@@ -1102,6 +1169,13 @@
       if (pendingRollbackId != null) return rollbackRevision(pendingRollbackId);
     });
     element("configCancelRollback").addEventListener("click", cancelRollback);
+    [
+      "configRollbackAcknowledgeBroad",
+      "configRollbackAcknowledgeBase",
+      "configConfirmRollbackAssetPreview",
+    ].forEach((id) => {
+      element(id).addEventListener("change", renderHistory);
+    });
   }
 
   global.TriagewallConfigEditor = {

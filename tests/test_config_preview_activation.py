@@ -498,6 +498,101 @@ class ConfigPreviewActivationTests(unittest.TestCase):
         )
         self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
 
+    def activate_inventory(self, document, *, acknowledge=True):
+        """Activate one asset inventory and return the activated revision id."""
+        draft_id, _, summary = self.create_validate("asset_inventory", document)
+        body = {"expected_generation": summary["generation"]}
+        if acknowledge:
+            body["acknowledge_incomplete_asset_preview"] = True
+        activated = self.client.post(
+            f"/api/v1/config/asset_inventory/drafts/{draft_id}/activate",
+            headers=self.headers,
+            json=body,
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        return activated.json()["revision"]["id"]
+
+    def test_asset_rollback_requires_the_incomplete_preview_acknowledgement(self):
+        self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
+        inventory_a = self.activate_inventory(
+            asset_document(asset("router", "10.0.0.1"), asset("a", "10.0.0.5"))
+        )
+        self.activate_inventory(
+            asset_document(asset("router", "10.0.0.1"), asset("b", "10.0.0.6"))
+        )
+        generation = self.summary()["generation"]
+        self.assertNotEqual(
+            self.summary()["active"]["asset_inventory"]["id"], inventory_a
+        )
+
+        # The body the editor used to send: no suppression preview exists for a
+        # rollback, so this must fail closed.
+        blocked = self.client.post(
+            f"/api/v1/config/asset_inventory/revisions/{inventory_a}/rollback",
+            headers=self.headers,
+            json={
+                "expected_generation": generation,
+                "acknowledge_broad_rules": True,
+                "acknowledge_shipped_base_change": True,
+            },
+        )
+
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertIn("complete asset preview", blocked.text)
+        self.assertEqual(self.summary()["generation"], generation)
+        self.assertNotEqual(
+            self.summary()["active"]["asset_inventory"]["id"], inventory_a
+        )
+        rejection = json.loads(
+            self.db_rows(
+                """SELECT detail_json FROM operator_config_audit
+                   WHERE action = 'revision_rollback_rejected'
+                   ORDER BY id DESC LIMIT 1"""
+            )[0][0]
+        )
+        self.assertEqual(rejection["reason"], "incomplete_asset_preview")
+
+        acknowledged = self.client.post(
+            f"/api/v1/config/asset_inventory/revisions/{inventory_a}/rollback",
+            headers=self.headers,
+            json={
+                "expected_generation": generation,
+                "acknowledge_broad_rules": True,
+                "acknowledge_shipped_base_change": True,
+                "acknowledge_incomplete_asset_preview": True,
+            },
+        )
+
+        self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
+        self.assertEqual(acknowledged.json()["generation"], generation + 1)
+        self.assertEqual(
+            self.summary()["active"]["asset_inventory"]["id"], inventory_a
+        )
+
+    def test_asset_rollback_without_asset_scoped_rules_is_unchanged(self):
+        # The bootstrapped policy is scoped by protocol only.
+        inventory_a = self.activate_inventory(
+            asset_document(asset("router", "10.0.0.1"), asset("a", "10.0.0.5")),
+            acknowledge=False,
+        )
+        self.activate_inventory(
+            asset_document(asset("router", "10.0.0.1"), asset("b", "10.0.0.6")),
+            acknowledge=False,
+        )
+        generation = self.summary()["generation"]
+
+        rolled_back = self.client.post(
+            f"/api/v1/config/asset_inventory/revisions/{inventory_a}/rollback",
+            headers=self.headers,
+            json={"expected_generation": generation},
+        )
+
+        self.assertEqual(rolled_back.status_code, 200, rolled_back.text)
+        self.assertEqual(rolled_back.json()["generation"], generation + 1)
+        self.assertEqual(
+            self.summary()["active"]["asset_inventory"]["id"], inventory_a
+        )
+
     def test_a_complete_asset_preview_activates_without_extra_acknowledgement(self):
         self.add_event(1, 1001, "10.0.0.5", "198.51.100.1")
         self.activate_policy(prefilter_document(asset_scoped_rule(1001)))
