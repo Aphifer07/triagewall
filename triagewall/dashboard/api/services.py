@@ -162,16 +162,21 @@ def build_verdict_filters(
         if include_private_search:
             # Snapshot JSON is immutable and validated when written, but
             # json_valid keeps a damaged historical row from aborting the
-            # whole queue. Resolve matching snapshot ids in a subquery so
-            # repeated event references do not re-parse the same JSON.
-            hostname_ids = """SELECT id FROM asset_snapshots
-                WHERE CASE WHEN json_valid(asset_json)
-                               THEN json_extract(asset_json, '$.hostname')
-                           END LIKE ?"""
+            # whole queue. Evaluate the snapshots already referenced by each
+            # candidate event; independent snapshot subqueries would scan the
+            # complete retained snapshot history for an absent term.
             clauses.extend(
                 (
-                    f"events.src_asset_snapshot_id IN ({hostname_ids})",
-                    f"events.dest_asset_snapshot_id IN ({hostname_ids})",
+                    """CASE WHEN json_valid(src_snapshot.asset_json)
+                            THEN json_extract(
+                                src_snapshot.asset_json, '$.hostname'
+                            )
+                       END LIKE ?""",
+                    """CASE WHEN json_valid(dest_snapshot.asset_json)
+                            THEN json_extract(
+                                dest_snapshot.asset_json, '$.hostname'
+                            )
+                       END LIKE ?""",
                 )
             )
             hostname_pattern = f"%{term}%"
@@ -420,6 +425,10 @@ _NEIGHBOR_SELECT = f"""
 SELECT events.id, events.signature, events.verdict, events.processed_at,
        {_SOURCE_TYPE_EXPR} AS source_type
 FROM triage_events AS events
+LEFT JOIN asset_snapshots AS src_snapshot
+  ON src_snapshot.id = events.src_asset_snapshot_id
+LEFT JOIN asset_snapshots AS dest_snapshot
+  ON dest_snapshot.id = events.dest_asset_snapshot_id
 LEFT JOIN sensor_event_context AS sensor
   ON sensor.triage_event_id = events.id
 """

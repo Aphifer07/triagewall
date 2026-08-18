@@ -442,8 +442,23 @@ class ApiV1Tests(unittest.TestCase):
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute(
-                "UPDATE triage_events SET signature = ? WHERE id = 3",
-                ("only-old-row-matches",),
+                """
+                INSERT INTO asset_snapshots (
+                    id, snapshot_hash, asset_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    1,
+                    "only-old-asset-matches",
+                    '{"hostname":"only-old-asset-matches"}',
+                    format_utc_timestamp(datetime.now(timezone.utc)),
+                ),
+            )
+            conn.execute(
+                """UPDATE triage_events
+                   SET signature = ?, src_asset_snapshot_id = ?
+                   WHERE id = 3""",
+                ("only-old-row-matches", 1),
             )
             conn.commit()
         finally:
@@ -471,6 +486,20 @@ class ApiV1Tests(unittest.TestCase):
                 "truncated": True,
             },
         )
+
+        with patch.object(
+            services,
+            "MAX_QUEUE_SEARCH_CANDIDATE_ROWS",
+            2,
+            create=True,
+        ):
+            old_asset = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": "only-old-asset-matches"},
+                headers=self.host,
+            )
+        self.assertEqual(old_asset.status_code, 200)
+        self.assertEqual(old_asset.json()["verdicts"], [])
 
         with patch.object(
             services,
@@ -2103,6 +2132,27 @@ class InvestigationScaleTests(unittest.TestCase):
         self.assertFalse(
             any(step.startswith("SCAN events") for step in steps),
             f"search must not scan the retained event table: {steps}",
+        )
+
+    def test_queue_search_does_not_scan_complete_asset_snapshot_history(self):
+        where, params = services.build_verdict_filters(
+            None,
+            "definitely-not-present",
+            None,
+            include_private_search=True,
+        )
+        services._apply_queue_search_bound(where, params)
+        steps = self.plan_for(
+            f"""{services._VERDICT_SELECT}
+                WHERE {" AND ".join(where)}
+                ORDER BY events.processed_at DESC NULLS LAST, events.id DESC
+                LIMIT ?""",
+            params + [101],
+        )
+
+        self.assertFalse(
+            any(step.startswith("SCAN asset_snapshots") for step in steps),
+            f"hostname search must inspect only candidate snapshots: {steps}",
         )
 
     def test_zero_match_queue_search_finishes_inside_the_hard_budget(self):
