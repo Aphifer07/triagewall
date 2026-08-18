@@ -79,6 +79,8 @@ function runDashboard({
   pathname,
   search = "",
   verdicts = [],
+  searchScope = null,
+  searchWindow = "search-window-token",
   defer = () => false,
   fail = () => false,
 }) {
@@ -86,6 +88,7 @@ function runDashboard({
   const documentListeners = new Map();
   const intervals = [];
   const pushedUrls = [];
+  const pushedStates = [];
   const replacedUrls = [];
   const deferred = [];
   const windowListeners = new Map();
@@ -205,8 +208,17 @@ function runDashboard({
     const investigation = target.match(/\/api\/v1\/verdicts\/(\d+)\/investigation/);
     if (investigation) {
       const id = Number(investigation[1]);
+      const params = new URL(target, "http://localhost").searchParams;
+      const responseSearchWindow = params.has("signature")
+        ? (params.get("search_window") ?? (
+            typeof searchWindow === "function"
+              ? searchWindow(params, { eventId: id })
+              : searchWindow
+          ))
+        : null;
       return {
         window_hours: 24,
+        search_window: responseSearchWindow,
         recurrence: {
           available: true,
           signature_id: id,
@@ -274,6 +286,9 @@ function runDashboard({
       const params = new URLSearchParams(list[1]);
       const tag = params.get("model") || "any";
       const cursor = params.get("cursor");
+      const responseSearchWindow = typeof searchWindow === "function"
+        ? searchWindow(params)
+        : searchWindow;
       // Cursors carry their page depth so several Load Older pages can be
       // walked. Rows are tagged with the filter that asked for them, so a
       // response can be traced back to the request that produced it.
@@ -297,6 +312,8 @@ function runDashboard({
           saved.has(row.id) ? { ...row, ...saved.get(row.id) } : row,
         ),
         next_cursor: `cursor-${tag}-${page + 1}`,
+        search_scope: params.has("signature") ? searchScope : null,
+        search_window: params.has("signature") ? responseSearchWindow : null,
       };
     }
     return { mode: "local", verdicts: listRows, next_cursor: null };
@@ -355,13 +372,17 @@ function runDashboard({
     window: {
       location,
       history: {
-        pushState(_state, _title, url) {
+        state: null,
+        pushState(state, _title, url) {
           pushedUrls.push(url);
+          pushedStates.push(state);
+          this.state = state;
           navigate(url);
         },
-        replaceState(_state, _title, url) {
+        replaceState(state, _title, url) {
           if (!url) return;
           replacedUrls.push(url);
+          this.state = state;
           navigate(url);
         },
       },
@@ -407,6 +428,10 @@ function runDashboard({
     currentFilter: { ...currentFilter },
     currentVerdicts: currentVerdicts.map((row) => ({ ...row })),
     nextCursor,
+    queueSearchScope,
+    queueSearchWindow,
+    detailSearchWindow,
+    historySearchWindow: window.history.state?.searchWindow ?? null,
     browsingHistory,
     focusedIndex,
   }),
@@ -422,6 +447,7 @@ function runDashboard({
     document,
     fetchCalls,
     pushedUrls,
+    pushedStates,
     replacedUrls,
     location,
     api: sandbox.__probe,
@@ -468,9 +494,10 @@ function runDashboard({
     },
     // Simulates the browser restoring a history entry: move the URL, then
     // deliver popstate, exactly as a back/forward press would.
-    goBackTo(url) {
+    goBackTo(url, state = null) {
       navigate(url);
-      (windowListeners.get("popstate") ?? []).forEach((handler) => handler({}));
+      sandbox.window.history.state = state;
+      (windowListeners.get("popstate") ?? []).forEach((handler) => handler({ state }));
     },
     dispatchKey: (key, target = { tagName: "DIV" }) =>
       (documentListeners.get("keydown") ?? []).forEach((handler) =>
@@ -1288,6 +1315,185 @@ test("a restored detail entry investigates with that entry's filters", async () 
   assert.match(String(harness.pushedUrls.at(-1)), /model=prefilter/);
 });
 
+test("searched detail navigation keeps the queue search window", async () => {
+  const searchWindow = "opaque-window-from-queue";
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=scan",
+    searchWindow,
+  });
+  await harness.settle();
+
+  await harness.api.open(100);
+  await harness.settle();
+  let investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts/100/investigation"))
+    .at(-1);
+  assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("search_window"), searchWindow);
+  assert.equal(harness.pushedStates.at(-1).searchWindow, searchWindow);
+
+  harness.document.getElementById("nextAlertButton").dispatch("click", {});
+  await harness.settle();
+  investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/investigation"))
+    .at(-1);
+  assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("search_window"), searchWindow);
+  assert.equal(harness.pushedStates.at(-1).searchWindow, searchWindow);
+
+  harness.goBackTo("/triage/100?model=llm&signature=scan", { searchWindow });
+  await harness.settle();
+  investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts/100/investigation"))
+    .at(-1);
+  assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("search_window"), searchWindow);
+
+  harness.goBackTo("/triage/100?signature=scan", { searchWindow });
+  await harness.settle();
+  investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts/100/investigation"))
+    .at(-1);
+  assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("search_window"), searchWindow);
+});
+
+test("a direct searched detail persists its captured window for navigation", async () => {
+  const searchWindow = "window-captured-by-investigation";
+  const harness = runDashboard({
+    pathname: "/triage/100",
+    search: "?model=llm&signature=scan",
+    searchWindow,
+  });
+  await harness.settle();
+
+  let state = harness.api.state();
+  assert.equal(state.detailSearchWindow, searchWindow);
+  assert.equal(state.historySearchWindow, searchWindow);
+
+  harness.document.getElementById("nextAlertButton").dispatch("click", {});
+  await harness.settle();
+  const investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/investigation"))
+    .at(-1);
+  assert.equal(
+    new URL(`http://localhost${investigation}`).searchParams.get("search_window"),
+    searchWindow,
+  );
+  state = harness.api.state();
+  assert.equal(state.detailSearchWindow, searchWindow);
+});
+
+test("a superseded investigation cannot publish its captured window", async () => {
+  const harness = runDashboard({
+    pathname: "/triage/5",
+    search: "?model=llm&signature=scan",
+    searchWindow: (_params, { eventId }) => `window-${eventId}`,
+    defer: (url) => url.includes("/api/v1/verdicts/5/investigation"),
+  });
+  await harness.settle();
+
+  await harness.api.open(6);
+  await harness.settle();
+  assert.equal(harness.api.state().detailSearchWindow, "window-6");
+
+  harness.releaseDeferred();
+  await harness.settle();
+  assert.equal(harness.api.state().detailSearchWindow, "window-6");
+  assert.equal(harness.api.state().historySearchWindow, "window-6");
+});
+
+test("a superseded search response cannot replace the current search window", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=old",
+    searchWindow: (params) => `window-${params.get("signature")}`,
+    defer: (url) => /[?&]signature=old(?:&|$)/.test(url),
+  });
+  await harness.settle();
+  assert.ok(harness.deferred.length > 0);
+
+  harness.api.setFilter("signature", "new");
+  harness.api.applyFilters();
+  await harness.settle();
+  assert.equal(harness.api.state().queueSearchWindow, "window-new");
+
+  harness.releaseDeferred();
+  await harness.settle();
+  assert.equal(harness.api.state().queueSearchWindow, "window-new");
+});
+
+test("Load Older refuses a changed search window without splicing rows", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=scan",
+    searchWindow: (params) => params.has("cursor") ? "window-changed" : "window-original",
+  });
+  await harness.settle();
+  assert.equal(harness.api.state().queueSearchWindow, "window-original");
+
+  await harness.api.loadOlder();
+  await harness.settle();
+  const state = harness.api.state();
+  assert.equal(state.queueSearchWindow, "window-original");
+  assert.equal(state.currentVerdicts.length, 1);
+  assert.equal(state.browsingHistory, false);
+  assert.match(
+    harness.document.getElementById("toast").textContent,
+    /search window changed/,
+  );
+});
+
+test("clearing queue search drops its window before opening detail", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=scan",
+    searchWindow: "window-scan",
+  });
+  await harness.settle();
+  assert.equal(harness.api.state().queueSearchWindow, "window-scan");
+
+  harness.api.setFilter("signature", "");
+  harness.api.applyFilters();
+  await harness.settle();
+  assert.equal(harness.api.state().queueSearchWindow, null);
+
+  await harness.api.open(100);
+  await harness.settle();
+  const investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts/100/investigation"))
+    .at(-1);
+  assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("search_window"), null);
+});
+
+test("whitespace-only queue search is omitted from queue and investigation requests", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=%20%20%20",
+    searchWindow: "window-that-must-not-be-used",
+  });
+  await harness.settle();
+
+  const queueRequest = harness.fetchCalls
+    .map(({ url }) => url)
+    .find((url) => url.includes("/api/v1/verdicts?"));
+  assert.equal(new URL(`http://localhost${queueRequest}`).searchParams.get("signature"), null);
+  assert.equal(harness.api.state().queueSearchWindow, null);
+
+  await harness.api.open(100);
+  await harness.settle();
+  const investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts/100/investigation"))
+    .at(-1);
+  const params = new URL(`http://localhost${investigation}`).searchParams;
+  assert.equal(params.get("signature"), null);
+  assert.equal(params.get("search_window"), null);
+});
+
 test("a stale queue feedback completion cannot reload a newly opened alert", async () => {
   const harness = runDashboard({
     pathname: "/triage",
@@ -1522,6 +1728,33 @@ test("a pending signature debounce cannot remount a detail page", async () => {
   assert.equal(harness.document.getElementById("toast").textContent, "");
   // The typed value itself is kept: only the scheduled reload was dropped.
   assert.equal(state.currentFilter.signature, "scan");
+});
+
+test("typing a new search retires the prior queue window before detail opens", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=old",
+    searchWindow: "window-old",
+    verdicts: [
+      { id: 7, verdict: "real", signature: "seven", confidence: 0.5, human_verdict: null },
+    ],
+  });
+  await harness.settle();
+  assert.equal(harness.api.state().queueSearchWindow, "window-old");
+
+  harness.document.getElementById("sigFilter").dispatch("input", {
+    target: { value: "new" },
+  });
+  assert.equal(harness.api.state().queueSearchWindow, null);
+
+  await harness.api.open(7);
+  await harness.settle();
+  const investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts/7/investigation"))
+    .at(-1);
+  assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("signature"), "new");
+  assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("search_window"), null);
 });
 
 test("leaving the queue cancels the pending signature debounce", async () => {
@@ -2443,6 +2676,41 @@ test("the queue search advertises signature, IP, and historical asset lookup", (
   // The shortcut legend must describe what D now does.
   assert.match(html, /<kbd>D<\/kbd> Review/);
   assert.doesNotMatch(html, /<kbd>D<\/kbd> Correct/);
+});
+
+test("the queue reports when search excludes older retained alerts", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=missing",
+    searchScope: {
+      candidate_limit: 10_000,
+      candidates_in_scope: 10_000,
+      truncated: true,
+    },
+  });
+  await harness.settle();
+
+  assert.deepEqual(
+    harness.api.state().queueSearchScope,
+    {
+      candidate_limit: 10_000,
+      candidates_in_scope: 10_000,
+      truncated: true,
+    },
+  );
+  assert.match(
+    harness.document.getElementById("queueMeta").textContent,
+    /search covers newest 10,000 retained alerts; older alerts not examined/,
+  );
+
+  harness.api.setFilter("signature", "");
+  harness.api.applyFilters();
+  await harness.settle();
+  assert.equal(harness.api.state().queueSearchScope, null);
+  assert.doesNotMatch(
+    harness.document.getElementById("queueMeta").textContent,
+    /search covers/,
+  );
 });
 
 test("overview uses a truthful policy-to-model decision band", () => {

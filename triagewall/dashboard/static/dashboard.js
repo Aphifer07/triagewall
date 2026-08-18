@@ -31,6 +31,8 @@ let focusedIndex = 0;
 let unreviewedModelCount = 0;
 let currentVerdicts = [];
 let nextCursor = null;
+let queueSearchScope = null;
+let queueSearchWindow = null;
 let browsingHistory = false;
 let pageLoading = false;
 let timelineCache = { at: 0, data: [] };
@@ -38,6 +40,7 @@ let toastTimer = null;
 let currentView = "triage";
 let activeDetail = null;
 let activeInvestigation = null;
+let detailSearchWindow = null;
 // Detail and investigation are two awaits deep and race each other across
 // navigations. Every navigation takes the next generation and aborts the
 // previous one; a response may only touch the page if it still owns the
@@ -107,6 +110,13 @@ function initializeView() {
   };
   const detailMatch = window.location.pathname.match(/^\/triage\/(\d+)$/);
   currentView = detailMatch ? "detail" : (viewByPath[window.location.pathname] ?? "triage");
+  const routedSearch = normalizedSignature(
+    new URLSearchParams(window.location.search).get("signature"),
+  );
+  detailSearchWindow = currentView === "detail" && routedSearch
+    && typeof window.history.state?.searchWindow === "string"
+    ? window.history.state.searchWindow
+    : null;
   const titles = {
     triage: "Triage queue",
     overview: "Overview",
@@ -149,7 +159,7 @@ function syncFilterControls() {
 function readFilterParam(params, key) {
   const value = params.get(key);
   if (value == null) return null;
-  if (key === "signature") return value.slice(0, 200);
+  if (key === "signature") return normalizedSignature(value.slice(0, 200));
   // An explicit All maps back onto the internal no-model-filter state.
   if (key === "model" && value === MODEL_ALL_PARAM) return "";
   return VALID_FILTERS[key]?.has(value) ? value : null;
@@ -186,7 +196,7 @@ function canonicalizeTriageUrl() {
   const params = new URLSearchParams(window.location.search);
   if (params.get("model") != null) return;
   window.history.replaceState(
-    {},
+    window.history.state ?? {},
     "",
     `${window.location.pathname}?${queueFilterParams().toString()}`,
   );
@@ -197,6 +207,7 @@ function canonicalizeTriageUrl() {
 // view instead of resetting the queue.
 // URL form of one filter. Only `model` differs from the internal value.
 function filterParamValue(key) {
+  if (key === "signature") return normalizedSignature(currentFilter.signature);
   if (key !== "model") return currentFilter[key];
   return currentFilter.model === "" ? MODEL_ALL_PARAM : currentFilter.model;
 }
@@ -239,7 +250,12 @@ function beginDetailNavigation() {
   if (detailAbort) detailAbort.abort();
   detailAbort = typeof AbortController === "function" ? new AbortController() : null;
   retireActiveDetail();
-  return { generation: detailGeneration, signal: detailAbort?.signal };
+  return {
+    generation: detailGeneration,
+    signal: detailAbort?.signal,
+    filter: { ...currentFilter },
+    searchWindow: detailSearchWindow,
+  };
 }
 
 // Invalidate outstanding detail work without starting any: used when leaving
@@ -342,14 +358,21 @@ function syncUrlState(eventId = null) {
 
 function resetPagination() {
   nextCursor = null;
+  queueSearchScope = null;
+  queueSearchWindow = null;
   browsingHistory = false;
   focusedIndex = 0;
+}
+
+function normalizedSignature(value) {
+  return String(value ?? "").trim();
 }
 
 function buildVerdictParams(cursor = null) {
   const params = new URLSearchParams();
   if (currentFilter.verdict) params.set("verdict", currentFilter.verdict);
-  if (currentFilter.signature) params.set("signature", currentFilter.signature);
+  const signature = normalizedSignature(currentFilter.signature);
+  if (signature) params.set("signature", signature);
   // Internal values, not URL values: the API has no "all" model filter, so All
   // is expressed by omitting the parameter. Never send MODEL_ALL_PARAM here.
   if (currentFilter.model) params.set("model", currentFilter.model);
@@ -447,8 +470,19 @@ async function loadVerdictPage(cursor = null, append = false, request = beginQue
   if (!response.ok) throw new Error(`Decision request failed (${response.status})`);
   const data = await response.json();
   if (!queueRequestIsCurrent(request)) return false;
+  const responseSearchWindow = typeof data.search_window === "string"
+    ? data.search_window
+    : null;
+  if (Boolean(normalizedSignature(request.filter.signature)) !== Boolean(responseSearchWindow)) {
+    throw new Error("Decision search returned invalid window state");
+  }
+  if (append && responseSearchWindow !== queueSearchWindow) {
+    throw new Error("Decision search window changed while loading older alerts");
+  }
   mode = data.mode;
   nextCursor = data.next_cursor;
+  queueSearchScope = data.search_scope ?? null;
+  queueSearchWindow = responseSearchWindow;
   // The next page is built locally and handed to renderVerdicts, which is the
   // single owner of currentVerdicts. Assigning it here first would destroy the
   // old list before renderVerdicts could read which alert was selected, so an
@@ -636,7 +670,15 @@ function renderPagination() {
   // total from /stats, so it is labelled as such and never reads as a count of
   // what is currently filtered or paged in.
   const reviewLabel = `${formatCompact(unreviewedModelCount)} unreviewed in the last 24h, all filters`;
-  document.getElementById("queueMeta").textContent = `${currentVerdicts.length} ${pathLabel} decisions loaded on this page · ${reviewLabel}`;
+  let searchScopeLabel = "";
+  if (queueSearchScope) {
+    const candidateLimit = Number(queueSearchScope.candidate_limit ?? 0).toLocaleString();
+    const candidatesInScope = Number(queueSearchScope.candidates_in_scope ?? 0).toLocaleString();
+    searchScopeLabel = queueSearchScope.truncated
+      ? ` · search covers newest ${candidateLimit} retained alerts; older alerts not examined`
+      : ` · search covers all ${candidatesInScope} retained alerts`;
+  }
+  document.getElementById("queueMeta").textContent = `${currentVerdicts.length} ${pathLabel} decisions loaded on this page · ${reviewLabel}${searchScopeLabel}`;
   document.getElementById("paginationMeta").textContent = browsingHistory
     ? `${currentVerdicts.length} loaded · live queue refresh paused while browsing history`
     : `${currentVerdicts.length} loaded · newest first`;
@@ -1083,11 +1125,17 @@ function renderDetailNavigation(neighbors) {
 }
 
 async function loadInvestigation(eventId, navigation) {
-  const { generation, signal } = navigation;
+  const { generation, signal, filter, searchWindow } = navigation;
   const params = new URLSearchParams();
   for (const key of FILTER_KEYS) {
     // Internal values: All omits the model parameter rather than sending it.
-    if (currentFilter[key]) params.set(key, currentFilter[key]);
+    const value = key === "signature"
+      ? normalizedSignature(filter[key])
+      : filter[key];
+    if (value) params.set(key, value);
+  }
+  if (normalizedSignature(filter.signature) && searchWindow) {
+    params.set("search_window", searchWindow);
   }
   try {
     const response = await fetch(
@@ -1098,6 +1146,25 @@ async function loadInvestigation(eventId, navigation) {
     if (!response.ok) throw new Error(`Investigation request failed (${response.status})`);
     const data = await response.json();
     if (!detailRequestIsCurrent(generation, eventId)) return;
+    const responseSearchWindow = typeof data.search_window === "string"
+      ? data.search_window
+      : null;
+    if (
+      Boolean(normalizedSignature(filter.signature))
+      !== Boolean(responseSearchWindow)
+    ) {
+      throw new Error("Investigation search returned invalid window state");
+    }
+    // A direct searched detail has no queue token to carry in. Publish the
+    // freshly captured identity only after this response still owns the route,
+    // then bind it to both the live detail session and this history entry so
+    // Previous/Next and Back/Forward cannot silently recapture a newer window.
+    detailSearchWindow = responseSearchWindow;
+    window.history.replaceState(
+      { ...(window.history.state ?? {}), searchWindow: responseSearchWindow },
+      "",
+      `${window.location.pathname}${window.location.search}`,
+    );
     activeInvestigation = data;
     renderInvestigation(data);
     renderDetailNavigation(data.neighbors);
@@ -1141,8 +1208,15 @@ async function loadDetail(eventId, navigation = beginDetailNavigation()) {
 
 async function openDetailById(eventId, { focusNotes = false } = {}) {
   if (!Number.isInteger(eventId) || eventId < 1) return;
+  const searchWindow = currentView === "detail"
+    ? detailSearchWindow
+    : queueSearchWindow;
   // Push first so the generation check below compares against the new URL.
-  window.history.pushState({}, "", `/triage/${eventId}${queueQueryString()}`);
+  window.history.pushState(
+    { searchWindow },
+    "",
+    `/triage/${eventId}${queueQueryString()}`,
+  );
   initializeView();
   window.scrollTo({ top: 0, behavior: "instant" });
   const navigation = beginDetailNavigation();
@@ -1388,6 +1462,13 @@ document.querySelectorAll(".model-btn").forEach((button) => {
 
 document.getElementById("sigFilter").addEventListener("input", (event) => {
   currentFilter.signature = event.target.value;
+  // The visible rows may remain while typing is debounced, but their page and
+  // search-window identity belong to the previous term. Retire both before an
+  // alert can be opened under the new URL and accidentally pair the new term
+  // with the old candidate boundary.
+  invalidateQueueRequests();
+  resetPagination();
+  renderPagination();
   // The typed value is active URL state from the first keystroke, not once the
   // debounce fires. Otherwise opening an alert mid-debounce pushes a detail URL
   // carrying the new signature while the queue entry behind it still holds the

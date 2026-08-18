@@ -141,6 +141,16 @@ class VerdictRow(BaseModel):
     raw_alert: str | None = None
 
 
+class QueueSearchScope(BaseModel):
+    """The newest retained-event window examined by a queue search."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_limit: int = Field(gt=0, strict=True)
+    candidates_in_scope: int = Field(ge=0, strict=True)
+    truncated: bool
+
+
 class VerdictsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -148,6 +158,8 @@ class VerdictsResponse(BaseModel):
     mode: Literal["local", "demo"]
     verdicts: list[VerdictRow]
     next_cursor: str | None = None
+    search_scope: QueueSearchScope | None = None
+    search_window: str | None = None
 
 
 class VerdictDetailResponse(BaseModel):
@@ -255,6 +267,7 @@ class QueueNeighbors(BaseModel):
     previous: NeighborAlert | None = None
     next: NeighborAlert | None = None
     filters: QueueFilters
+    search_scope: QueueSearchScope | None = None
 
 
 class InvestigationResponse(BaseModel):
@@ -268,6 +281,7 @@ class InvestigationResponse(BaseModel):
     recurrence: RecurrenceSummary
     related: list[RelatedGroup]
     neighbors: QueueNeighbors
+    search_window: str | None = None
 
 
 class TimelineBucket(BaseModel):

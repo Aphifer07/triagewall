@@ -165,9 +165,30 @@ the current inventory never rewrites historical search results. IP and asset
 matching are disabled in demo mode and whenever
 `TRIAGEWALL_API_REDACT_IPS=true`; a disclosure policy that withholds those
 values must not expose them through a search-result membership oracle.
+Surrounding whitespace is ignored; a whitespace-only value is the same as
+omitting `signature` and does not activate a bounded search window.
 
-Response: `{generated_at, mode, verdicts, next_cursor}`. Pass `next_cursor`
-as `cursor` for the next page. Cursor is opaque over `(processed_at, id)`.
+Search evaluates every documented predicate inside the newest 10,000 retained
+alerts. This fixed candidate window prevents an absent leading-wildcard term
+from scanning the complete retained database. `search_scope` reports
+`candidate_limit`, `candidates_in_scope`, and `truncated`; when `truncated` is
+true, older retained alerts were not examined. The dashboard displays that
+boundary rather than implying a complete-history result. A three-second SQLite
+progress deadline additionally interrupts an unexpectedly slow search with
+**503**; ordinary unsearched queue reads are not subject to that deadline.
+
+Response: `{generated_at, mode, verdicts, next_cursor, search_scope,
+search_window}`. Pass `next_cursor` as `cursor` for the next page. Cursor is opaque over
+`(processed_at, id)`. A search cursor also carries the complete initial window:
+its insertion watermark, newest candidate ceiling, oldest candidate floor, and
+disclosed scope. Those indexable boundaries let later pages seek directly into
+the original candidate range, so work does not grow with alerts inserted after
+page one. New alerts are excluded; retention can remove initial candidates but
+cannot pull an older alert into their place. Starting a fresh search observes
+the current live queue.
+`search_window` is a separate opaque identity returned on every searched page,
+including a one-page result with no `next_cursor`. Pass it to investigation when
+Previous/Next must remain inside the exact queue window the analyst loaded.
 
 ```bash
 curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
@@ -202,14 +223,24 @@ Additive: it does not change `/api/v1/verdicts` or
 | `source` | enum | `suricata` \| `wazuh` |
 | `review` | enum | `unreviewed` \| `agreed` \| `corrected` |
 | `signature` | string | ≤ 200 characters; the same queue search used by `/api/v1/verdicts` |
+| `search_window` | opaque string | ≤ 512 characters; optional identity returned by the searched queue |
 
 The filter parameters are the ones `/api/v1/verdicts` accepts, and they apply
 only to `neighbors`, so previous/next stay inside the queue the analyst was
 working from. An unknown event id returns **404**; unrecognized filter values
 and an out-of-bound `hours` return **422**.
 
+When `signature` search is active, pass the queue response's `search_window` to
+preserve its immutable candidate boundary while opening alert details. Without
+that optional context (for example, on a direct link), investigation captures a
+fresh window and returns its opaque identity as top-level `search_window` for
+subsequent detail navigation. `neighbors.search_scope` reports the window used;
+previous and next never escape it. A `search_window` without `signature`, or a
+malformed value, returns **422**. The same three-second progress deadline
+applies to the search-aware neighbor query.
+
 Response: `{generated_at, mode, event_id, window_hours, window_start,
-recurrence, related, neighbors}`.
+recurrence, related, neighbors, search_window}`.
 
 **`recurrence`** counts events sharing this alert's `(source type, signature
 id)` inside the bounded candidate set. The source qualifier is load-bearing:

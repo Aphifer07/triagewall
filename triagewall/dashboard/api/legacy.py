@@ -77,7 +77,7 @@ def create_legacy_router(
         _auth: AuthContext = Depends(require_read),
     ):
         with db_factory(readonly=True) as conn:
-            rows, _next = services.fetch_verdicts(
+            rows, _next, _search_scope, _search_window = services.fetch_verdicts(
                 conn,
                 verdict=verdict,
                 signature=signature,
@@ -85,6 +85,7 @@ def create_legacy_router(
                 # This deprecated alias remains signature-only until removal;
                 # expanded workbench search is a v1 contract addition.
                 include_private_search=False,
+                bounded_search=False,
                 limit=limit,
                 cursor=None,
             )
