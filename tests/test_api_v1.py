@@ -382,6 +382,28 @@ class ApiV1Tests(unittest.TestCase):
         self.assertEqual(ids("dell", verdict="false_positive"), [2])
         self.assertEqual(ids("not-present"), [])
 
+    def test_ip_shaped_search_term_still_matches_signature_text(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE triage_events SET signature = ? WHERE id = 1",
+                ("Connection to 198.51.100.250 was blocked",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "198.51.100.250"},
+            headers=self.host,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [row["id"] for row in response.json()["verdicts"]],
+            [1],
+        )
+
     def test_private_queue_search_is_disabled_when_values_are_withheld(self):
         conn = sqlite3.connect(self.db_path)
         try:
@@ -400,9 +422,13 @@ class ApiV1Tests(unittest.TestCase):
             )
             conn.execute(
                 """UPDATE triage_events
-                   SET src_ip = ?, src_asset_snapshot_id = ?
+                   SET src_ip = ?, src_asset_snapshot_id = ?, signature = ?
                    WHERE id = 1""",
-                ("10.0.0.44", 1),
+                (
+                    "10.0.0.44",
+                    1,
+                    "Connection to 198.51.100.250 was blocked",
+                ),
             )
             conn.commit()
         finally:
@@ -418,6 +444,12 @@ class ApiV1Tests(unittest.TestCase):
                     headers=self.host,
                 ).json()
                 self.assertEqual(payload["verdicts"], [])
+        payload = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "198.51.100.250"},
+            headers=self.host,
+        ).json()
+        self.assertEqual([row["id"] for row in payload["verdicts"]], [1])
 
         dashboard.API_REDACT_IPS = False
         dashboard.MODE = "demo"
@@ -429,6 +461,12 @@ class ApiV1Tests(unittest.TestCase):
                     headers=self.host,
                 ).json()
                 self.assertEqual(payload["verdicts"], [])
+        payload = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "198.51.100.250"},
+            headers=self.host,
+        ).json()
+        self.assertEqual([row["id"] for row in payload["verdicts"]], [1])
 
     def test_malformed_historical_asset_json_cannot_break_queue_search(self):
         conn = sqlite3.connect(self.db_path)

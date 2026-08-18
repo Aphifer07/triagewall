@@ -131,8 +131,9 @@ def build_verdict_filters(
         # would reveal them; demo and IP-redacted callers must not gain a
         # membership oracle through an otherwise empty result set.
         term = signature.strip()
-        clauses: list[str] = []
-        search_params: list[Any] = []
+        clauses = ["events.signature LIKE ?"]
+        search_params: list[Any] = [f"%{term}%"]
+        normalized_ip = None
         if include_private_search:
             try:
                 normalized_ip = str(ipaddress.ip_address(term))
@@ -141,28 +142,23 @@ def build_verdict_filters(
             if normalized_ip is not None:
                 clauses.extend(("events.src_ip = ?", "events.dest_ip = ?"))
                 search_params.extend((normalized_ip, normalized_ip))
-        else:
-            normalized_ip = None
-        if normalized_ip is None:
-            clauses.append("events.signature LIKE ?")
-            search_params.append(f"%{term}%")
-            if include_private_search:
-                # Snapshot JSON is immutable and validated when written, but
-                # json_valid keeps a damaged historical row from aborting the
-                # whole queue. Resolve matching snapshot ids in a subquery so
-                # repeated event references do not re-parse the same JSON.
-                hostname_ids = """SELECT id FROM asset_snapshots
-                    WHERE CASE WHEN json_valid(asset_json)
-                                   THEN json_extract(asset_json, '$.hostname')
-                               END LIKE ?"""
-                clauses.extend(
-                    (
-                        f"events.src_asset_snapshot_id IN ({hostname_ids})",
-                        f"events.dest_asset_snapshot_id IN ({hostname_ids})",
-                    )
+        if normalized_ip is None and include_private_search:
+            # Snapshot JSON is immutable and validated when written, but
+            # json_valid keeps a damaged historical row from aborting the
+            # whole queue. Resolve matching snapshot ids in a subquery so
+            # repeated event references do not re-parse the same JSON.
+            hostname_ids = """SELECT id FROM asset_snapshots
+                WHERE CASE WHEN json_valid(asset_json)
+                               THEN json_extract(asset_json, '$.hostname')
+                           END LIKE ?"""
+            clauses.extend(
+                (
+                    f"events.src_asset_snapshot_id IN ({hostname_ids})",
+                    f"events.dest_asset_snapshot_id IN ({hostname_ids})",
                 )
-                hostname_pattern = f"%{term}%"
-                search_params.extend((hostname_pattern, hostname_pattern))
+            )
+            hostname_pattern = f"%{term}%"
+            search_params.extend((hostname_pattern, hostname_pattern))
         where.append("(" + " OR ".join(clauses) + ")")
         params.extend(search_params)
     if model == "llm":
