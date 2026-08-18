@@ -1,11 +1,21 @@
 # Changelog
 
-All notable changes to Triagewall are documented in this file.
+All notable changes to TriageWall are documented in this file.
 
 ## Unreleased
 
 ### Added
 
+- A redesigned routed analyst workbench with overview, triage queue,
+  behavioural signals, integrity posture, and source-aware investigation views.
+- Bounded recurrence and related-activity context, source-specific evidence,
+  and queue-aware Previous/Next navigation for both Suricata and Wazuh alerts.
+- A versioned operator-configuration lifecycle for prefilter policy and private
+  asset inventory: immutable drafts, validation, bounded impact preview,
+  explicit activation, optimistic locking, last-known-good reload, rollback,
+  consumer health, and attributable audit history.
+- Alert-to-configuration handoff for drafting a scoped Suricata rule or editing
+  the exact inventory asset that owns an observed address.
 - Queue search now accepts an exact source or destination IP address and a
   historical source or destination asset hostname, while preserving signature
   search and saved `signature` query URLs. It examines a disclosed window of
@@ -21,6 +31,42 @@ All notable changes to Triagewall are documented in this file.
 - A guided, standard-library-only API-key generator now produces an
   attributable `config:write` key and a Compose-safe hash-only `.env` entry for
   the configuration workspace.
+
+### Changed
+
+- The dashboard is now a multi-view application while retaining the versioned
+  API and existing source-aware decision contracts.
+- Both ingest consumers publish one immutable configuration bundle per decision
+  and converge on durable database authority without requiring legacy mounts in
+  database mode.
+- Configuration previews bound row count, elapsed time, and retained-alert
+  bytes; oversized or pre-metadata rows stop safely without materializing a
+  rejected alert body.
+
+### Security
+
+- Configuration mutation remains disabled by default and requires an
+  attributable API key carrying `config:write`; anonymous reads, dashboard
+  feedback cookies, and demo mode cannot mutate configuration.
+- Activation and rollback are explicit, acknowledgement-gated, atomic,
+  generation-locked, parent-locked, and audited without storing credentials or
+  configuration documents in audit details.
+- Browser lifecycle ownership prevents stale loads, credentials, drafts, and
+  confirmations from publishing across reload, disconnect, kind-switch, or
+  replacement-draft boundaries.
+
+### Migration notes
+
+1. Take and verify a current backup before upgrading a persistent database.
+2. Let the one-shot `migrate` and `config-bootstrap` services complete before
+   dashboard or ingest services start.
+3. Existing retained alerts receive no synthetic byte-size backfill. A bounded
+   configuration preview stops at an older unsized row rather than reading it.
+4. Configuration writes are opt-in. Run `python scripts/generate_api_key.py`,
+   preserve its one-time plaintext key, add the hash-only record to `.env`, and
+   set `TRIAGEWALL_CONFIG_WRITES_ENABLED=true` only when the editor is needed.
+5. Queue search examines a disclosed retained window and returns an opaque
+   window identity for stable pagination and investigation navigation.
 
 ## [v0.3](https://github.com/aaronphifer/triagewall/releases/tag/v0.3) - 2026-08-09
 

@@ -119,7 +119,7 @@ for the security gain.
 ### Conclusion
 
 Phase 2 closes the URL injection vulnerability that defeated Phase 1.
-Combined with Phase 1's canary mechanism and schema validation, Triagewall
+Combined with Phase 1's canary mechanism and schema validation, TriageWall
 v0.2 has meaningful defense in depth against the four most common LLM
 injection attack patterns:
 - Canary extraction (Phase 1)

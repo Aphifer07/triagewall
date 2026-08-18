@@ -1,0 +1,54 @@
+name: Feature request
+description: Propose a focused improvement to TriageWall Core or its documented roadmap.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the roadmap and Core/Lab product boundary before proposing major
+        scope. Use Discussions first when the problem or design is still open-ended.
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the roadmap, existing issues, and discussions.
+          required: true
+        - label: This request preserves local-first operation and the operator decision boundary.
+          required: true
+  - type: textarea
+    attributes:
+      label: Operator problem
+      description: What recurring task or limitation should this solve?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed outcome
+      description: Describe the observable result rather than a preferred implementation.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Alternatives considered
+      description: Existing TriageWall workflow or external tool you use today.
+  - type: dropdown
+    attributes:
+      label: Area
+      options:
+        - Analyst workbench
+        - Suricata integration
+        - Wazuh integration
+        - Configuration lifecycle
+        - API / automation
+        - Evaluation / release evidence
+        - Documentation / deployment
+        - TriageWall Lab (future)
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Security and privacy impact
+      description: Note new data, credentials, network access, writes, or trust-boundary changes.
+    validations:
+      required: true

@@ -5,13 +5,13 @@ Lab availability: Not shipped
 
 ## Decision
 
-Triagewall will mature as one product family with two independently runnable
+TriageWall will mature as one product family with two independently runnable
 applications:
 
-- **Triagewall Core** is the production-supported operational application. It
+- **TriageWall Core** is the production-supported operational application. It
   ingests sensor alerts, applies trusted policy and context, obtains local-model
   verdicts, persists decision history, and serves the operator dashboard.
-- **Triagewall Lab** is the future replay, evaluation, and release-validation
+- **TriageWall Lab** is the future replay, evaluation, and release-validation
   application. It compares models, prompts, and policies; runs injection and
   gold-set regressions; and reports evidence for a human release decision.
 
@@ -102,4 +102,4 @@ Lab can join the public repository only when:
 
 Lab is not a generic model-benchmarking platform, a second SIEM, a live sensor
 ingest service, or an autonomous deployment controller. It evaluates the
-Triagewall decision pipeline and produces evidence for a human decision.
+TriageWall decision pipeline and produces evidence for a human decision.

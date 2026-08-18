@@ -5,11 +5,11 @@
 
 ## Summary
 
-I evaluated whether Cisco Foundation AI's [Foundation-Sec-8B-Instruct](https://huggingface.co/fdtn-ai/Foundation-Sec-8B-Instruct) (a cybersecurity-specialized fine-tune of Llama 3.1) should replace Mistral 7B as Triagewall's triage model. The hypothesis was that domain-specialized training would translate to better IDS alert classification.
+I evaluated whether Cisco Foundation AI's [Foundation-Sec-8B-Instruct](https://huggingface.co/fdtn-ai/Foundation-Sec-8B-Instruct) (a cybersecurity-specialized fine-tune of Llama 3.1) should replace Mistral 7B as TriageWall's triage model. The hypothesis was that domain-specialized training would translate to better IDS alert classification.
 
 The first benchmark contradicted the hypothesis: every Foundation-Sec quantization underperformed generic Mistral on the same prompt. Investigation showed the root cause was the prompt, not the model. After revising the prompt to include category priors, threat-intel guidance, and operational context, Foundation-Sec Q5_K_M moved from κ=0.210 to κ=0.687 and from 0% true-positive recall to 83%, comfortably beating Mistral. **Model specialization was real but latent — the prompt had to elicit it.**
 
-Triagewall v0.2 ships with the revised prompt and Foundation-Sec Q5_K_M as the production model.
+TriageWall v0.2 ships with the revised prompt and Foundation-Sec Q5_K_M as the production model.
 
 ## Method
 
@@ -37,7 +37,7 @@ The set is small for statistical confidence intervals but large enough to discri
 | Foundation-Sec-8B-Instruct Q6_K | 6.6 GB | gabriellarson/Foundation-Sec-8B-Instruct-GGUF |
 | Foundation-Sec-8B-Instruct Q8_0 | 8.5 GB | fdtn-ai/Foundation-Sec-8B-Instruct-Q8_0-GGUF (Cisco's official release) |
 
-All models served through Ollama on an RTX 4060 (8 GB VRAM) connected to the Triagewall container over LAN.
+All models served through Ollama on an RTX 4060 (8 GB VRAM) connected to the TriageWall container over LAN.
 
 ### Prompts
 
@@ -113,7 +113,7 @@ The pattern is clear: the v0.2 prompt's explicit guidance on Spamhaus DROP and o
 
 ## Production change
 
-Triagewall v0.2 ships with:
+TriageWall v0.2 ships with:
 
 - **`SYSTEM_PROMPT` revised** in `triagewall/triage.py` to the v0.2 prompt
 - **Production model:** `hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M`

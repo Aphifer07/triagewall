@@ -1,6 +1,6 @@
-# Triagewall HTTP API
+# TriageWall HTTP API
 
-Stable contract for clients that consume Triagewall outside the built-in
+Stable contract for clients that consume TriageWall outside the built-in
 dashboard (kiosks, scrapers, automations). The dashboard process serves both
 the HTML UI and this JSON API.
 
@@ -26,10 +26,10 @@ scheduled for removal on **2026-12-31**. Prefer `/api/v1/*` and the field
 
 API keys identify a caller. The dashboard write cookie does not. It is
 **same-origin CSRF resistance for the trusted built-in interface**: it proves a
-write came from a page Triagewall itself served, not that a particular user is
+write came from a page TriageWall itself served, not that a particular user is
 signed in. Every browser that can load the dashboard receives one.
 
-That is deliberate — Triagewall targets a single trusted operator on a private
+That is deliberate — TriageWall targets a single trusted operator on a private
 network — but it means the cookie is not a substitute for network controls.
 **Remote access still requires a VPN or an authenticated reverse proxy.** There
 is no multi-user login or SSO.
@@ -101,7 +101,7 @@ pseudonym**:
   secret for both means disclosing either compromises both.
 - **Startup fails** if redaction is enabled without a valid secret. An unsalted
   digest of an IP address is not redaction — the address space is small enough
-  to enumerate offline — so Triagewall refuses to imply protection it is not
+  to enumerate offline — so TriageWall refuses to imply protection it is not
   providing.
 - Pseudonyms are deterministic within a deployment, so correlation across
   responses still works. Changing the secret changes every pseudonym.
@@ -483,7 +483,7 @@ silently leaks into the stable contract.
 
 One deliberate exception: the `asset_context.source` and
 `asset_context.destination` objects stay free-form dictionaries. Their contents
-come from the operator's own asset inventory, so Triagewall does not invent a
+come from the operator's own asset inventory, so TriageWall does not invent a
 schema for fields it does not define.
 
 ## Caching

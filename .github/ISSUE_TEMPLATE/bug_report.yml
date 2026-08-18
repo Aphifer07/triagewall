@@ -1,0 +1,74 @@
+name: Bug report
+description: Report reproducible behavior that does not match the documented contract.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve TriageWall. Do not include real alert bodies,
+        API keys, private IP inventories, credentials, or other sensitive data.
+        Report security issues privately through the security policy instead.
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the existing issues and discussions for a duplicate.
+          required: true
+        - label: This is not a vulnerability or sensitive security report.
+          required: true
+        - label: I removed credentials, private telemetry, and identifying data.
+          required: true
+  - type: input
+    attributes:
+      label: TriageWall version
+      description: Release tag or commit SHA.
+      placeholder: v0.4 or 436c259
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Deployment
+      options:
+        - Core only
+        - Core + Wazuh
+        - Demo mode
+        - Direct Python / custom deployment
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Environment
+      description: OS, Docker/Compose version, browser, Ollama version, and model when relevant.
+      placeholder: Debian 13; Docker 28; Compose v2; Firefox 141; Ollama 0.x
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction
+      description: Minimal, sanitized steps that consistently reproduce the problem.
+      placeholder: |
+        1. Start TriageWall with ...
+        2. Open ...
+        3. Select ...
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Sanitized diagnostics
+      description: Relevant bounded logs, health output, or screenshots with private data removed.
+      render: shell
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Anything else that changes the result, including rollback or workaround details.
