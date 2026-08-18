@@ -1,12 +1,12 @@
 # Wazuh alerts.json integration
 
-Triagewall can optionally read Wazuh's local `alerts.json` stream on the same
+TriageWall can optionally read Wazuh's local `alerts.json` stream on the same
 Docker host. It does not use the Wazuh API, Indexer API, Docker socket, or any
 Wazuh credentials. Wazuh remains the authoritative alert store.
 
 ## Requirements
 
-- Wazuh and Triagewall run on the same Docker Engine host.
+- Wazuh and TriageWall run on the same Docker Engine host.
 - Wazuh exposes its `/var/ossec/logs` directory through a named volume.
 - Docker Engine 26 or newer and a current Docker Compose v2 release are
   required for the read-only volume `subpath` mount.
@@ -21,7 +21,7 @@ docker volume inspect YOUR_WAZUH_LOGS_VOLUME
 stat -c 'gid=%g mode=%a' /var/lib/docker/volumes/YOUR_WAZUH_LOGS_VOLUME/_data/alerts
 ```
 
-The Triagewall service joins that numeric group and drops all Linux
+The TriageWall service joins that numeric group and drops all Linux
 capabilities. The volume is mounted read-only and restricted to its `alerts`
 subdirectory.
 
@@ -45,18 +45,18 @@ TZ=UTC
 ### Timezone must match the Wazuh manager
 
 Wazuh names its daily archives `ossec-alerts-DD` using the **manager's local
-calendar day**, so Triagewall derives the archive day from the process-local
+calendar day**, so TriageWall derives the archive day from the process-local
 timezone rather than UTC. `TZ` on the `wazuh-ingest` service must therefore be
 set to the same timezone the Wazuh manager runs in. Both default to `UTC`,
 which is correct only if the manager is also on UTC.
 
-A mismatch is not cosmetic. It shifts Triagewall's day boundary away from the
+A mismatch is not cosmetic. It shifts TriageWall's day boundary away from the
 one Wazuh rotates on, and at rotation that produces one of two failures:
 
-- **Triagewall's day advances first.** It looks for an archive the manager has
+- **TriageWall's day advances first.** It looks for an archive the manager has
   not written yet, finds it missing, and stops fail-closed rather than skipping
   a gap in alerts.
-- **Triagewall's day advances last.** It reaches the new `alerts.json` inode
+- **TriageWall's day advances last.** It reaches the new `alerts.json` inode
   without having drained the previous day's archive, and again stops
   fail-closed rather than losing the undrained records.
 
@@ -77,7 +77,7 @@ is present fails startup so one stream cannot silently assume another identity.
 
 Level 8 is the recommended initial admission threshold. Lower-level records
 remain available in Wazuh but are checkpointed without being copied to
-Triagewall or sent to Ollama. Changing Wazuh's own `log_alert_level` is neither
+TriageWall or sent to Ollama. Changing Wazuh's own `log_alert_level` is neither
 required nor recommended for this integration.
 
 `WAZUH_START_MODE` is consulted only when no Wazuh checkpoint exists. `end`
@@ -122,7 +122,7 @@ Wazuh verdicts carry a `wazuh` sensor badge, use `Rule` rather than `SID`, and
 show the Wazuh agent when no network tuple is available. Demo mode removes the
 source instance, event ID, and agent identity.
 
-To roll back the connector without changing Wazuh or deleting Triagewall data:
+To roll back the connector without changing Wazuh or deleting TriageWall data:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.wazuh.yml --profile wazuh stop wazuh-ingest

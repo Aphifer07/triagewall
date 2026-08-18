@@ -4,7 +4,7 @@ Status: Accepted; implementation in progress for v0.4
 
 ## Purpose
 
-Triagewall needs operator-managed prefilter and asset configuration without
+TriageWall needs operator-managed prefilter and asset configuration without
 turning the analyst dashboard into an unaudited file editor. This design adds a
 versioned configuration lifecycle before any prefilter or asset editor is
 exposed.
@@ -384,7 +384,7 @@ Status: implemented.
 
 The routed `/configuration` workspace keeps its dedicated administrator key in
 memory only and sends it exclusively as `X-API-Key`. It never places the key in
-URLs, request bodies, logs, browser storage, or the Triagewall database. The
+URLs, request bodies, logs, browser storage, or the TriageWall database. The
 workspace exposes the exact canonical candidate, immutable draft creation,
 validation, bounded preview, broad-rule and shipped-base warnings, explicit
 activation, revision history, rollback, audit history, and consumer reload

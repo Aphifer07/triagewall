@@ -1,6 +1,6 @@
-# Triagewall Roadmap
+# TriageWall Roadmap
 
-Triagewall started as a way to make a homelab IDS usable again: reduce
+TriageWall started as a way to make a homelab IDS usable again: reduce
 thousands of Suricata alerts to the handful worth reviewing. The longer-term
 goal is a local-first **homelab security awareness platform** that surfaces
 what matters across sensors without requiring the operator to remember to
@@ -10,9 +10,9 @@ The product strategy remains consistent:
 
 - **Integrate, do not reinvent.** Suricata, Wazuh, Zeek, Pi-hole, OpenVAS, and
   Garak provide detection, collection, scanning, and adversarial probes.
-  Triagewall adds local reasoning, prioritization, correlation, and release
+  TriageWall adds local reasoning, prioritization, correlation, and release
   evidence.
-- **Keep operational triage independent.** Triagewall Core must remain useful
+- **Keep operational triage independent.** TriageWall Core must remain useful
   without optional evaluation or awareness components.
 - **Require human approval for behavior changes.** Automation may test and
   report a prompt, policy, model, or threshold change; it does not silently
@@ -149,7 +149,7 @@ and performance gate over human labels and makes no adversarial claim. The two
 fail for different reasons and need different review.
 
 - [ ] **Garak injection gate (full isolated pipeline).** Exercise the complete
-  isolated Triagewall pipeline rather than the bare model. A regression is
+  isolated TriageWall pipeline rather than the bare model. A regression is
   blocked and reported for human review. Once implemented it should run
   periodically **and before applicable future releases** — especially any
   release that changes the model, the prompts, field isolation, or the source
@@ -205,9 +205,9 @@ fail for different reasons and need different review.
   model latency only after overload, retry, ordering, and recovery semantics
   are explicit.
 
-### Triagewall Core and Lab — accepted product direction
+### TriageWall Core and Lab — accepted product direction
 
-Triagewall will mature as one product family with two independently runnable
+TriageWall will mature as one product family with two independently runnable
 applications. See
 [Core and Lab product boundary](docs/core-lab-product-boundary.md).
 
@@ -233,7 +233,7 @@ applications. See
   separation, CI, upgrade, rollback, backup, removal, and user-documentation
   gates pass. Archive the private incubation repository after import.
 
-### v0.4 — Analyst workbench — September–October 2026
+### v0.4 — Analyst workbench — August 2026
 
 Turn the alert queue into a source-aware investigation and configuration
 workbench without weakening the production boundary.
@@ -265,6 +265,12 @@ workbench without weakening the production boundary.
 - [x] **Unified analyst actions.** Connect feedback, related-alert filtering,
   rule drafting, asset editing, and bounded evidence copying from the alert
   workbench.
+- [x] **Bounded retained-alert search.** Search by signature, exact IP address,
+  or historical asset hostname with a disclosed candidate window, query
+  deadline, stable pagination identity, and queue-aware investigation reuse.
+- [x] **Guided configuration-key onboarding.** Generate a one-time plaintext
+  key and Compose-safe hash-only `config:write` record without external
+  dependencies.
 - [x] **Release hardening.** Cover authorization, audit, concurrency, atomic
   activation, reload failure, rollback, both sensor paths, browser behaviour,
   field isolation, and canary regressions before tagging v0.4.
@@ -272,7 +278,7 @@ workbench without weakening the production boundary.
 #### Analyst investigation context — delivered
 
 The routed alert-detail page is the first functional investigation surface. It
-reads only what Triagewall already persists; no schema change, no new index,
+reads only what TriageWall already persists; no schema change, no new index,
 and no new sensor field were introduced.
 
 - [x] **Recurrence for the selected alert.** Occurrence count, first and latest
@@ -316,12 +322,11 @@ inferred:
 - The window is capped at 24 hours. A wider window needs a production-shaped
   benchmark against a defined query-time budget first.
 
-**Deliberately not in this slice.** Configuration mutation from the UI is out
-of scope: no prefilter rule creation or editing, no asset-enrichment editing,
-and no configuration activation or rollback. Those belong to the versioned
-operator-configuration subsystem, which must land with its own authorization
-and audit story rather than riding along with a read-only investigation
-surface.
+**Delivered in later v0.4 slices.** The initial investigation view remained
+read-only. Configuration editing subsequently landed through the separate
+versioned subsystem described above, with dedicated authorization, previews,
+activation, rollback, concurrency controls, and audit evidence rather than
+riding on the dashboard feedback boundary.
 
 ### v0.5 — Lab to production — Late 2026
 
@@ -351,7 +356,7 @@ revision into Core through an explicit audited boundary.
 - Explain CVEs, prioritize by asset exposure and criticality, and provide
   plain-language remediation
 
-Triagewall reasons on top of mature sensors and scanners; it does not become a
+TriageWall reasons on top of mature sensors and scanners; it does not become a
 SIEM or vulnerability scanner.
 
 ### v1.0 — Early 2027
@@ -391,11 +396,11 @@ upgrade, rollback, backup, retention, observability, and security guarantees.
 ## Out of scope
 
 - **Auto-blocking or active response.** Use Wazuh Active Response or firewall
-  policy. Triagewall is decision support.
+  policy. TriageWall is decision support.
 - **Cloud LLM integration.** It conflicts with the local-first telemetry
   boundary.
 - **Endpoint-agent functionality.** Use Wazuh agents.
-- **Building another SIEM or vulnerability scanner.** Triagewall reasons over
+- **Building another SIEM or vulnerability scanner.** TriageWall reasons over
   existing sensors and scanners.
 - **Unsupervised self-tuning or auto-rollback.** Regressions are blocked and
   reported; a human decides what changes production.
