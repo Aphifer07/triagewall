@@ -192,9 +192,12 @@ inode.
   returns 422 rather than silently behaving like no filter.
 - Free-form inputs are bounded: queue search, cursor length and feedback notes
   each have a documented maximum, so one request cannot make the database or
-  the application do unbounded work. Queue search includes private IP and
-  historical asset fields only when the response disclosure policy would show
-  them; demo and IP-redaction modes do not expose a membership oracle.
+  the application do unbounded work. Queue search evaluates at most the newest
+  10,000 retained alerts, reports when older rows were excluded, and has a
+  three-second SQLite progress deadline as a second fail-safe. It includes
+  private IP and historical asset fields only when the response disclosure
+  policy would show them; demo and IP-redaction modes do not expose a
+  membership oracle.
 
 ### Operator-facing output
 

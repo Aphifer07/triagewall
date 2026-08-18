@@ -31,6 +31,7 @@ let focusedIndex = 0;
 let unreviewedModelCount = 0;
 let currentVerdicts = [];
 let nextCursor = null;
+let queueSearchScope = null;
 let browsingHistory = false;
 let pageLoading = false;
 let timelineCache = { at: 0, data: [] };
@@ -342,6 +343,7 @@ function syncUrlState(eventId = null) {
 
 function resetPagination() {
   nextCursor = null;
+  queueSearchScope = null;
   browsingHistory = false;
   focusedIndex = 0;
 }
@@ -449,6 +451,7 @@ async function loadVerdictPage(cursor = null, append = false, request = beginQue
   if (!queueRequestIsCurrent(request)) return false;
   mode = data.mode;
   nextCursor = data.next_cursor;
+  queueSearchScope = data.search_scope ?? null;
   // The next page is built locally and handed to renderVerdicts, which is the
   // single owner of currentVerdicts. Assigning it here first would destroy the
   // old list before renderVerdicts could read which alert was selected, so an
@@ -636,7 +639,15 @@ function renderPagination() {
   // total from /stats, so it is labelled as such and never reads as a count of
   // what is currently filtered or paged in.
   const reviewLabel = `${formatCompact(unreviewedModelCount)} unreviewed in the last 24h, all filters`;
-  document.getElementById("queueMeta").textContent = `${currentVerdicts.length} ${pathLabel} decisions loaded on this page · ${reviewLabel}`;
+  let searchScopeLabel = "";
+  if (queueSearchScope) {
+    const candidateLimit = Number(queueSearchScope.candidate_limit ?? 0).toLocaleString();
+    const candidatesInScope = Number(queueSearchScope.candidates_in_scope ?? 0).toLocaleString();
+    searchScopeLabel = queueSearchScope.truncated
+      ? ` · search covers newest ${candidateLimit} retained alerts; older alerts not examined`
+      : ` · search covers all ${candidatesInScope} retained alerts`;
+  }
+  document.getElementById("queueMeta").textContent = `${currentVerdicts.length} ${pathLabel} decisions loaded on this page · ${reviewLabel}${searchScopeLabel}`;
   document.getElementById("paginationMeta").textContent = browsingHistory
     ? `${currentVerdicts.length} loaded · live queue refresh paused while browsing history`
     : `${currentVerdicts.length} loaded · newest first`;

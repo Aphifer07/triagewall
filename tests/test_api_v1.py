@@ -438,6 +438,171 @@ class ApiV1Tests(unittest.TestCase):
             [1],
         )
 
+    def test_queue_search_is_bounded_to_newest_candidates_and_discloses_scope(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE triage_events SET signature = ? WHERE id = 3",
+                ("only-old-row-matches",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch.object(
+            services,
+            "MAX_QUEUE_SEARCH_CANDIDATE_ROWS",
+            2,
+            create=True,
+        ):
+            response = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": "only-old-row-matches"},
+                headers=self.host,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["verdicts"], [])
+        self.assertEqual(
+            response.json()["search_scope"],
+            {
+                "candidate_limit": 2,
+                "candidates_in_scope": 2,
+                "truncated": True,
+            },
+        )
+
+        with patch.object(
+            services,
+            "MAX_QUEUE_SEARCH_CANDIDATE_ROWS",
+            5,
+            create=True,
+        ):
+            complete = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": "not-present"},
+                headers=self.host,
+            )
+        self.assertEqual(
+            complete.json()["search_scope"],
+            {
+                "candidate_limit": 5,
+                "candidates_in_scope": 3,
+                "truncated": False,
+            },
+        )
+
+    def test_queue_search_pagination_cannot_escape_the_candidate_window(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            oldest = datetime.now(timezone.utc) - timedelta(hours=1)
+            conn.execute(
+                """
+                INSERT INTO triage_events (
+                    timestamp, signature_id, signature, raw_alert, verdict,
+                    confidence, reasoning, model_used, processed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    format_utc_timestamp(oldest),
+                    2000,
+                    "Signature outside bounded window",
+                    "{}",
+                    "real",
+                    0.9,
+                    "reason",
+                    "test-llm",
+                    format_utc_timestamp(oldest),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        cursor = None
+        seen = []
+        with patch.object(
+            services,
+            "MAX_QUEUE_SEARCH_CANDIDATE_ROWS",
+            3,
+            create=True,
+        ):
+            for _ in range(3):
+                params = {"signature": "Signature", "limit": 1}
+                if cursor is not None:
+                    params["cursor"] = cursor
+                payload = self.client.get(
+                    "/api/v1/verdicts",
+                    params=params,
+                    headers=self.host,
+                ).json()
+                seen.extend(row["id"] for row in payload["verdicts"])
+                cursor = payload["next_cursor"]
+
+        self.assertEqual(seen, [1, 2, 3])
+        self.assertIsNone(cursor)
+
+    def test_queue_search_time_budget_fails_closed_without_affecting_plain_queue(self):
+        with patch.object(
+            services,
+            "QUEUE_SEARCH_TIMEOUT_SECONDS",
+            -1.0,
+            create=True,
+        ), patch.object(
+            services,
+            "QUEUE_SEARCH_PROGRESS_OPCODES",
+            1,
+            create=True,
+        ):
+            timed_out = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": "not-present"},
+                headers=self.host,
+            )
+            plain = self.client.get("/api/v1/verdicts", headers=self.host)
+
+        self.assertEqual(timed_out.status_code, 503)
+        self.assertEqual(
+            timed_out.json()["detail"],
+            "search exceeded its query-time budget; narrow the filters and retry",
+        )
+        self.assertEqual(plain.status_code, 200)
+
+    def test_investigation_neighbors_share_the_bounded_search_scope(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE triage_events SET signature = ? WHERE id IN (1, 3)",
+                ("bounded-neighbor-match",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch.object(
+            services,
+            "MAX_QUEUE_SEARCH_CANDIDATE_ROWS",
+            2,
+            create=True,
+        ):
+            response = self.client.get(
+                "/api/v1/verdicts/1/investigation",
+                params={"signature": "bounded-neighbor-match"},
+                headers=self.host,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        neighbors = response.json()["neighbors"]
+        self.assertIsNone(neighbors["next"])
+        self.assertEqual(
+            neighbors["search_scope"],
+            {
+                "candidate_limit": 2,
+                "candidates_in_scope": 2,
+                "truncated": True,
+            },
+        )
+
     def test_private_queue_search_is_disabled_when_values_are_withheld(self):
         conn = sqlite3.connect(self.db_path)
         try:
@@ -1910,6 +2075,60 @@ class InvestigationScaleTests(unittest.TestCase):
             f"candidate selection should use the processed_at index: {steps}",
         )
         self.assertNoUnboundedEventScan(steps)
+
+    def test_queue_search_is_driven_by_bounded_processed_candidates(self):
+        where, params = services.build_verdict_filters(
+            None,
+            "definitely-not-present",
+            None,
+            include_private_search=True,
+        )
+        services._apply_queue_search_bound(where, params)
+        steps = self.plan_for(
+            f"""{services._VERDICT_SELECT}
+                WHERE {" AND ".join(where)}
+                ORDER BY events.processed_at DESC NULLS LAST, events.id DESC
+                LIMIT ?""",
+            params + [101],
+        )
+
+        self.assertTrue(
+            any("COVERING INDEX idx_triage_processed" in step for step in steps),
+            f"candidate ids should come from the processed index: {steps}",
+        )
+        self.assertTrue(
+            any("SEARCH events USING INTEGER PRIMARY KEY" in step for step in steps),
+            f"candidate rows should be primary-key lookups: {steps}",
+        )
+        self.assertFalse(
+            any(step.startswith("SCAN events") for step in steps),
+            f"search must not scan the retained event table: {steps}",
+        )
+
+    def test_zero_match_queue_search_finishes_inside_the_hard_budget(self):
+        started = time.perf_counter()
+        response = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "definitely-not-present"},
+            headers=self.host,
+        )
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["verdicts"], [])
+        self.assertEqual(
+            response.json()["search_scope"],
+            {
+                "candidate_limit": services.MAX_QUEUE_SEARCH_CANDIDATE_ROWS,
+                "candidates_in_scope": services.MAX_QUEUE_SEARCH_CANDIDATE_ROWS,
+                "truncated": True,
+            },
+        )
+        self.assertLess(
+            elapsed,
+            services.QUEUE_SEARCH_TIMEOUT_SECONDS,
+            f"bounded zero-match search took {elapsed:.2f}s",
+        )
 
     def test_results_stay_bounded_on_a_large_database(self):
         payload = self.client.get(

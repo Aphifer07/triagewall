@@ -7,8 +7,9 @@ import ipaddress
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import timedelta
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from fastapi import HTTPException
 
@@ -40,6 +41,22 @@ DEFAULT_VERDICT_LIMIT = 100
 MAX_SIGNATURE_SEARCH_LENGTH = 200
 MAX_CURSOR_LENGTH = 512
 MAX_FEEDBACK_NOTES_LENGTH = 2_000
+
+# Queue text/IP/asset search is deliberately scoped to the newest retained
+# events. A leading-wildcard signature match cannot use a conventional index;
+# letting a zero-match term traverse a multi-million-row table made an
+# interactive request run for more than 16 minutes on the production-shaped
+# database. Candidate ids come from the covering processed_at index, then every
+# documented predicate is evaluated inside this fixed window. The API reports
+# the window and whether older rows were excluded.
+MAX_QUEUE_SEARCH_CANDIDATE_ROWS = 10_000
+
+# The candidate bound is the primary work limit. The progress handler is a
+# second, wall-clock fail-safe for unexpectedly slow storage or a future query
+# plan regression. It is installed only around queue-search SQL and is always
+# removed before the connection returns to its caller.
+QUEUE_SEARCH_TIMEOUT_SECONDS = 3.0
+QUEUE_SEARCH_PROGRESS_OPCODES = 1_000
 
 # Investigation bounds.
 #
@@ -180,6 +197,77 @@ def build_verdict_filters(
     return where, params
 
 
+_QUEUE_SEARCH_CANDIDATE_IDS_SQL = """
+SELECT search_events.id
+FROM triage_events AS search_events INDEXED BY idx_triage_processed
+ORDER BY search_events.processed_at DESC NULLS LAST, search_events.id DESC
+LIMIT ?
+"""
+
+
+def _queue_search_scope(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Describe the fixed newest-event window used by queue search."""
+    candidate_limit = MAX_QUEUE_SEARCH_CANDIDATE_ROWS
+    row = conn.execute(
+        f"""SELECT COUNT(*) AS candidate_count
+            FROM ({_QUEUE_SEARCH_CANDIDATE_IDS_SQL})""",
+        (candidate_limit + 1,),
+    ).fetchone()
+    available = int(
+        row["candidate_count"] if isinstance(row, sqlite3.Row) else row[0]
+    )
+    return {
+        "candidate_limit": candidate_limit,
+        "candidates_in_scope": min(available, candidate_limit),
+        "truncated": available > candidate_limit,
+    }
+
+
+def _apply_queue_search_bound(
+    where: list[str],
+    params: list[Any],
+) -> None:
+    """Restrict filters to one fixed newest-event candidate window."""
+    where.insert(0, f"events.id IN ({_QUEUE_SEARCH_CANDIDATE_IDS_SQL})")
+    params.insert(0, MAX_QUEUE_SEARCH_CANDIDATE_ROWS)
+
+
+@contextmanager
+def _queue_search_budget(
+    conn: sqlite3.Connection,
+    *,
+    enabled: bool,
+) -> Iterator[None]:
+    """Interrupt queue-search SQL that exceeds its wall-clock budget."""
+    if not enabled:
+        yield
+        return
+
+    deadline = time.monotonic() + QUEUE_SEARCH_TIMEOUT_SECONDS
+
+    def over_budget() -> int:
+        return int(time.monotonic() >= deadline)
+
+    conn.set_progress_handler(
+        over_budget,
+        max(1, int(QUEUE_SEARCH_PROGRESS_OPCODES)),
+    )
+    try:
+        yield
+    except sqlite3.OperationalError as exc:
+        if "interrupted" not in str(exc).lower():
+            raise
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "search exceeded its query-time budget; "
+                "narrow the filters and retry"
+            ),
+        ) from exc
+    finally:
+        conn.set_progress_handler(None, 0)
+
+
 _VERDICT_SELECT = """
 SELECT events.id, events.timestamp, events.src_ip, events.src_port,
        events.dest_ip, events.dest_port, events.proto,
@@ -219,10 +307,11 @@ def fetch_verdicts(
     source: str | None = None,
     review: str | None = None,
     include_private_search: bool = True,
+    bounded_search: bool = True,
     limit: int = DEFAULT_VERDICT_LIMIT,
     cursor: str | None = None,
-) -> tuple[list[sqlite3.Row], str | None]:
-    """Return verdict rows and an opaque next_cursor (or None)."""
+) -> tuple[list[sqlite3.Row], str | None, dict[str, Any] | None]:
+    """Return rows, an opaque next_cursor, and bounded-search scope."""
     if limit < 1 or limit > MAX_VERDICT_LIMIT:
         raise HTTPException(
             status_code=422,
@@ -236,6 +325,9 @@ def fetch_verdicts(
         review,
         include_private_search=include_private_search,
     )
+    search_enabled = bool(signature) and bounded_search
+    if search_enabled:
+        _apply_queue_search_bound(where, params)
     if cursor:
         processed_at, event_id = decode_cursor(cursor)
         where.append(
@@ -266,13 +358,17 @@ def fetch_verdicts(
             ]
         )
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    rows = conn.execute(
-        f"""{_VERDICT_SELECT}
-            {where_sql}
-            ORDER BY events.processed_at DESC NULLS LAST, events.id DESC
-            LIMIT ?""",
-        params + [limit + 1],
-    ).fetchall()
+    search_scope = None
+    with _queue_search_budget(conn, enabled=search_enabled):
+        if search_enabled:
+            search_scope = _queue_search_scope(conn)
+        rows = conn.execute(
+            f"""{_VERDICT_SELECT}
+                {where_sql}
+                ORDER BY events.processed_at DESC NULLS LAST, events.id DESC
+                LIMIT ?""",
+            params + [limit + 1],
+        ).fetchall()
     next_cursor = None
     if len(rows) > limit:
         rows = rows[:limit]
@@ -281,7 +377,7 @@ def fetch_verdicts(
     elif rows:
         # Exact page with no more rows.
         next_cursor = None
-    return list(rows), next_cursor
+    return list(rows), next_cursor, search_scope
 
 
 def fetch_verdict(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
@@ -699,13 +795,20 @@ def fetch_investigation(
         review,
         include_private_search=include_private_search,
     )
-    previous_row, next_row = _fetch_neighbors(
-        conn,
-        anchor_id=int(anchor["id"]),
-        anchor_processed_at=anchor["processed_at"],
-        where=list(where),
-        params=list(params),
-    )
+    search_enabled = bool(signature)
+    if search_enabled:
+        _apply_queue_search_bound(where, params)
+    search_scope = None
+    with _queue_search_budget(conn, enabled=search_enabled):
+        if search_enabled:
+            search_scope = _queue_search_scope(conn)
+        previous_row, next_row = _fetch_neighbors(
+            conn,
+            anchor_id=int(anchor["id"]),
+            anchor_processed_at=anchor["processed_at"],
+            where=list(where),
+            params=list(params),
+        )
 
     return {
         "generated_at": utc_now_iso(),
@@ -724,6 +827,7 @@ def fetch_investigation(
                 "source": source,
                 "review": review,
             },
+            "search_scope": search_scope,
         },
     }
 

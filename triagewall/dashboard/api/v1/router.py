@@ -169,7 +169,7 @@ def create_v1_router(
         _auth: AuthContext = Depends(require_read),
     ):
         with db_factory(readonly=True) as conn:
-            rows, next_cursor = services.fetch_verdicts(
+            rows, next_cursor, search_scope = services.fetch_verdicts(
                 conn,
                 verdict=verdict,
                 signature=signature,
@@ -187,6 +187,7 @@ def create_v1_router(
             "mode": get_mode(),
             "verdicts": [row_to_dict(r) for r in rows],
             "next_cursor": next_cursor,
+            "search_scope": search_scope,
         }
         # Rows carry review state that an operator can change at any moment, so
         # the queue is as mutable as the detail view and gets the same policy.

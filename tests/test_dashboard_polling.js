@@ -79,6 +79,7 @@ function runDashboard({
   pathname,
   search = "",
   verdicts = [],
+  searchScope = null,
   defer = () => false,
   fail = () => false,
 }) {
@@ -297,6 +298,7 @@ function runDashboard({
           saved.has(row.id) ? { ...row, ...saved.get(row.id) } : row,
         ),
         next_cursor: `cursor-${tag}-${page + 1}`,
+        search_scope: params.has("signature") ? searchScope : null,
       };
     }
     return { mode: "local", verdicts: listRows, next_cursor: null };
@@ -407,6 +409,7 @@ function runDashboard({
     currentFilter: { ...currentFilter },
     currentVerdicts: currentVerdicts.map((row) => ({ ...row })),
     nextCursor,
+    queueSearchScope,
     browsingHistory,
     focusedIndex,
   }),
@@ -2443,6 +2446,41 @@ test("the queue search advertises signature, IP, and historical asset lookup", (
   // The shortcut legend must describe what D now does.
   assert.match(html, /<kbd>D<\/kbd> Review/);
   assert.doesNotMatch(html, /<kbd>D<\/kbd> Correct/);
+});
+
+test("the queue reports when search excludes older retained alerts", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=missing",
+    searchScope: {
+      candidate_limit: 10_000,
+      candidates_in_scope: 10_000,
+      truncated: true,
+    },
+  });
+  await harness.settle();
+
+  assert.deepEqual(
+    harness.api.state().queueSearchScope,
+    {
+      candidate_limit: 10_000,
+      candidates_in_scope: 10_000,
+      truncated: true,
+    },
+  );
+  assert.match(
+    harness.document.getElementById("queueMeta").textContent,
+    /search covers newest 10,000 retained alerts; older alerts not examined/,
+  );
+
+  harness.api.setFilter("signature", "");
+  harness.api.applyFilters();
+  await harness.settle();
+  assert.equal(harness.api.state().queueSearchScope, null);
+  assert.doesNotMatch(
+    harness.document.getElementById("queueMeta").textContent,
+    /search covers/,
+  );
 });
 
 test("overview uses a truthful policy-to-model decision band", () => {
