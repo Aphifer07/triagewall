@@ -169,7 +169,7 @@ def create_v1_router(
         _auth: AuthContext = Depends(require_read),
     ):
         with db_factory(readonly=True) as conn:
-            rows, next_cursor, search_scope = services.fetch_verdicts(
+            rows, next_cursor, search_scope, search_window = services.fetch_verdicts(
                 conn,
                 verdict=verdict,
                 signature=signature,
@@ -188,6 +188,7 @@ def create_v1_router(
             "verdicts": [row_to_dict(r) for r in rows],
             "next_cursor": next_cursor,
             "search_scope": search_scope,
+            "search_window": search_window,
         }
         # Rows carry review state that an operator can change at any moment, so
         # the queue is as mutable as the detail view and gets the same policy.
@@ -246,6 +247,10 @@ def create_v1_router(
         model: ModelFilter | None = None,
         source: SourceFilter | None = None,
         review: ReviewFilter | None = None,
+        search_window: str | None = Query(
+            default=None,
+            max_length=services.MAX_CURSOR_LENGTH,
+        ),
         _auth: AuthContext = Depends(require_read),
     ):
         """Bounded recurrence, related activity and queue-aware neighbours.
@@ -267,6 +272,11 @@ def create_v1_router(
                 model=model,
                 source=source,
                 review=review,
+                search_window=(
+                    services.decode_search_window(search_window)
+                    if search_window is not None
+                    else None
+                ),
                 include_private_search=(
                     get_mode() != "demo" and not redact_ips()
                 ),

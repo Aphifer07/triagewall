@@ -32,6 +32,7 @@ let unreviewedModelCount = 0;
 let currentVerdicts = [];
 let nextCursor = null;
 let queueSearchScope = null;
+let queueSearchWindow = null;
 let browsingHistory = false;
 let pageLoading = false;
 let timelineCache = { at: 0, data: [] };
@@ -39,6 +40,7 @@ let toastTimer = null;
 let currentView = "triage";
 let activeDetail = null;
 let activeInvestigation = null;
+let detailSearchWindow = null;
 // Detail and investigation are two awaits deep and race each other across
 // navigations. Every navigation takes the next generation and aborts the
 // previous one; a response may only touch the page if it still owns the
@@ -108,6 +110,11 @@ function initializeView() {
   };
   const detailMatch = window.location.pathname.match(/^\/triage\/(\d+)$/);
   currentView = detailMatch ? "detail" : (viewByPath[window.location.pathname] ?? "triage");
+  const routedSearch = new URLSearchParams(window.location.search).get("signature");
+  detailSearchWindow = currentView === "detail" && routedSearch
+    && typeof window.history.state?.searchWindow === "string"
+    ? window.history.state.searchWindow
+    : null;
   const titles = {
     triage: "Triage queue",
     overview: "Overview",
@@ -187,7 +194,7 @@ function canonicalizeTriageUrl() {
   const params = new URLSearchParams(window.location.search);
   if (params.get("model") != null) return;
   window.history.replaceState(
-    {},
+    window.history.state ?? {},
     "",
     `${window.location.pathname}?${queueFilterParams().toString()}`,
   );
@@ -240,7 +247,12 @@ function beginDetailNavigation() {
   if (detailAbort) detailAbort.abort();
   detailAbort = typeof AbortController === "function" ? new AbortController() : null;
   retireActiveDetail();
-  return { generation: detailGeneration, signal: detailAbort?.signal };
+  return {
+    generation: detailGeneration,
+    signal: detailAbort?.signal,
+    filter: { ...currentFilter },
+    searchWindow: detailSearchWindow,
+  };
 }
 
 // Invalidate outstanding detail work without starting any: used when leaving
@@ -344,6 +356,7 @@ function syncUrlState(eventId = null) {
 function resetPagination() {
   nextCursor = null;
   queueSearchScope = null;
+  queueSearchWindow = null;
   browsingHistory = false;
   focusedIndex = 0;
 }
@@ -449,9 +462,19 @@ async function loadVerdictPage(cursor = null, append = false, request = beginQue
   if (!response.ok) throw new Error(`Decision request failed (${response.status})`);
   const data = await response.json();
   if (!queueRequestIsCurrent(request)) return false;
+  const responseSearchWindow = typeof data.search_window === "string"
+    ? data.search_window
+    : null;
+  if (Boolean(request.filter.signature) !== Boolean(responseSearchWindow)) {
+    throw new Error("Decision search returned invalid window state");
+  }
+  if (append && responseSearchWindow !== queueSearchWindow) {
+    throw new Error("Decision search window changed while loading older alerts");
+  }
   mode = data.mode;
   nextCursor = data.next_cursor;
   queueSearchScope = data.search_scope ?? null;
+  queueSearchWindow = responseSearchWindow;
   // The next page is built locally and handed to renderVerdicts, which is the
   // single owner of currentVerdicts. Assigning it here first would destroy the
   // old list before renderVerdicts could read which alert was selected, so an
@@ -1094,11 +1117,14 @@ function renderDetailNavigation(neighbors) {
 }
 
 async function loadInvestigation(eventId, navigation) {
-  const { generation, signal } = navigation;
+  const { generation, signal, filter, searchWindow } = navigation;
   const params = new URLSearchParams();
   for (const key of FILTER_KEYS) {
     // Internal values: All omits the model parameter rather than sending it.
-    if (currentFilter[key]) params.set(key, currentFilter[key]);
+    if (filter[key]) params.set(key, filter[key]);
+  }
+  if (filter.signature && searchWindow) {
+    params.set("search_window", searchWindow);
   }
   try {
     const response = await fetch(
@@ -1152,8 +1178,15 @@ async function loadDetail(eventId, navigation = beginDetailNavigation()) {
 
 async function openDetailById(eventId, { focusNotes = false } = {}) {
   if (!Number.isInteger(eventId) || eventId < 1) return;
+  const searchWindow = currentView === "detail"
+    ? detailSearchWindow
+    : queueSearchWindow;
   // Push first so the generation check below compares against the new URL.
-  window.history.pushState({}, "", `/triage/${eventId}${queueQueryString()}`);
+  window.history.pushState(
+    { searchWindow },
+    "",
+    `/triage/${eventId}${queueQueryString()}`,
+  );
   initializeView();
   window.scrollTo({ top: 0, behavior: "instant" });
   const navigation = beginDetailNavigation();
@@ -1399,6 +1432,13 @@ document.querySelectorAll(".model-btn").forEach((button) => {
 
 document.getElementById("sigFilter").addEventListener("input", (event) => {
   currentFilter.signature = event.target.value;
+  // The visible rows may remain while typing is debounced, but their page and
+  // search-window identity belong to the previous term. Retire both before an
+  // alert can be opened under the new URL and accidentally pair the new term
+  // with the old candidate boundary.
+  invalidateQueueRequests();
+  resetPagination();
+  renderPagination();
   // The typed value is active URL state from the first keystroke, not once the
   // debounce fires. Otherwise opening an alert mid-debounce pushes a detail URL
   // carrying the new signature while the queue entry behind it still holds the

@@ -133,20 +133,29 @@ def encode_cursor(
 ) -> str:
     cursor_payload: dict[str, Any] = {"p": processed_at, "i": event_id}
     if search_window is not None:
-        cursor_payload.update(
-            {
-                "s": search_window.max_event_id,
-                "f": {
-                    "p": search_window.floor_processed_at,
-                    "i": search_window.floor_event_id,
-                },
-                "l": search_window.candidate_limit,
-                "n": search_window.candidates_in_scope,
-                "t": search_window.truncated,
-            }
-        )
+        cursor_payload.update(_search_window_payload(search_window))
     payload = json.dumps(cursor_payload, separators=(",", ":"))
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _search_window_payload(search_window: QueueSearchWindow) -> dict[str, Any]:
+    return {
+        "s": search_window.max_event_id,
+        "f": {
+            "p": search_window.floor_processed_at,
+            "i": search_window.floor_event_id,
+        },
+        "l": search_window.candidate_limit,
+        "n": search_window.candidates_in_scope,
+        "t": search_window.truncated,
+    }
+
+
+def encode_search_window(search_window: QueueSearchWindow) -> str:
+    """Encode queue-search identity independently from page position."""
+    payload = {"v": 1, **_search_window_payload(search_window)}
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
 def _cursor_integer(
@@ -162,15 +171,78 @@ def _cursor_integer(
     return value
 
 
+def _decode_opaque_payload(value: str) -> dict[str, Any]:
+    padding = "=" * (-len(value) % 4)
+    raw = base64.urlsafe_b64decode(value + padding)
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("invalid opaque payload")
+    return payload
+
+
+def _search_window_from_payload(payload: dict[str, Any]) -> QueueSearchWindow:
+    max_event_id = _cursor_integer(payload["s"], minimum=0)
+    floor = payload["f"]
+    if not isinstance(floor, dict) or set(floor) != {"p", "i"}:
+        raise ValueError("invalid search floor")
+    floor_processed_at = floor["p"]
+    if floor_processed_at is not None and not isinstance(floor_processed_at, str):
+        raise ValueError("invalid search floor timestamp")
+    raw_floor_event_id = floor["i"]
+    floor_event_id = None
+    if raw_floor_event_id is not None:
+        floor_event_id = _cursor_integer(
+            raw_floor_event_id,
+            maximum=max_event_id,
+        )
+    candidate_limit = _cursor_integer(
+        payload["l"],
+        maximum=MAX_QUEUE_SEARCH_CANDIDATE_ROWS,
+    )
+    candidates_in_scope = _cursor_integer(
+        payload["n"],
+        minimum=0,
+        maximum=candidate_limit,
+    )
+    truncated = payload["t"]
+    if not isinstance(truncated, bool):
+        raise ValueError("invalid search truncation state")
+    if truncated and candidates_in_scope != candidate_limit:
+        raise ValueError("invalid truncated search scope")
+    if (floor_event_id is None) != (candidates_in_scope == 0):
+        raise ValueError("search floor does not match candidate scope")
+    if floor_event_id is None and floor_processed_at is not None:
+        raise ValueError("empty search window has a timestamp floor")
+    return QueueSearchWindow(
+        max_event_id=max_event_id,
+        floor_processed_at=floor_processed_at,
+        floor_event_id=floor_event_id,
+        candidate_limit=candidate_limit,
+        candidates_in_scope=candidates_in_scope,
+        truncated=truncated,
+    )
+
+
+def decode_search_window(value: str) -> QueueSearchWindow:
+    """Decode and validate search identity supplied to investigation."""
+    try:
+        payload = _decode_opaque_payload(value)
+        if (
+            set(payload) != {"v", "s", "f", "l", "n", "t"}
+            or type(payload["v"]) is not int
+            or payload["v"] != 1
+        ):
+            raise ValueError("invalid search window payload")
+        return _search_window_from_payload(payload)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(status_code=422, detail="invalid search window") from exc
+
+
 def decode_cursor(
     cursor: str,
 ) -> tuple[str | None, int, QueueSearchWindow | None]:
     try:
-        padding = "=" * (-len(cursor) % 4)
-        raw = base64.urlsafe_b64decode(cursor + padding)
-        payload = json.loads(raw.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("invalid cursor payload")
+        payload = _decode_opaque_payload(cursor)
         event_id = _cursor_integer(payload["i"])
         processed_at = payload.get("p")
         if processed_at is not None and not isinstance(processed_at, str):
@@ -181,42 +253,9 @@ def decode_cursor(
         if present_search_keys:
             if present_search_keys != search_keys:
                 raise ValueError("incomplete search boundary")
-            max_event_id = _cursor_integer(payload["s"])
-            floor = payload["f"]
-            if not isinstance(floor, dict) or set(floor) != {"p", "i"}:
-                raise ValueError("invalid search floor")
-            floor_processed_at = floor["p"]
-            if floor_processed_at is not None and not isinstance(
-                floor_processed_at, str
-            ):
-                raise ValueError("invalid search floor timestamp")
-            floor_event_id = _cursor_integer(
-                floor["i"],
-                maximum=max_event_id,
-            )
-            candidate_limit = _cursor_integer(
-                payload["l"],
-                maximum=MAX_QUEUE_SEARCH_CANDIDATE_ROWS,
-            )
-            candidates_in_scope = _cursor_integer(
-                payload["n"],
-                maximum=candidate_limit,
-            )
-            truncated = payload["t"]
-            if not isinstance(truncated, bool):
-                raise ValueError("invalid search truncation state")
-            if truncated and candidates_in_scope != candidate_limit:
-                raise ValueError("invalid truncated search scope")
-            if event_id > max_event_id:
+            search_window = _search_window_from_payload(payload)
+            if event_id > search_window.max_event_id:
                 raise ValueError("cursor lies beyond search watermark")
-            search_window = QueueSearchWindow(
-                max_event_id=max_event_id,
-                floor_processed_at=floor_processed_at,
-                floor_event_id=floor_event_id,
-                candidate_limit=candidate_limit,
-                candidates_in_scope=candidates_in_scope,
-                truncated=truncated,
-            )
         return processed_at, event_id, search_window
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
         raise HTTPException(status_code=422, detail="invalid cursor") from exc
@@ -482,8 +521,8 @@ def fetch_verdicts(
     bounded_search: bool = True,
     limit: int = DEFAULT_VERDICT_LIMIT,
     cursor: str | None = None,
-) -> tuple[list[sqlite3.Row], str | None, dict[str, Any] | None]:
-    """Return rows, an opaque next_cursor, and bounded-search scope."""
+) -> tuple[list[sqlite3.Row], str | None, dict[str, Any] | None, str | None]:
+    """Return rows, pagination, bounded-search scope, and search identity."""
     if limit < 1 or limit > MAX_VERDICT_LIMIT:
         raise HTTPException(
             status_code=422,
@@ -569,7 +608,10 @@ def fetch_verdicts(
     elif rows:
         # Exact page with no more rows.
         next_cursor = None
-    return list(rows), next_cursor, search_scope
+    encoded_search_window = (
+        encode_search_window(search_window) if search_window is not None else None
+    )
+    return list(rows), next_cursor, search_scope, encoded_search_window
 
 
 def fetch_verdict(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
@@ -815,6 +857,7 @@ def fetch_investigation(
     source: str | None = None,
     review: str | None = None,
     include_private_search: bool = True,
+    search_window: QueueSearchWindow | None = None,
 ) -> dict[str, Any] | None:
     """Return bounded recurrence, related activity and queue neighbours.
 
@@ -992,9 +1035,11 @@ def fetch_investigation(
         include_private_search=include_private_search,
     )
     search_enabled = bool(signature)
-    search_window = None
+    if search_window is not None and not search_enabled:
+        raise HTTPException(status_code=422, detail="search window requires search")
     if search_enabled:
-        search_window = _new_queue_search_window(conn)
+        if search_window is None:
+            search_window = _new_queue_search_window(conn)
         _apply_queue_search_bound(
             where,
             params,

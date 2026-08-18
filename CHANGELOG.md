@@ -12,7 +12,8 @@ All notable changes to Triagewall are documented in this file.
   the newest 10,000 retained alerts and has a three-second query fail-safe, so
   an absent term cannot traverse the complete retained database. Search
   cursors keep that initial candidate window stable while new alerts arrive or
-  retention removes rows.
+  retention removes rows, and alert-detail Previous/Next navigation reuses the
+  queue's opaque window identity instead of silently capturing a newer scope.
 - A guided, standard-library-only API-key generator now produces an
   attributable `config:write` key and a Compose-safe hash-only `.env` entry for
   the configuration workspace.

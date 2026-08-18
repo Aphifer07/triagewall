@@ -77,7 +77,7 @@ def create_legacy_router(
         _auth: AuthContext = Depends(require_read),
     ):
         with db_factory(readonly=True) as conn:
-            rows, _next, _search_scope = services.fetch_verdicts(
+            rows, _next, _search_scope, _search_window = services.fetch_verdicts(
                 conn,
                 verdict=verdict,
                 signature=signature,

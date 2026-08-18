@@ -159,6 +159,7 @@ class VerdictsResponse(BaseModel):
     verdicts: list[VerdictRow]
     next_cursor: str | None = None
     search_scope: QueueSearchScope | None = None
+    search_window: str | None = None
 
 
 class VerdictDetailResponse(BaseModel):
