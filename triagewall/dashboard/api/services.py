@@ -142,7 +142,7 @@ def build_verdict_filters(
             if normalized_ip is not None:
                 clauses.extend(("events.src_ip = ?", "events.dest_ip = ?"))
                 search_params.extend((normalized_ip, normalized_ip))
-        if normalized_ip is None and include_private_search:
+        if include_private_search:
             # Snapshot JSON is immutable and validated when written, but
             # json_valid keeps a damaged historical row from aborting the
             # whole queue. Resolve matching snapshot ids in a subquery so

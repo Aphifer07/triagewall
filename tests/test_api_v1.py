@@ -404,7 +404,7 @@ class ApiV1Tests(unittest.TestCase):
             [1],
         )
 
-    def test_private_queue_search_is_disabled_when_values_are_withheld(self):
+    def test_ip_shaped_search_term_matches_historical_asset_hostname(self):
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute(
@@ -415,9 +415,51 @@ class ApiV1Tests(unittest.TestCase):
                 """,
                 (
                     1,
-                    "private-search",
-                    '{"hostname":"private-host"}',
+                    "ip-shaped-hostname",
+                    '{"hostname":"198.51.100.251"}',
                     format_utc_timestamp(datetime.now(timezone.utc)),
+                ),
+            )
+            conn.execute(
+                "UPDATE triage_events SET src_asset_snapshot_id = 1 WHERE id = 1"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "198.51.100.251"},
+            headers=self.host,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [row["id"] for row in response.json()["verdicts"]],
+            [1],
+        )
+
+    def test_private_queue_search_is_disabled_when_values_are_withheld(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO asset_snapshots (
+                    id, snapshot_hash, asset_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (
+                        1,
+                        "private-search",
+                        '{"hostname":"private-host"}',
+                        format_utc_timestamp(datetime.now(timezone.utc)),
+                    ),
+                    (
+                        2,
+                        "private-ip-shaped-hostname",
+                        '{"hostname":"198.51.100.251"}',
+                        format_utc_timestamp(datetime.now(timezone.utc)),
+                    ),
                 ),
             )
             conn.execute(
@@ -430,13 +472,16 @@ class ApiV1Tests(unittest.TestCase):
                     "Connection to 198.51.100.250 was blocked",
                 ),
             )
+            conn.execute(
+                "UPDATE triage_events SET src_asset_snapshot_id = 2 WHERE id = 2"
+            )
             conn.commit()
         finally:
             conn.close()
 
         dashboard.API_REDACT_IPS = True
         dashboard.API_IP_HASH_SECRET = b"x" * 40
-        for term in ("10.0.0.44", "private-host"):
+        for term in ("10.0.0.44", "private-host", "198.51.100.251"):
             with self.subTest(term=term):
                 payload = self.client.get(
                     "/api/v1/verdicts",
@@ -453,7 +498,7 @@ class ApiV1Tests(unittest.TestCase):
 
         dashboard.API_REDACT_IPS = False
         dashboard.MODE = "demo"
-        for term in ("10.0.0.44", "private-host"):
+        for term in ("10.0.0.44", "private-host", "198.51.100.251"):
             with self.subTest(term=term):
                 payload = self.client.get(
                     "/api/v1/verdicts",
