@@ -41,16 +41,31 @@ is reached over HTTPS so the browser will not send it over plaintext.
 ### Configuring a key
 
 ```bash
-# Generate a plaintext key and a PBKDF2 digest (store only the digest in env):
-python -c "from triagewall.dashboard.api.auth import hash_api_key; import secrets; k=secrets.token_urlsafe(32); print(k); print(hash_api_key(k))"
+# Run this in a private terminal from the repository root. The plaintext key
+# is printed once; the generated .env value contains only its PBKDF2 hash.
+python scripts/generate_api_key.py
 ```
 
+The default creates an attributable `config-admin` record carrying only
+`config:write`. Use `--name` and repeat `--scope` to generate a different
+least-privilege record. The command prints both the record to append when
+`TRIAGEWALL_API_KEYS` already exists and a complete Compose-safe assignment for
+a new installation. Keep the assignment single-quoted: the quotes prevent
+Compose from treating the PBKDF2 `$` separators as variable interpolation.
+
 ```env
-TRIAGEWALL_API_KEYS=kiosk:pbkdf2_sha256$210000$<salt>$<digest>:read,operator:pbkdf2_sha256$210000$<salt>$<digest>:read|feedback:write,config-admin:pbkdf2_sha256$210000$<salt>$<digest>:config:write
+TRIAGEWALL_API_KEYS='config-admin:pbkdf2_sha256$210000$<salt>$<digest>:config:write'
 TRIAGEWALL_DASHBOARD_WRITE_SECRET=<long-random-string>
 TRIAGEWALL_API_ALLOW_UNAUTHENTICATED_READS=true
-TRIAGEWALL_CONFIG_WRITES_ENABLED=false
+TRIAGEWALL_CONFIG_WRITES_ENABLED=true
 ```
+
+Restart the dashboard after changing `.env`, open `/configuration`, and enter
+the one-time plaintext key. The browser keeps it only in the current page's
+memory and clears it on reload or disconnect. Set
+`TRIAGEWALL_CONFIG_WRITES_ENABLED=false` again whenever configuration mutation
+should be administratively disabled; configuration access still requires the
+attributable key.
 
 ### Recommended production settings
 
@@ -134,13 +149,22 @@ Verdict rows only (no stats).
 | `model` | enum | `llm` \| `prefilter` |
 | `source` | enum | `suricata` \| `wazuh` |
 | `review` | enum | `unreviewed` \| `agreed` \| `corrected` |
-| `signature` | string | ≤ 200 characters (substring match) |
+| `signature` | string | ≤ 200 characters; signature substring, exact source/destination IP, or historical asset-hostname substring |
 | `limit` | integer | 1–500, default 100 |
 | `cursor` | opaque string | ≤ 512 characters |
 
 Filter values are typed: an unrecognized `verdict`, `model`, `source`, or `review` returns **422**
 rather than silently behaving like no filter. Values over a documented bound
 also return 422.
+
+The `signature` parameter name is retained for existing API clients and saved
+dashboard URLs, but the workbench treats it as its bounded search term. Address
+matches are exact after IPv4/IPv6 normalization. Asset names come from the
+immutable source or destination snapshot stored with each verdict, so changing
+the current inventory never rewrites historical search results. IP and asset
+matching are disabled in demo mode and whenever
+`TRIAGEWALL_API_REDACT_IPS=true`; a disclosure policy that withholds those
+values must not expose them through a search-result membership oracle.
 
 Response: `{generated_at, mode, verdicts, next_cursor}`. Pass `next_cursor`
 as `cursor` for the next page. Cursor is opaque over `(processed_at, id)`.
@@ -177,7 +201,7 @@ Additive: it does not change `/api/v1/verdicts` or
 | `model` | enum | `llm` \| `prefilter` |
 | `source` | enum | `suricata` \| `wazuh` |
 | `review` | enum | `unreviewed` \| `agreed` \| `corrected` |
-| `signature` | string | ≤ 200 characters (substring match) |
+| `signature` | string | ≤ 200 characters; the same queue search used by `/api/v1/verdicts` |
 
 The filter parameters are the ones `/api/v1/verdicts` accepts, and they apply
 only to `neighbors`, so previous/next stay inside the queue the analyst was

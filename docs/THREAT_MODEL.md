@@ -190,9 +190,11 @@ inode.
   contents stay free-form dictionaries by design.
 - Verdict, model and timeline-interval filters are typed. An unrecognized value
   returns 422 rather than silently behaving like no filter.
-- Free-form inputs are bounded: signature search, cursor length and feedback
-  notes each have a documented maximum, so one request cannot make the database
-  or the application do unbounded work.
+- Free-form inputs are bounded: queue search, cursor length and feedback notes
+  each have a documented maximum, so one request cannot make the database or
+  the application do unbounded work. Queue search includes private IP and
+  historical asset fields only when the response disclosure policy would show
+  them; demo and IP-redaction modes do not expose a membership oracle.
 
 ### Operator-facing output
 

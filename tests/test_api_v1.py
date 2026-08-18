@@ -189,6 +189,15 @@ class ApiV1Tests(unittest.TestCase):
         self.assertEqual(payload["stats"]["real"], payload["stats"]["real_"])
         self.assertNotIn("model_real_count", payload["stats"])
 
+    def test_legacy_signature_filter_does_not_gain_private_search_semantics(self):
+        response = self.client.get(
+            "/api/verdicts",
+            params={"signature": "10.0.0.5"},
+            headers=self.host,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["verdicts"], [])
+
     def test_feedback_requires_credential(self):
         response = self.client.post(
             "/api/v1/feedback/1",
@@ -313,6 +322,227 @@ class ApiV1Tests(unittest.TestCase):
                     f"/api/v1/verdicts?review={review}", headers=self.host
                 ).json()["verdicts"]
                 self.assertEqual([row["id"] for row in rows], event_ids)
+
+    def test_queue_search_matches_signature_addresses_and_asset_hostnames(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO asset_snapshots (
+                    id, snapshot_hash, asset_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (
+                        1,
+                        "search-source",
+                        '{"hostname":"delltop","role":"admin-workstation"}',
+                        format_utc_timestamp(datetime.now(timezone.utc)),
+                    ),
+                    (
+                        2,
+                        "search-destination",
+                        '{"hostname":"ringgarage","role":"security-camera"}',
+                        format_utc_timestamp(datetime.now(timezone.utc)),
+                    ),
+                ),
+            )
+            conn.execute(
+                """UPDATE triage_events
+                   SET src_ip = ?, dest_ip = ?, src_asset_snapshot_id = ?
+                   WHERE id = 2""",
+                ("10.0.0.44", "203.0.113.9", 1),
+            )
+            conn.execute(
+                """UPDATE triage_events
+                   SET src_ip = ?, dest_ip = ?, dest_asset_snapshot_id = ?
+                   WHERE id = 3""",
+                ("2001:db8::1", "2001:db8::2", 2),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        def ids(term, **filters):
+            response = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": term, **filters},
+                headers=self.host,
+            )
+            self.assertEqual(response.status_code, 200)
+            return [row["id"] for row in response.json()["verdicts"]]
+
+        self.assertEqual(ids("Signature 0"), [1])
+        self.assertEqual(ids("10.0.0.44"), [2])
+        self.assertEqual(ids("203.0.113.9"), [2])
+        self.assertEqual(ids("2001:0db8:0:0:0:0:0:1"), [3])
+        self.assertEqual(ids("2001:db8::2"), [3])
+        self.assertEqual(ids("DELL"), [2])
+        self.assertEqual(ids("garage"), [3])
+        self.assertEqual(ids("dell", verdict="false_positive"), [2])
+        self.assertEqual(ids("not-present"), [])
+
+    def test_ip_shaped_search_term_still_matches_signature_text(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE triage_events SET signature = ? WHERE id = 1",
+                ("Connection to 198.51.100.250 was blocked",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "198.51.100.250"},
+            headers=self.host,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [row["id"] for row in response.json()["verdicts"]],
+            [1],
+        )
+
+    def test_ip_shaped_search_term_matches_historical_asset_hostname(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO asset_snapshots (
+                    id, snapshot_hash, asset_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    1,
+                    "ip-shaped-hostname",
+                    '{"hostname":"198.51.100.251"}',
+                    format_utc_timestamp(datetime.now(timezone.utc)),
+                ),
+            )
+            conn.execute(
+                "UPDATE triage_events SET src_asset_snapshot_id = 1 WHERE id = 1"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "198.51.100.251"},
+            headers=self.host,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [row["id"] for row in response.json()["verdicts"]],
+            [1],
+        )
+
+    def test_private_queue_search_is_disabled_when_values_are_withheld(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO asset_snapshots (
+                    id, snapshot_hash, asset_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (
+                        1,
+                        "private-search",
+                        '{"hostname":"private-host"}',
+                        format_utc_timestamp(datetime.now(timezone.utc)),
+                    ),
+                    (
+                        2,
+                        "private-ip-shaped-hostname",
+                        '{"hostname":"198.51.100.251"}',
+                        format_utc_timestamp(datetime.now(timezone.utc)),
+                    ),
+                ),
+            )
+            conn.execute(
+                """UPDATE triage_events
+                   SET src_ip = ?, src_asset_snapshot_id = ?, signature = ?
+                   WHERE id = 1""",
+                (
+                    "10.0.0.44",
+                    1,
+                    "Connection to 198.51.100.250 was blocked",
+                ),
+            )
+            conn.execute(
+                "UPDATE triage_events SET src_asset_snapshot_id = 2 WHERE id = 2"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        dashboard.API_REDACT_IPS = True
+        dashboard.API_IP_HASH_SECRET = b"x" * 40
+        for term in ("10.0.0.44", "private-host", "198.51.100.251"):
+            with self.subTest(term=term):
+                payload = self.client.get(
+                    "/api/v1/verdicts",
+                    params={"signature": term},
+                    headers=self.host,
+                ).json()
+                self.assertEqual(payload["verdicts"], [])
+        payload = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "198.51.100.250"},
+            headers=self.host,
+        ).json()
+        self.assertEqual([row["id"] for row in payload["verdicts"]], [1])
+
+        dashboard.API_REDACT_IPS = False
+        dashboard.MODE = "demo"
+        for term in ("10.0.0.44", "private-host", "198.51.100.251"):
+            with self.subTest(term=term):
+                payload = self.client.get(
+                    "/api/v1/verdicts",
+                    params={"signature": term},
+                    headers=self.host,
+                ).json()
+                self.assertEqual(payload["verdicts"], [])
+        payload = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "198.51.100.250"},
+            headers=self.host,
+        ).json()
+        self.assertEqual([row["id"] for row in payload["verdicts"]], [1])
+
+    def test_malformed_historical_asset_json_cannot_break_queue_search(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO asset_snapshots (
+                    id, snapshot_hash, asset_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    1,
+                    "damaged-search-snapshot",
+                    "{not-json",
+                    format_utc_timestamp(datetime.now(timezone.utc)),
+                ),
+            )
+            conn.execute(
+                "UPDATE triage_events SET src_asset_snapshot_id = 1 WHERE id = 1"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "not-present"},
+            headers=self.host,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["verdicts"], [])
 
     def test_timeline_parameters_and_validation(self):
         ok = self.client.get(
@@ -1059,6 +1289,24 @@ class InvestigationTests(unittest.TestCase):
                         "web01" if source_type == "wazuh" else None,
                     ),
                 )
+        conn.execute(
+            """
+            INSERT INTO asset_snapshots (
+                id, snapshot_hash, asset_json, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                1,
+                "neighbor-search",
+                '{"hostname":"delltop"}',
+                format_utc_timestamp(self.now),
+            ),
+        )
+        conn.execute(
+            """UPDATE triage_events
+               SET src_asset_snapshot_id = 1
+               WHERE id IN (2, 3)"""
+        )
         conn.commit()
         conn.close()
 
@@ -1277,6 +1525,12 @@ class InvestigationTests(unittest.TestCase):
 
         payload = self.investigate(1, review="unreviewed").json()
         self.assertEqual(payload["neighbors"]["next"]["id"], 5)
+
+        payload = self.investigate(1, signature="10.0.0.9").json()
+        self.assertEqual(payload["neighbors"]["next"]["id"], 3)
+
+        payload = self.investigate(1, signature="delltop").json()
+        self.assertEqual(payload["neighbors"]["next"]["id"], 2)
 
     def test_applied_filters_are_echoed_back(self):
         payload = self.investigate(1, verdict="real", source="suricata").json()

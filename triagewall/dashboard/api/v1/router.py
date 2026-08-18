@@ -176,6 +176,9 @@ def create_v1_router(
                 model=model,
                 source=source,
                 review=review,
+                include_private_search=(
+                    get_mode() != "demo" and not redact_ips()
+                ),
                 limit=limit,
                 cursor=cursor,
             )
@@ -263,6 +266,9 @@ def create_v1_router(
                 model=model,
                 source=source,
                 review=review,
+                include_private_search=(
+                    get_mode() != "demo" and not redact_ips()
+                ),
             )
         if payload is None:
             raise HTTPException(status_code=404, detail="event not found")

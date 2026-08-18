@@ -2431,12 +2431,14 @@ test("queue badge counts declare their global 24h scope", () => {
   assert.match(script, /unreviewed in the last 24h, all filters/);
 });
 
-test("the queue search advertises only what it actually searches", () => {
+test("the queue search advertises signature, IP, and historical asset lookup", () => {
   const html = fs.readFileSync(path.join(STATIC_DIR, "index.html"), "utf8");
 
-  // The filter is a signature LIKE; it does not search IPs or rule ids.
-  assert.match(html, /id="sigFilter"[^>]*placeholder="signature text…"/);
-  assert.doesNotMatch(html, /placeholder="[^"]*\bIP\b/);
+  assert.match(
+    html,
+    /id="sigFilter"[^>]*placeholder="signature, IP, or asset…"/,
+  );
+  assert.match(html, /<span class="sr-only">Search alerts by signature, IP address, or historical asset hostname<\/span>/);
   assert.doesNotMatch(html, /placeholder="[^"]*rule id/);
   // The shortcut legend must describe what D now does.
   assert.match(html, /<kbd>D<\/kbd> Review/);

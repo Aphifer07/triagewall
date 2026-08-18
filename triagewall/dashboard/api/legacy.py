@@ -82,6 +82,9 @@ def create_legacy_router(
                 verdict=verdict,
                 signature=signature,
                 model=model,
+                # This deprecated alias remains signature-only until removal;
+                # expanded workbench search is a v1 contract addition.
+                include_private_search=False,
                 limit=limit,
                 cursor=None,
             )

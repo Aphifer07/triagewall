@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import sqlite3
 import time
@@ -114,6 +115,8 @@ def build_verdict_filters(
     model: str | None,
     source: str | None = None,
     review: str | None = None,
+    *,
+    include_private_search: bool = True,
 ) -> tuple[list[str], list[Any]]:
     where: list[str] = []
     params: list[Any] = []
@@ -121,8 +124,43 @@ def build_verdict_filters(
         where.append("events.verdict = ?")
         params.append(verdict)
     if signature:
-        where.append("events.signature LIKE ?")
-        params.append(f"%{signature}%")
+        # ``signature`` is retained as the public parameter name for existing
+        # clients and bookmarked queue URLs, but the workbench search now also
+        # resolves exact source/destination addresses and immutable asset
+        # hostnames. Private fields participate only when the response policy
+        # would reveal them; demo and IP-redacted callers must not gain a
+        # membership oracle through an otherwise empty result set.
+        term = signature.strip()
+        clauses = ["events.signature LIKE ?"]
+        search_params: list[Any] = [f"%{term}%"]
+        normalized_ip = None
+        if include_private_search:
+            try:
+                normalized_ip = str(ipaddress.ip_address(term))
+            except ValueError:
+                normalized_ip = None
+            if normalized_ip is not None:
+                clauses.extend(("events.src_ip = ?", "events.dest_ip = ?"))
+                search_params.extend((normalized_ip, normalized_ip))
+        if include_private_search:
+            # Snapshot JSON is immutable and validated when written, but
+            # json_valid keeps a damaged historical row from aborting the
+            # whole queue. Resolve matching snapshot ids in a subquery so
+            # repeated event references do not re-parse the same JSON.
+            hostname_ids = """SELECT id FROM asset_snapshots
+                WHERE CASE WHEN json_valid(asset_json)
+                               THEN json_extract(asset_json, '$.hostname')
+                           END LIKE ?"""
+            clauses.extend(
+                (
+                    f"events.src_asset_snapshot_id IN ({hostname_ids})",
+                    f"events.dest_asset_snapshot_id IN ({hostname_ids})",
+                )
+            )
+            hostname_pattern = f"%{term}%"
+            search_params.extend((hostname_pattern, hostname_pattern))
+        where.append("(" + " OR ".join(clauses) + ")")
+        params.extend(search_params)
     if model == "llm":
         where.append("events.model_used != 'prefilter'")
     elif model == "prefilter":
@@ -180,6 +218,7 @@ def fetch_verdicts(
     model: str | None = None,
     source: str | None = None,
     review: str | None = None,
+    include_private_search: bool = True,
     limit: int = DEFAULT_VERDICT_LIMIT,
     cursor: str | None = None,
 ) -> tuple[list[sqlite3.Row], str | None]:
@@ -195,6 +234,7 @@ def fetch_verdicts(
         model,
         source,
         review,
+        include_private_search=include_private_search,
     )
     if cursor:
         processed_at, event_id = decode_cursor(cursor)
@@ -482,6 +522,7 @@ def fetch_investigation(
     model: str | None = None,
     source: str | None = None,
     review: str | None = None,
+    include_private_search: bool = True,
 ) -> dict[str, Any] | None:
     """Return bounded recurrence, related activity and queue neighbours.
 
@@ -650,7 +691,14 @@ def fetch_investigation(
             }
         )
 
-    where, params = build_verdict_filters(verdict, signature, model, source, review)
+    where, params = build_verdict_filters(
+        verdict,
+        signature,
+        model,
+        source,
+        review,
+        include_private_search=include_private_search,
+    )
     previous_row, next_row = _fetch_neighbors(
         conn,
         anchor_id=int(anchor["id"]),
