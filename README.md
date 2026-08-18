@@ -188,7 +188,7 @@ and known limitations.
 - [Operator configuration lifecycle](docs/operator-configuration-foundation.md)
 - [Threat model](docs/THREAT_MODEL.md)
 - [Gold-set release gate](docs/gold-set-gate.md)
-- [Release evidence](docs/release-evidence-v0.3.md)
+- [Release evidence](docs/release-evidence-v0.4.md)
 - [Model and security experiments](docs/experiments/)
 - [Product roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
