@@ -177,10 +177,11 @@ progress deadline additionally interrupts an unexpectedly slow search with
 
 Response: `{generated_at, mode, verdicts, next_cursor, search_scope}`. Pass
 `next_cursor` as `cursor` for the next page. Cursor is opaque over
-`(processed_at, id)`. A search cursor also carries an insertion watermark from
-its first page, so later pages enumerate the same newest-event candidate window
-even while new alerts arrive. Pagination cannot expose a result beyond that
-initial window; starting a fresh search observes the current live queue.
+`(processed_at, id)`. A search cursor also carries the complete initial window:
+its insertion watermark, oldest candidate floor, and disclosed scope. Later
+pages therefore stay inside that initial newest-event candidate set. New alerts
+are excluded; retention can remove initial candidates but cannot pull an older
+alert into their place. Starting a fresh search observes the current live queue.
 
 ```bash
 curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \

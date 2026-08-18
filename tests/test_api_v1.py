@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -656,6 +658,217 @@ class ApiV1Tests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["detail"], "invalid search cursor")
+
+    def test_queue_search_pagination_does_not_backfill_after_candidate_deletion(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            oldest = datetime.now(timezone.utc) - timedelta(hours=1)
+            inserted = conn.execute(
+                """
+                INSERT INTO triage_events (
+                    timestamp, signature_id, signature, raw_alert, verdict,
+                    confidence, reasoning, model_used, processed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    format_utc_timestamp(oldest),
+                    4000,
+                    "Signature older retained candidate",
+                    "{}",
+                    "real",
+                    0.9,
+                    "reason",
+                    "test-llm",
+                    format_utc_timestamp(oldest),
+                ),
+            )
+            outside_initial_window = int(inserted.lastrowid)
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch.object(
+            services,
+            "MAX_QUEUE_SEARCH_CANDIDATE_ROWS",
+            3,
+            create=True,
+        ):
+            first = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": "Signature", "limit": 1},
+                headers=self.host,
+            ).json()
+            seen = [row["id"] for row in first["verdicts"]]
+            scopes = [first["search_scope"]]
+            cursor = first["next_cursor"]
+
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.execute("DELETE FROM triage_events WHERE id = ?", (2,))
+                conn.commit()
+            finally:
+                conn.close()
+
+            for _ in range(5):
+                if cursor is None:
+                    break
+                page = self.client.get(
+                    "/api/v1/verdicts",
+                    params={
+                        "signature": "Signature",
+                        "limit": 1,
+                        "cursor": cursor,
+                    },
+                    headers=self.host,
+                ).json()
+                seen.extend(row["id"] for row in page["verdicts"])
+                scopes.append(page["search_scope"])
+                cursor = page["next_cursor"]
+            else:
+                self.fail("search pagination did not terminate")
+
+            fresh = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": "Signature", "limit": 3},
+                headers=self.host,
+            ).json()
+
+        self.assertEqual(seen, [1, 3])
+        self.assertNotIn(outside_initial_window, seen)
+        self.assertTrue(all(scope == scopes[0] for scope in scopes))
+        self.assertIn(
+            outside_initial_window,
+            [row["id"] for row in fresh["verdicts"]],
+        )
+
+    def test_queue_search_floor_handles_equal_processed_timestamps(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            stamp = format_utc_timestamp(datetime.now(timezone.utc))
+            conn.execute("UPDATE triage_events SET processed_at = ?", (stamp,))
+            inserted = conn.execute(
+                """
+                INSERT INTO triage_events (
+                    timestamp, signature_id, signature, raw_alert, verdict,
+                    confidence, reasoning, model_used, processed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    stamp,
+                    4001,
+                    "Signature tied",
+                    "{}",
+                    "real",
+                    0.9,
+                    "reason",
+                    "test-llm",
+                    stamp,
+                ),
+            )
+            newest_id = int(inserted.lastrowid)
+            conn.commit()
+            with patch.object(services, "MAX_QUEUE_SEARCH_CANDIDATE_ROWS", 3):
+                window = services._new_queue_search_window(conn)
+                conn.execute("DELETE FROM triage_events WHERE id = ?", (3,))
+                conn.commit()
+                sql, params = services._queue_search_candidate_query(window)
+                candidate_ids = [row[0] for row in conn.execute(sql, params)]
+        finally:
+            conn.close()
+
+        self.assertEqual(window.floor_event_id, 2)
+        self.assertEqual(candidate_ids, [newest_id, 2])
+        self.assertNotIn(1, candidate_ids)
+
+    def test_queue_search_floor_handles_null_processed_timestamps(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("UPDATE triage_events SET processed_at = NULL")
+            conn.execute(
+                """
+                INSERT INTO triage_events (
+                    id, timestamp, signature_id, signature, raw_alert, verdict,
+                    confidence, reasoning, model_used, processed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    0,
+                    format_utc_timestamp(datetime.now(timezone.utc)),
+                    4002,
+                    "Signature null floor",
+                    "{}",
+                    "real",
+                    0.9,
+                    "reason",
+                    "test-llm",
+                ),
+            )
+            conn.commit()
+            with patch.object(services, "MAX_QUEUE_SEARCH_CANDIDATE_ROWS", 3):
+                window = services._new_queue_search_window(conn)
+                conn.execute("DELETE FROM triage_events WHERE id = ?", (2,))
+                conn.commit()
+                sql, params = services._queue_search_candidate_query(window)
+                candidate_ids = [row[0] for row in conn.execute(sql, params)]
+        finally:
+            conn.close()
+
+        self.assertIsNone(window.floor_processed_at)
+        self.assertEqual(window.floor_event_id, 1)
+        self.assertEqual(candidate_ids, [3, 1])
+        self.assertNotIn(0, candidate_ids)
+
+    def test_queue_search_rejects_watermark_outside_sqlite_integer_range(self):
+        payload = json.dumps(
+            {
+                "p": format_utc_timestamp(datetime.now(timezone.utc)),
+                "i": 1,
+                "s": 10**100,
+                "f": {
+                    "p": format_utc_timestamp(datetime.now(timezone.utc)),
+                    "i": 1,
+                },
+                "l": 3,
+                "n": 3,
+                "t": False,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        client = TestClient(dashboard.app, raise_server_exceptions=False)
+        try:
+            response = client.get(
+                "/api/v1/verdicts",
+                params={"signature": "Signature", "cursor": cursor},
+                headers=self.host,
+            )
+        finally:
+            client.close()
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"], "invalid cursor")
+
+    def test_queue_rejects_event_id_outside_sqlite_integer_range(self):
+        payload = json.dumps(
+            {
+                "p": format_utc_timestamp(datetime.now(timezone.utc)),
+                "i": 10**100,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        client = TestClient(dashboard.app, raise_server_exceptions=False)
+        try:
+            response = client.get(
+                "/api/v1/verdicts",
+                params={"cursor": cursor},
+                headers=self.host,
+            )
+        finally:
+            client.close()
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"], "invalid cursor")
 
     def test_queue_search_time_budget_fails_closed_without_affecting_plain_queue(self):
         with patch.object(
@@ -2153,6 +2366,13 @@ class InvestigationScaleTests(unittest.TestCase):
             conn.close()
         return [str(row[-1]) for row in rows]
 
+    def queue_search_window(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return services._new_queue_search_window(conn)
+        finally:
+            conn.close()
+
     def assertNoUnboundedEventScan(self, steps):
         # Deliberately not an exact plan match: SQLite is free to change how it
         # words or orders a plan. What must hold is that triage_events is never
@@ -2201,7 +2421,7 @@ class InvestigationScaleTests(unittest.TestCase):
         services._apply_queue_search_bound(
             where,
             params,
-            max_event_id=self.ROW_COUNT,
+            window=self.queue_search_window(),
         )
         steps = self.plan_for(
             f"""{services._VERDICT_SELECT}
@@ -2234,7 +2454,7 @@ class InvestigationScaleTests(unittest.TestCase):
         services._apply_queue_search_bound(
             where,
             params,
-            max_event_id=self.ROW_COUNT,
+            window=self.queue_search_window(),
         )
         steps = self.plan_for(
             f"""{services._VERDICT_SELECT}
