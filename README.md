@@ -118,6 +118,24 @@ docker compose up -d        # Docker Compose v2+
 
 You'll need [Ollama](https://ollama.com) running somewhere reachable on your network, with at least one compatible model pulled. The Ollama instance can be on the same host or a separate GPU node.
 
+### Enable the configuration workspace
+
+Configuration access uses a dedicated attributable key rather than the
+dashboard feedback cookie. Generate its plaintext and Compose-safe hash record
+from a private terminal:
+
+```bash
+python scripts/generate_api_key.py
+```
+
+Save the plaintext key when it is shown—it is not stored and cannot be shown
+again. Copy the generated single-quoted `TRIAGEWALL_API_KEYS` assignment into
+`.env`, set `TRIAGEWALL_CONFIG_WRITES_ENABLED=true`, and restart the dashboard
+with `docker compose up -d`. Enter the plaintext key at `/configuration`.
+Existing API-key records must be retained and separated from the generated
+record by a comma inside the same quotes. See [the API authentication guide](docs/api.md#configuring-a-key)
+for custom names, scopes, and the security boundary.
+
 ### Serialized database startup
 
 Docker Compose runs a one-shot `migrate` service before dashboard, Suricata

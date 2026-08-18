@@ -4,6 +4,15 @@ All notable changes to Triagewall are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Queue search now accepts an exact source or destination IP address and a
+  historical source or destination asset hostname, while preserving signature
+  search and saved `signature` query URLs.
+- A guided, standard-library-only API-key generator now produces an
+  attributable `config:write` key and a Compose-safe hash-only `.env` entry for
+  the configuration workspace.
+
 ## [v0.3](https://github.com/aaronphifer/triagewall/releases/tag/v0.3) - 2026-08-09
 
 ### Added
