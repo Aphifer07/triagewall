@@ -1126,6 +1126,9 @@ def fetch_investigation(
             where=list(where),
             params=list(params),
         )
+    encoded_search_window = (
+        encode_search_window(search_window) if search_window is not None else None
+    )
 
     return {
         "generated_at": utc_now_iso(),
@@ -1134,6 +1137,7 @@ def fetch_investigation(
         "window_start": window_start,
         "recurrence": recurrence,
         "related": groups,
+        "search_window": encoded_search_window,
         "neighbors": {
             "previous": _neighbor_row_to_dict(previous_row),
             "next": _neighbor_row_to_dict(next_row),

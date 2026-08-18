@@ -1146,6 +1146,25 @@ async function loadInvestigation(eventId, navigation) {
     if (!response.ok) throw new Error(`Investigation request failed (${response.status})`);
     const data = await response.json();
     if (!detailRequestIsCurrent(generation, eventId)) return;
+    const responseSearchWindow = typeof data.search_window === "string"
+      ? data.search_window
+      : null;
+    if (
+      Boolean(normalizedSignature(filter.signature))
+      !== Boolean(responseSearchWindow)
+    ) {
+      throw new Error("Investigation search returned invalid window state");
+    }
+    // A direct searched detail has no queue token to carry in. Publish the
+    // freshly captured identity only after this response still owns the route,
+    // then bind it to both the live detail session and this history entry so
+    // Previous/Next and Back/Forward cannot silently recapture a newer window.
+    detailSearchWindow = responseSearchWindow;
+    window.history.replaceState(
+      { ...(window.history.state ?? {}), searchWindow: responseSearchWindow },
+      "",
+      `${window.location.pathname}${window.location.search}`,
+    );
     activeInvestigation = data;
     renderInvestigation(data);
     renderDetailNavigation(data.neighbors);

@@ -1081,6 +1081,30 @@ class ApiV1Tests(unittest.TestCase):
         self.assertEqual(neighbors["next"]["id"], 3)
         self.assertEqual(neighbors["search_scope"], queue["search_scope"])
 
+    def test_investigation_returns_the_search_window_it_captures(self):
+        with patch.object(
+            services,
+            "MAX_QUEUE_SEARCH_CANDIDATE_ROWS",
+            2,
+            create=True,
+        ):
+            searched = self.client.get(
+                "/api/v1/verdicts/2/investigation",
+                params={"signature": "Signature"},
+                headers=self.host,
+            )
+            unsearched = self.client.get(
+                "/api/v1/verdicts/2/investigation",
+                headers=self.host,
+            )
+
+        self.assertEqual(searched.status_code, 200)
+        token = searched.json()["search_window"]
+        self.assertIsInstance(token, str)
+        decoded = services.decode_search_window(token)
+        self.assertEqual(decoded.scope(), searched.json()["neighbors"]["search_scope"])
+        self.assertIsNone(unsearched.json()["search_window"])
+
     def test_investigation_search_window_does_not_backfill_after_retention(self):
         conn = sqlite3.connect(self.db_path)
         try:

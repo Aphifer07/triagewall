@@ -281,6 +281,7 @@ class InvestigationResponse(BaseModel):
     recurrence: RecurrenceSummary
     related: list[RelatedGroup]
     neighbors: QueueNeighbors
+    search_window: str | None = None
 
 
 class TimelineBucket(BaseModel):

@@ -208,8 +208,17 @@ function runDashboard({
     const investigation = target.match(/\/api\/v1\/verdicts\/(\d+)\/investigation/);
     if (investigation) {
       const id = Number(investigation[1]);
+      const params = new URL(target, "http://localhost").searchParams;
+      const responseSearchWindow = params.has("signature")
+        ? (params.get("search_window") ?? (
+            typeof searchWindow === "function"
+              ? searchWindow(params, { eventId: id })
+              : searchWindow
+          ))
+        : null;
       return {
         window_hours: 24,
+        search_window: responseSearchWindow,
         recurrence: {
           available: true,
           signature_id: id,
@@ -422,6 +431,7 @@ function runDashboard({
     queueSearchScope,
     queueSearchWindow,
     detailSearchWindow,
+    historySearchWindow: window.history.state?.searchWindow ?? null,
     browsingHistory,
     focusedIndex,
   }),
@@ -1347,6 +1357,52 @@ test("searched detail navigation keeps the queue search window", async () => {
     .filter((url) => url.includes("/api/v1/verdicts/100/investigation"))
     .at(-1);
   assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("search_window"), searchWindow);
+});
+
+test("a direct searched detail persists its captured window for navigation", async () => {
+  const searchWindow = "window-captured-by-investigation";
+  const harness = runDashboard({
+    pathname: "/triage/100",
+    search: "?model=llm&signature=scan",
+    searchWindow,
+  });
+  await harness.settle();
+
+  let state = harness.api.state();
+  assert.equal(state.detailSearchWindow, searchWindow);
+  assert.equal(state.historySearchWindow, searchWindow);
+
+  harness.document.getElementById("nextAlertButton").dispatch("click", {});
+  await harness.settle();
+  const investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/investigation"))
+    .at(-1);
+  assert.equal(
+    new URL(`http://localhost${investigation}`).searchParams.get("search_window"),
+    searchWindow,
+  );
+  state = harness.api.state();
+  assert.equal(state.detailSearchWindow, searchWindow);
+});
+
+test("a superseded investigation cannot publish its captured window", async () => {
+  const harness = runDashboard({
+    pathname: "/triage/5",
+    search: "?model=llm&signature=scan",
+    searchWindow: (_params, { eventId }) => `window-${eventId}`,
+    defer: (url) => url.includes("/api/v1/verdicts/5/investigation"),
+  });
+  await harness.settle();
+
+  await harness.api.open(6);
+  await harness.settle();
+  assert.equal(harness.api.state().detailSearchWindow, "window-6");
+
+  harness.releaseDeferred();
+  await harness.settle();
+  assert.equal(harness.api.state().detailSearchWindow, "window-6");
+  assert.equal(harness.api.state().historySearchWindow, "window-6");
 });
 
 test("a superseded search response cannot replace the current search window", async () => {

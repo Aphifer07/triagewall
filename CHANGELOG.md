@@ -15,7 +15,9 @@ All notable changes to Triagewall are documented in this file.
   retention removes rows, and alert-detail Previous/Next navigation reuses the
   queue's opaque window identity instead of silently capturing a newer scope.
   Both ends of that window are indexable, so resuming it does not walk alerts
-  that arrived later; whitespace-only terms are treated as no search.
+  that arrived later; direct searched detail links retain the window they
+  capture for Previous/Next, and whitespace-only terms are treated as no
+  search.
 - A guided, standard-library-only API-key generator now produces an
   attributable `config:write` key and a Compose-safe hash-only `.env` entry for
   the configuration workspace.

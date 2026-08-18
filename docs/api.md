@@ -233,13 +233,14 @@ and an out-of-bound `hours` return **422**.
 When `signature` search is active, pass the queue response's `search_window` to
 preserve its immutable candidate boundary while opening alert details. Without
 that optional context (for example, on a direct link), investigation captures a
-fresh window. `neighbors.search_scope` reports the window used; previous and
-next never escape it. A `search_window` without `signature`, or a malformed
-value, returns **422**. The same three-second progress deadline applies to the
-search-aware neighbor query.
+fresh window and returns its opaque identity as top-level `search_window` for
+subsequent detail navigation. `neighbors.search_scope` reports the window used;
+previous and next never escape it. A `search_window` without `signature`, or a
+malformed value, returns **422**. The same three-second progress deadline
+applies to the search-aware neighbor query.
 
 Response: `{generated_at, mode, event_id, window_hours, window_start,
-recurrence, related, neighbors}`.
+recurrence, related, neighbors, search_window}`.
 
 **`recurrence`** counts events sharing this alert's `(source type, signature
 id)` inside the bounded candidate set. The source qualifier is load-bearing:
