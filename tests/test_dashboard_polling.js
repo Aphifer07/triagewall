@@ -1413,6 +1413,31 @@ test("clearing queue search drops its window before opening detail", async () =>
   assert.equal(new URL(`http://localhost${investigation}`).searchParams.get("search_window"), null);
 });
 
+test("whitespace-only queue search is omitted from queue and investigation requests", async () => {
+  const harness = runDashboard({
+    pathname: "/triage",
+    search: "?model=llm&signature=%20%20%20",
+    searchWindow: "window-that-must-not-be-used",
+  });
+  await harness.settle();
+
+  const queueRequest = harness.fetchCalls
+    .map(({ url }) => url)
+    .find((url) => url.includes("/api/v1/verdicts?"));
+  assert.equal(new URL(`http://localhost${queueRequest}`).searchParams.get("signature"), null);
+  assert.equal(harness.api.state().queueSearchWindow, null);
+
+  await harness.api.open(100);
+  await harness.settle();
+  const investigation = harness.fetchCalls
+    .map(({ url }) => url)
+    .filter((url) => url.includes("/api/v1/verdicts/100/investigation"))
+    .at(-1);
+  const params = new URL(`http://localhost${investigation}`).searchParams;
+  assert.equal(params.get("signature"), null);
+  assert.equal(params.get("search_window"), null);
+});
+
 test("a stale queue feedback completion cannot reload a newly opened alert", async () => {
   const harness = runDashboard({
     pathname: "/triage",

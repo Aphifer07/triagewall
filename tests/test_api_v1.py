@@ -523,6 +523,37 @@ class ApiV1Tests(unittest.TestCase):
             },
         )
 
+    def test_whitespace_only_search_is_the_unfiltered_queue_and_investigation(self):
+        plain_queue = self.client.get("/api/v1/verdicts", headers=self.host)
+        whitespace_queue = self.client.get(
+            "/api/v1/verdicts",
+            params={"signature": "   "},
+            headers=self.host,
+        )
+
+        self.assertEqual(whitespace_queue.status_code, 200)
+        self.assertEqual(
+            whitespace_queue.json()["verdicts"],
+            plain_queue.json()["verdicts"],
+        )
+        self.assertIsNone(whitespace_queue.json()["search_scope"])
+        self.assertIsNone(whitespace_queue.json()["search_window"])
+
+        plain_investigation = self.client.get(
+            "/api/v1/verdicts/2/investigation",
+            headers=self.host,
+        )
+        whitespace_investigation = self.client.get(
+            "/api/v1/verdicts/2/investigation",
+            params={"signature": "   "},
+            headers=self.host,
+        )
+        self.assertEqual(whitespace_investigation.status_code, 200)
+        self.assertEqual(
+            whitespace_investigation.json()["neighbors"],
+            plain_investigation.json()["neighbors"],
+        )
+
     def test_queue_search_pagination_cannot_escape_the_candidate_window(self):
         conn = sqlite3.connect(self.db_path)
         try:
@@ -818,6 +849,70 @@ class ApiV1Tests(unittest.TestCase):
         self.assertEqual(candidate_ids, [3, 1])
         self.assertNotIn(0, candidate_ids)
 
+    def test_queue_search_window_can_span_timestamped_and_null_rows(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            stamp = format_utc_timestamp(datetime.now(timezone.utc))
+            conn.execute(
+                "UPDATE triage_events SET processed_at = NULL WHERE id = 1"
+            )
+            conn.execute(
+                "UPDATE triage_events SET processed_at = ? WHERE id IN (2, 3)",
+                (stamp,),
+            )
+            conn.execute(
+                """
+                INSERT INTO triage_events (
+                    id, timestamp, signature_id, signature, raw_alert, verdict,
+                    confidence, reasoning, model_used, processed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    0,
+                    stamp,
+                    4003,
+                    "Signature older null",
+                    "{}",
+                    "real",
+                    0.9,
+                    "reason",
+                    "test-llm",
+                ),
+            )
+            conn.commit()
+            with patch.object(services, "MAX_QUEUE_SEARCH_CANDIDATE_ROWS", 3):
+                window = services._new_queue_search_window(conn)
+                conn.execute(
+                    """
+                    INSERT INTO triage_events (
+                        timestamp, signature_id, signature, raw_alert, verdict,
+                        confidence, reasoning, model_used, processed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        stamp,
+                        4004,
+                        "Signature later arrival",
+                        "{}",
+                        "real",
+                        0.9,
+                        "reason",
+                        "test-llm",
+                        stamp,
+                    ),
+                )
+                conn.commit()
+                sql, params = services._queue_search_candidate_query(window)
+                candidate_ids = [row[0] for row in conn.execute(sql, params)]
+        finally:
+            conn.close()
+
+        self.assertEqual(window.ceiling_event_id, 3)
+        self.assertEqual(window.floor_event_id, 1)
+        self.assertIsNone(window.floor_processed_at)
+        self.assertEqual(candidate_ids, [3, 2, 1])
+
     def test_queue_search_rejects_watermark_outside_sqlite_integer_range(self):
         payload = json.dumps(
             {
@@ -1076,6 +1171,8 @@ class ApiV1Tests(unittest.TestCase):
     def test_empty_search_window_round_trips(self):
         window = services.QueueSearchWindow(
             max_event_id=0,
+            ceiling_processed_at=None,
+            ceiling_event_id=None,
             floor_processed_at=None,
             floor_event_id=None,
             candidate_limit=services.MAX_QUEUE_SEARCH_CANDIDATE_ROWS,
@@ -2598,6 +2695,59 @@ class InvestigationScaleTests(unittest.TestCase):
         self.assertFalse(
             any(step.startswith("SCAN events") for step in steps),
             f"search must not scan the retained event table: {steps}",
+        )
+
+    def test_resumed_search_seeks_past_events_inserted_after_its_window(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE triage_events (
+                    id INTEGER PRIMARY KEY,
+                    processed_at TEXT
+                );
+                CREATE INDEX idx_triage_processed
+                    ON triage_events(processed_at);
+                """
+            )
+            origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            conn.executemany(
+                "INSERT INTO triage_events (processed_at) VALUES (?)",
+                (
+                    (format_utc_timestamp(origin + timedelta(seconds=offset)),)
+                    for offset in range(100)
+                ),
+            )
+            with patch.object(services, "MAX_QUEUE_SEARCH_CANDIDATE_ROWS", 100):
+                window = services._new_queue_search_window(conn)
+
+            conn.executemany(
+                "INSERT INTO triage_events (processed_at) VALUES (?)",
+                (
+                    (format_utc_timestamp(origin + timedelta(seconds=offset)),)
+                    for offset in range(100, 20_100)
+                ),
+            )
+            callbacks = 0
+
+            def record_progress():
+                nonlocal callbacks
+                callbacks += 1
+                return 0
+
+            sql, params = services._queue_search_candidate_query(window)
+            conn.set_progress_handler(record_progress, 100)
+            candidate_ids = [row[0] for row in conn.execute(sql, params)]
+            conn.set_progress_handler(None, 0)
+        finally:
+            conn.close()
+
+        self.assertEqual(candidate_ids, list(range(100, 0, -1)))
+        self.assertLess(
+            callbacks,
+            100,
+            "resuming a fixed search window walked later arrivals",
         )
 
     def test_queue_search_does_not_scan_complete_asset_snapshot_history(self):

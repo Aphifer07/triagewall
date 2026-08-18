@@ -66,6 +66,8 @@ class QueueSearchWindow:
     """Complete immutable state for one paged queue-search candidate set."""
 
     max_event_id: int
+    ceiling_processed_at: str | None
+    ceiling_event_id: int | None
     floor_processed_at: str | None
     floor_event_id: int | None
     candidate_limit: int
@@ -141,6 +143,10 @@ def encode_cursor(
 def _search_window_payload(search_window: QueueSearchWindow) -> dict[str, Any]:
     return {
         "s": search_window.max_event_id,
+        "c": {
+            "p": search_window.ceiling_processed_at,
+            "i": search_window.ceiling_event_id,
+        },
         "f": {
             "p": search_window.floor_processed_at,
             "i": search_window.floor_event_id,
@@ -153,7 +159,7 @@ def _search_window_payload(search_window: QueueSearchWindow) -> dict[str, Any]:
 
 def encode_search_window(search_window: QueueSearchWindow) -> str:
     """Encode queue-search identity independently from page position."""
-    payload = {"v": 1, **_search_window_payload(search_window)}
+    payload = {"v": 2, **_search_window_payload(search_window)}
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -182,6 +188,21 @@ def _decode_opaque_payload(value: str) -> dict[str, Any]:
 
 def _search_window_from_payload(payload: dict[str, Any]) -> QueueSearchWindow:
     max_event_id = _cursor_integer(payload["s"], minimum=0)
+    ceiling = payload["c"]
+    if not isinstance(ceiling, dict) or set(ceiling) != {"p", "i"}:
+        raise ValueError("invalid search ceiling")
+    ceiling_processed_at = ceiling["p"]
+    if ceiling_processed_at is not None and not isinstance(
+        ceiling_processed_at, str
+    ):
+        raise ValueError("invalid search ceiling timestamp")
+    raw_ceiling_event_id = ceiling["i"]
+    ceiling_event_id = None
+    if raw_ceiling_event_id is not None:
+        ceiling_event_id = _cursor_integer(
+            raw_ceiling_event_id,
+            maximum=max_event_id,
+        )
     floor = payload["f"]
     if not isinstance(floor, dict) or set(floor) != {"p", "i"}:
         raise ValueError("invalid search floor")
@@ -209,12 +230,27 @@ def _search_window_from_payload(payload: dict[str, Any]) -> QueueSearchWindow:
         raise ValueError("invalid search truncation state")
     if truncated and candidates_in_scope != candidate_limit:
         raise ValueError("invalid truncated search scope")
-    if (floor_event_id is None) != (candidates_in_scope == 0):
-        raise ValueError("search floor does not match candidate scope")
-    if floor_event_id is None and floor_processed_at is not None:
-        raise ValueError("empty search window has a timestamp floor")
+    empty = candidates_in_scope == 0
+    if (ceiling_event_id is None) != empty or (floor_event_id is None) != empty:
+        raise ValueError("search boundaries do not match candidate scope")
+    if empty:
+        if ceiling_processed_at is not None or floor_processed_at is not None:
+            raise ValueError("empty search window has timestamp boundaries")
+    elif ceiling_processed_at is None:
+        if floor_processed_at is not None or ceiling_event_id < floor_event_id:
+            raise ValueError("invalid null-timestamp search boundaries")
+    elif floor_processed_at is not None and (
+        ceiling_processed_at,
+        ceiling_event_id,
+    ) < (
+        floor_processed_at,
+        floor_event_id,
+    ):
+        raise ValueError("search ceiling precedes floor")
     return QueueSearchWindow(
         max_event_id=max_event_id,
+        ceiling_processed_at=ceiling_processed_at,
+        ceiling_event_id=ceiling_event_id,
         floor_processed_at=floor_processed_at,
         floor_event_id=floor_event_id,
         candidate_limit=candidate_limit,
@@ -228,9 +264,9 @@ def decode_search_window(value: str) -> QueueSearchWindow:
     try:
         payload = _decode_opaque_payload(value)
         if (
-            set(payload) != {"v", "s", "f", "l", "n", "t"}
+            set(payload) != {"v", "s", "c", "f", "l", "n", "t"}
             or type(payload["v"]) is not int
-            or payload["v"] != 1
+            or payload["v"] != 2
         ):
             raise ValueError("invalid search window payload")
         return _search_window_from_payload(payload)
@@ -247,7 +283,7 @@ def decode_cursor(
         processed_at = payload.get("p")
         if processed_at is not None and not isinstance(processed_at, str):
             raise ValueError("invalid processed_at")
-        search_keys = {"s", "f", "l", "n", "t"}
+        search_keys = {"s", "c", "f", "l", "n", "t"}
         present_search_keys = search_keys.intersection(payload)
         search_window = None
         if present_search_keys:
@@ -275,14 +311,14 @@ def build_verdict_filters(
     if verdict in ("real", "false_positive", "uncertain"):
         where.append("events.verdict = ?")
         params.append(verdict)
-    if signature:
+    term = _normalized_queue_search(signature)
+    if term:
         # ``signature`` is retained as the public parameter name for existing
         # clients and bookmarked queue URLs, but the workbench search now also
         # resolves exact source/destination addresses and immutable asset
         # hostnames. Private fields participate only when the response policy
         # would reveal them; demo and IP-redacted callers must not gain a
         # membership oracle through an otherwise empty result set.
-        term = signature.strip()
         clauses = ["events.signature LIKE ?"]
         search_params: list[Any] = [f"%{term}%"]
         normalized_ip = None
@@ -337,6 +373,11 @@ def build_verdict_filters(
     return where, params
 
 
+def _normalized_queue_search(signature: str | None) -> str:
+    """Return the effective queue term; whitespace alone means no search."""
+    return signature.strip() if signature else ""
+
+
 _QUEUE_SEARCH_ORDER = (
     "search_events.processed_at DESC NULLS LAST, search_events.id DESC"
 )
@@ -365,9 +406,18 @@ def _new_queue_search_window(
     ).fetchall()
     truncated = len(rows) > candidate_limit
     candidates = rows[:candidate_limit]
+    ceiling_processed_at = None
+    ceiling_event_id = None
     floor_processed_at = None
     floor_event_id = None
     if candidates:
+        ceiling = candidates[0]
+        ceiling_processed_at = ceiling["processed_at"] if isinstance(
+            ceiling, sqlite3.Row
+        ) else ceiling[0]
+        ceiling_event_id = int(
+            ceiling["id"] if isinstance(ceiling, sqlite3.Row) else ceiling[1]
+        )
         floor = candidates[-1]
         floor_processed_at = floor["processed_at"] if isinstance(
             floor, sqlite3.Row
@@ -377,6 +427,8 @@ def _new_queue_search_window(
         )
     return QueueSearchWindow(
         max_event_id=max_event_id,
+        ceiling_processed_at=ceiling_processed_at,
+        ceiling_event_id=ceiling_event_id,
         floor_processed_at=floor_processed_at,
         floor_event_id=floor_event_id,
         candidate_limit=candidate_limit,
@@ -391,35 +443,52 @@ def _queue_search_candidate_query(
     """Build the candidate-id query for one captured search window."""
     clauses = ["search_events.id <= ?"]
     params: list[Any] = [window.max_event_id]
-    if window.floor_event_id is not None:
-        if window.floor_processed_at is None:
-            clauses.append(
-                """(
-                    search_events.processed_at IS NOT NULL
-                    OR (
-                        search_events.processed_at IS NULL
-                        AND search_events.id >= ?
-                    )
-                )"""
+    if window.ceiling_event_id is None:
+        clauses.append("0")
+    elif window.ceiling_processed_at is None:
+        clauses.extend(
+            (
+                "search_events.processed_at IS NULL",
+                "search_events.id <= ?",
+                "search_events.id >= ?",
             )
-            params.append(window.floor_event_id)
-        else:
-            clauses.append(
-                """(
-                    search_events.processed_at > ?
-                    OR (
-                        search_events.processed_at = ?
-                        AND search_events.id >= ?
-                    )
-                )"""
-            )
-            params.extend(
+        )
+        params.extend((window.ceiling_event_id, window.floor_event_id))
+    elif window.floor_processed_at is None:
+        clauses.append(
+            """(
                 (
-                    window.floor_processed_at,
-                    window.floor_processed_at,
-                    window.floor_event_id,
+                    search_events.processed_at IS NOT NULL
+                    AND (search_events.processed_at, search_events.id) <= (?, ?)
                 )
+                OR (
+                    search_events.processed_at IS NULL
+                    AND search_events.id >= ?
+                )
+            )"""
+        )
+        params.extend(
+            (
+                window.ceiling_processed_at,
+                window.ceiling_event_id,
+                window.floor_event_id,
             )
+        )
+    else:
+        clauses.extend(
+            (
+                "(search_events.processed_at, search_events.id) <= (?, ?)",
+                "(search_events.processed_at, search_events.id) >= (?, ?)",
+            )
+        )
+        params.extend(
+            (
+                window.ceiling_processed_at,
+                window.ceiling_event_id,
+                window.floor_processed_at,
+                window.floor_event_id,
+            )
+        )
     params.append(window.candidate_limit)
     return (
         f"""SELECT search_events.id
@@ -536,7 +605,7 @@ def fetch_verdicts(
         review,
         include_private_search=include_private_search,
     )
-    search_enabled = bool(signature) and bounded_search
+    search_enabled = bool(_normalized_queue_search(signature)) and bounded_search
     cursor_position = None
     cursor_search_window = None
     if cursor:
@@ -1026,15 +1095,16 @@ def fetch_investigation(
             }
         )
 
+    effective_signature = _normalized_queue_search(signature)
     where, params = build_verdict_filters(
         verdict,
-        signature,
+        effective_signature,
         model,
         source,
         review,
         include_private_search=include_private_search,
     )
-    search_enabled = bool(signature)
+    search_enabled = bool(effective_signature)
     if search_window is not None and not search_enabled:
         raise HTTPException(status_code=422, detail="search window requires search")
     if search_enabled:
@@ -1069,7 +1139,7 @@ def fetch_investigation(
             "next": _neighbor_row_to_dict(next_row),
             "filters": {
                 "verdict": verdict,
-                "signature": signature,
+                "signature": effective_signature or None,
                 "model": model,
                 "source": source,
                 "review": review,

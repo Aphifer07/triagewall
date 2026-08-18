@@ -165,6 +165,8 @@ the current inventory never rewrites historical search results. IP and asset
 matching are disabled in demo mode and whenever
 `TRIAGEWALL_API_REDACT_IPS=true`; a disclosure policy that withholds those
 values must not expose them through a search-result membership oracle.
+Surrounding whitespace is ignored; a whitespace-only value is the same as
+omitting `signature` and does not activate a bounded search window.
 
 Search evaluates every documented predicate inside the newest 10,000 retained
 alerts. This fixed candidate window prevents an absent leading-wildcard term
@@ -178,10 +180,12 @@ progress deadline additionally interrupts an unexpectedly slow search with
 Response: `{generated_at, mode, verdicts, next_cursor, search_scope,
 search_window}`. Pass `next_cursor` as `cursor` for the next page. Cursor is opaque over
 `(processed_at, id)`. A search cursor also carries the complete initial window:
-its insertion watermark, oldest candidate floor, and disclosed scope. Later
-pages therefore stay inside that initial newest-event candidate set. New alerts
-are excluded; retention can remove initial candidates but cannot pull an older
-alert into their place. Starting a fresh search observes the current live queue.
+its insertion watermark, newest candidate ceiling, oldest candidate floor, and
+disclosed scope. Those indexable boundaries let later pages seek directly into
+the original candidate range, so work does not grow with alerts inserted after
+page one. New alerts are excluded; retention can remove initial candidates but
+cannot pull an older alert into their place. Starting a fresh search observes
+the current live queue.
 `search_window` is a separate opaque identity returned on every searched page,
 including a one-page result with no `next_cursor`. Pass it to investigation when
 Previous/Next must remain inside the exact queue window the analyst loaded.

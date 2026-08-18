@@ -110,7 +110,9 @@ function initializeView() {
   };
   const detailMatch = window.location.pathname.match(/^\/triage\/(\d+)$/);
   currentView = detailMatch ? "detail" : (viewByPath[window.location.pathname] ?? "triage");
-  const routedSearch = new URLSearchParams(window.location.search).get("signature");
+  const routedSearch = normalizedSignature(
+    new URLSearchParams(window.location.search).get("signature"),
+  );
   detailSearchWindow = currentView === "detail" && routedSearch
     && typeof window.history.state?.searchWindow === "string"
     ? window.history.state.searchWindow
@@ -157,7 +159,7 @@ function syncFilterControls() {
 function readFilterParam(params, key) {
   const value = params.get(key);
   if (value == null) return null;
-  if (key === "signature") return value.slice(0, 200);
+  if (key === "signature") return normalizedSignature(value.slice(0, 200));
   // An explicit All maps back onto the internal no-model-filter state.
   if (key === "model" && value === MODEL_ALL_PARAM) return "";
   return VALID_FILTERS[key]?.has(value) ? value : null;
@@ -205,6 +207,7 @@ function canonicalizeTriageUrl() {
 // view instead of resetting the queue.
 // URL form of one filter. Only `model` differs from the internal value.
 function filterParamValue(key) {
+  if (key === "signature") return normalizedSignature(currentFilter.signature);
   if (key !== "model") return currentFilter[key];
   return currentFilter.model === "" ? MODEL_ALL_PARAM : currentFilter.model;
 }
@@ -361,10 +364,15 @@ function resetPagination() {
   focusedIndex = 0;
 }
 
+function normalizedSignature(value) {
+  return String(value ?? "").trim();
+}
+
 function buildVerdictParams(cursor = null) {
   const params = new URLSearchParams();
   if (currentFilter.verdict) params.set("verdict", currentFilter.verdict);
-  if (currentFilter.signature) params.set("signature", currentFilter.signature);
+  const signature = normalizedSignature(currentFilter.signature);
+  if (signature) params.set("signature", signature);
   // Internal values, not URL values: the API has no "all" model filter, so All
   // is expressed by omitting the parameter. Never send MODEL_ALL_PARAM here.
   if (currentFilter.model) params.set("model", currentFilter.model);
@@ -465,7 +473,7 @@ async function loadVerdictPage(cursor = null, append = false, request = beginQue
   const responseSearchWindow = typeof data.search_window === "string"
     ? data.search_window
     : null;
-  if (Boolean(request.filter.signature) !== Boolean(responseSearchWindow)) {
+  if (Boolean(normalizedSignature(request.filter.signature)) !== Boolean(responseSearchWindow)) {
     throw new Error("Decision search returned invalid window state");
   }
   if (append && responseSearchWindow !== queueSearchWindow) {
@@ -1121,9 +1129,12 @@ async function loadInvestigation(eventId, navigation) {
   const params = new URLSearchParams();
   for (const key of FILTER_KEYS) {
     // Internal values: All omits the model parameter rather than sending it.
-    if (filter[key]) params.set(key, filter[key]);
+    const value = key === "signature"
+      ? normalizedSignature(filter[key])
+      : filter[key];
+    if (value) params.set(key, value);
   }
-  if (filter.signature && searchWindow) {
+  if (normalizedSignature(filter.signature) && searchWindow) {
     params.set("search_window", searchWindow);
   }
   try {
