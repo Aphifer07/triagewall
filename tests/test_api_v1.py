@@ -571,6 +571,92 @@ class ApiV1Tests(unittest.TestCase):
         self.assertEqual(seen, [1, 2, 3])
         self.assertIsNone(cursor)
 
+    def test_queue_search_pagination_keeps_initial_window_when_alerts_arrive(self):
+        with patch.object(
+            services,
+            "MAX_QUEUE_SEARCH_CANDIDATE_ROWS",
+            3,
+            create=True,
+        ):
+            first = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": "Signature", "limit": 1},
+                headers=self.host,
+            ).json()
+            seen = [row["id"] for row in first["verdicts"]]
+            cursor = first["next_cursor"]
+            scopes = [first["search_scope"]]
+
+            conn = sqlite3.connect(self.db_path)
+            try:
+                newest = datetime.now(timezone.utc) + timedelta(hours=1)
+                inserted = conn.execute(
+                    """
+                    INSERT INTO triage_events (
+                        timestamp, signature_id, signature, raw_alert, verdict,
+                        confidence, reasoning, model_used, processed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        format_utc_timestamp(newest),
+                        3000,
+                        "Signature inserted after page one",
+                        "{}",
+                        "real",
+                        0.9,
+                        "reason",
+                        "test-llm",
+                        format_utc_timestamp(newest),
+                    ),
+                )
+                inserted_id = int(inserted.lastrowid)
+                conn.commit()
+            finally:
+                conn.close()
+
+            while cursor is not None:
+                page = self.client.get(
+                    "/api/v1/verdicts",
+                    params={
+                        "signature": "Signature",
+                        "limit": 1,
+                        "cursor": cursor,
+                    },
+                    headers=self.host,
+                ).json()
+                seen.extend(row["id"] for row in page["verdicts"])
+                scopes.append(page["search_scope"])
+                cursor = page["next_cursor"]
+
+            fresh = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": "Signature", "limit": 1},
+                headers=self.host,
+            ).json()
+
+        self.assertEqual(seen, [1, 2, 3])
+        self.assertTrue(all(scope == scopes[0] for scope in scopes))
+        self.assertEqual(fresh["verdicts"][0]["id"], inserted_id)
+
+    def test_queue_search_rejects_cursor_without_candidate_boundary(self):
+        plain = self.client.get(
+            "/api/v1/verdicts",
+            params={"limit": 1},
+            headers=self.host,
+        ).json()
+        response = self.client.get(
+            "/api/v1/verdicts",
+            params={
+                "signature": "Signature",
+                "limit": 1,
+                "cursor": plain["next_cursor"],
+            },
+            headers=self.host,
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"], "invalid search cursor")
+
     def test_queue_search_time_budget_fails_closed_without_affecting_plain_queue(self):
         with patch.object(
             services,
@@ -2112,7 +2198,11 @@ class InvestigationScaleTests(unittest.TestCase):
             None,
             include_private_search=True,
         )
-        services._apply_queue_search_bound(where, params)
+        services._apply_queue_search_bound(
+            where,
+            params,
+            max_event_id=self.ROW_COUNT,
+        )
         steps = self.plan_for(
             f"""{services._VERDICT_SELECT}
                 WHERE {" AND ".join(where)}
@@ -2141,7 +2231,11 @@ class InvestigationScaleTests(unittest.TestCase):
             None,
             include_private_search=True,
         )
-        services._apply_queue_search_bound(where, params)
+        services._apply_queue_search_bound(
+            where,
+            params,
+            max_event_id=self.ROW_COUNT,
+        )
         steps = self.plan_for(
             f"""{services._VERDICT_SELECT}
                 WHERE {" AND ".join(where)}

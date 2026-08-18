@@ -104,15 +104,20 @@ def hash_ip(ip: str | None, secret: bytes | None = None) -> str | None:
     return pseudonymize_ip(ip, secret)
 
 
-def encode_cursor(processed_at: str | None, event_id: int) -> str:
-    payload = json.dumps(
-        {"p": processed_at, "i": event_id},
-        separators=(",", ":"),
-    )
+def encode_cursor(
+    processed_at: str | None,
+    event_id: int,
+    *,
+    search_max_id: int | None = None,
+) -> str:
+    cursor_payload: dict[str, Any] = {"p": processed_at, "i": event_id}
+    if search_max_id is not None:
+        cursor_payload["s"] = search_max_id
+    payload = json.dumps(cursor_payload, separators=(",", ":"))
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def decode_cursor(cursor: str) -> tuple[str | None, int]:
+def decode_cursor(cursor: str) -> tuple[str | None, int, int | None]:
     try:
         padding = "=" * (-len(cursor) % 4)
         raw = base64.urlsafe_b64decode(cursor + padding)
@@ -121,7 +126,14 @@ def decode_cursor(cursor: str) -> tuple[str | None, int]:
         processed_at = payload.get("p")
         if processed_at is not None and not isinstance(processed_at, str):
             raise ValueError("invalid processed_at")
-        return processed_at, event_id
+        search_max_id = None
+        if "s" in payload:
+            if isinstance(payload["s"], bool):
+                raise ValueError("invalid search boundary")
+            search_max_id = int(payload["s"])
+            if search_max_id < 1:
+                raise ValueError("invalid search boundary")
+        return processed_at, event_id, search_max_id
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
         raise HTTPException(status_code=422, detail="invalid cursor") from exc
 
@@ -205,18 +217,30 @@ def build_verdict_filters(
 _QUEUE_SEARCH_CANDIDATE_IDS_SQL = """
 SELECT search_events.id
 FROM triage_events AS search_events INDEXED BY idx_triage_processed
+WHERE search_events.id <= ?
 ORDER BY search_events.processed_at DESC NULLS LAST, search_events.id DESC
 LIMIT ?
 """
 
 
-def _queue_search_scope(conn: sqlite3.Connection) -> dict[str, Any]:
+def _queue_search_max_id(conn: sqlite3.Connection) -> int:
+    """Return the insertion watermark that freezes one search's candidates."""
+    row = conn.execute("SELECT MAX(id) AS max_id FROM triage_events").fetchone()
+    value = row["max_id"] if isinstance(row, sqlite3.Row) else row[0]
+    return int(value) if value is not None else 0
+
+
+def _queue_search_scope(
+    conn: sqlite3.Connection,
+    *,
+    max_event_id: int,
+) -> dict[str, Any]:
     """Describe the fixed newest-event window used by queue search."""
     candidate_limit = MAX_QUEUE_SEARCH_CANDIDATE_ROWS
     row = conn.execute(
         f"""SELECT COUNT(*) AS candidate_count
             FROM ({_QUEUE_SEARCH_CANDIDATE_IDS_SQL})""",
-        (candidate_limit + 1,),
+        (max_event_id, candidate_limit + 1),
     ).fetchone()
     available = int(
         row["candidate_count"] if isinstance(row, sqlite3.Row) else row[0]
@@ -231,10 +255,12 @@ def _queue_search_scope(conn: sqlite3.Connection) -> dict[str, Any]:
 def _apply_queue_search_bound(
     where: list[str],
     params: list[Any],
+    *,
+    max_event_id: int,
 ) -> None:
     """Restrict filters to one fixed newest-event candidate window."""
     where.insert(0, f"events.id IN ({_QUEUE_SEARCH_CANDIDATE_IDS_SQL})")
-    params.insert(0, MAX_QUEUE_SEARCH_CANDIDATE_ROWS)
+    params[0:0] = [max_event_id, MAX_QUEUE_SEARCH_CANDIDATE_ROWS]
 
 
 @contextmanager
@@ -331,10 +357,26 @@ def fetch_verdicts(
         include_private_search=include_private_search,
     )
     search_enabled = bool(signature) and bounded_search
-    if search_enabled:
-        _apply_queue_search_bound(where, params)
+    cursor_position = None
+    cursor_search_max_id = None
     if cursor:
-        processed_at, event_id = decode_cursor(cursor)
+        processed_at, event_id, cursor_search_max_id = decode_cursor(cursor)
+        cursor_position = (processed_at, event_id)
+    search_max_id = None
+    if search_enabled:
+        if cursor_position is not None:
+            if cursor_search_max_id is None:
+                raise HTTPException(status_code=422, detail="invalid search cursor")
+            search_max_id = cursor_search_max_id
+        else:
+            search_max_id = _queue_search_max_id(conn)
+        _apply_queue_search_bound(
+            where,
+            params,
+            max_event_id=search_max_id,
+        )
+    if cursor_position is not None:
+        processed_at, event_id = cursor_position
         where.append(
             """(
                 (
@@ -366,7 +408,10 @@ def fetch_verdicts(
     search_scope = None
     with _queue_search_budget(conn, enabled=search_enabled):
         if search_enabled:
-            search_scope = _queue_search_scope(conn)
+            search_scope = _queue_search_scope(
+                conn,
+                max_event_id=search_max_id,
+            )
         rows = conn.execute(
             f"""{_VERDICT_SELECT}
                 {where_sql}
@@ -378,7 +423,11 @@ def fetch_verdicts(
     if len(rows) > limit:
         rows = rows[:limit]
         last = rows[-1]
-        next_cursor = encode_cursor(last["processed_at"], int(last["id"]))
+        next_cursor = encode_cursor(
+            last["processed_at"],
+            int(last["id"]),
+            search_max_id=search_max_id,
+        )
     elif rows:
         # Exact page with no more rows.
         next_cursor = None
@@ -805,12 +854,21 @@ def fetch_investigation(
         include_private_search=include_private_search,
     )
     search_enabled = bool(signature)
+    search_max_id = None
     if search_enabled:
-        _apply_queue_search_bound(where, params)
+        search_max_id = _queue_search_max_id(conn)
+        _apply_queue_search_bound(
+            where,
+            params,
+            max_event_id=search_max_id,
+        )
     search_scope = None
     with _queue_search_budget(conn, enabled=search_enabled):
         if search_enabled:
-            search_scope = _queue_search_scope(conn)
+            search_scope = _queue_search_scope(
+                conn,
+                max_event_id=search_max_id,
+            )
         previous_row, next_row = _fetch_neighbors(
             conn,
             anchor_id=int(anchor["id"]),

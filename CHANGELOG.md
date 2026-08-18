@@ -10,7 +10,8 @@ All notable changes to Triagewall are documented in this file.
   historical source or destination asset hostname, while preserving signature
   search and saved `signature` query URLs. It examines a disclosed window of
   the newest 10,000 retained alerts and has a three-second query fail-safe, so
-  an absent term cannot traverse the complete retained database.
+  an absent term cannot traverse the complete retained database. Search
+  cursors keep that initial candidate window stable while new alerts arrive.
 - A guided, standard-library-only API-key generator now produces an
   attributable `config:write` key and a Compose-safe hash-only `.env` entry for
   the configuration workspace.
