@@ -7,6 +7,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseDocumentationTests(unittest.TestCase):
+    def test_demo_pulls_default_model_before_starting_stack(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        demo = readme.split("## Five-minute demo", 1)[1].split("\n## ", 1)[0]
+        model_pull = (
+            "ollama pull "
+            "hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M"
+        )
+
+        self.assertIn(model_pull, demo)
+        self.assertLess(demo.index(model_pull), demo.index("docker compose up -d"))
+
     def test_v04_changelog_release_state_matches_evidence(self):
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         released = bool(

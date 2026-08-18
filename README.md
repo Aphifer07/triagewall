@@ -88,6 +88,12 @@ cd triagewall
 cp .env.example .env
 ```
 
+On the Ollama host, pull the default model before starting TriageWall:
+
+```bash
+ollama pull hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M
+```
+
 Set `DEMO_MODE=true` in `.env`, then start the stack:
 
 ```bash
