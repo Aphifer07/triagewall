@@ -5,6 +5,20 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+FOUNDATION_DOC = ROOT / "docs" / "operator-configuration-foundation.md"
+
+STALE_CURRENT_STATE_HEADING = re.compile(r"^## Current state\s*$", re.MULTILINE)
+
+HISTORICAL_HEADING = re.compile(
+    r"^## .*(pre-v0\.4|pre-implementation|historical).*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def section_after(document: str, heading: str) -> str:
+    """Return the body under ``heading`` up to the next level-two heading."""
+    return document.split(heading, 1)[1].split("\n## ", 1)[0]
+
 
 def v04_release_state_is_valid(changelog: str, evidence_exists: bool) -> bool:
     released = bool(
@@ -128,6 +142,47 @@ class ReleaseDocumentationTests(unittest.TestCase):
             section.lower(),
             "the section must distinguish persisted verdicts from "
             "checkpoint movement",
+        )
+
+
+    def test_implemented_foundation_doc_labels_its_historical_baseline(self):
+        """Once the foundation is marked implemented, the section describing the
+        old static, startup-only system must be labelled as history rather than
+        as the current runtime."""
+        document = FOUNDATION_DOC.read_text(encoding="utf-8")
+        self.assertIn(
+            "implemented in v0.4",
+            document,
+            "this invariant applies to the implemented foundation document",
+        )
+
+        self.assertNotRegex(
+            document,
+            STALE_CURRENT_STATE_HEADING,
+            "the historical static system must not be headed 'Current state'",
+        )
+
+        heading = HISTORICAL_HEADING.search(document)
+        self.assertIsNotNone(
+            heading,
+            "the document needs an explicit pre-v0.4 baseline heading",
+        )
+
+        section = section_after(document, heading.group(0))
+        self.assertRegex(
+            section,
+            r"(?is)motivat",
+            "the baseline section must say it motivated the design",
+        )
+        self.assertRegex(
+            section,
+            r"(?is)does not describe.{0,160}v0\.4",
+            "the baseline section must disclaim describing the v0.4 runtime",
+        )
+        self.assertNotRegex(
+            section,
+            r"(?i)the current implementation is",
+            "the baseline section must not present itself as current",
         )
 
 
