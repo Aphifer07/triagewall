@@ -14,6 +14,7 @@ services:
 
       DB_PATH: ${DB_PATH:-/var/lib/triagewall/triage.db}
       POLL_INTERVAL: ${WAZUH_POLL_INTERVAL:-10}
+      TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS: ${TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS:-5}
 
       OLLAMA_HOST: ${OLLAMA_HOST:-http://localhost:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M}
@@ -27,6 +28,9 @@ services:
       WAZUH_START_MODE: ${WAZUH_START_MODE:-end}
     volumes:
       - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+      # Both consumers must read the identical mounted legacy documents: each
+      # start mirrors them into the durable bundle while authority is `legacy`.
+      - ./triagewall/config/prefilter.json:/app/triagewall/config/prefilter.json:ro
       - ${HOST_ASSET_INVENTORY:-./triagewall/config/assets.example.json}:/app/triagewall/config/assets.json:ro
       - type: volume
         source: wazuh_logs
@@ -42,7 +46,7 @@ services:
     security_opt:
       - no-new-privileges:true
     depends_on:
-      migrate:
+      config-bootstrap:
         condition: service_completed_successfully
     restart: unless-stopped
 

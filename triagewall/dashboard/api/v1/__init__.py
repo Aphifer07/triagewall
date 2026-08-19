@@ -1,6 +1,16 @@
 """Pydantic models for the Triagewall API v1 contract."""
 
 from triagewall.dashboard.api.v1.models import (  # noqa: F401
+    ActiveConfigResponse,
+    ConfigAuditEntry,
+    ConfigAuditResponse,
+    ConfigDraftRequest,
+    ConfigDraftResponse,
+    ConfigRevisionMetadata,
+    ConfigRevisionResponse,
+    ConfigRevisionsResponse,
+    ConfigSummaryResponse,
+    ConfigValidationResponse,
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,

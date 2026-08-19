@@ -4,30 +4,38 @@ For the full threat model — trust assumptions, attacker model, and known limit
 
 ## Reporting a vulnerability
 
-If you've discovered a security issue in Triagewall, please report it privately rather than opening a public issue.
+If you've discovered a security issue in TriageWall, please report it privately rather than opening a public issue.
 
 **Email:** security@triagewall.io
 
 Please include:
 - A description of the issue
 - Steps to reproduce
-- The version of Triagewall affected (or commit hash if you're on `main`)
+- The version of TriageWall affected (or commit hash if you're on `main`)
 - Any mitigations you've identified
 
 I aim to acknowledge reports within 72 hours and provide a remediation timeline within 7 days.
 
 ## Supported versions
 
-During pre-release (current), only the latest commit on `main` is supported. Once v0.1 ships, supported versions will be documented here.
+Security fixes target the latest published release and the current development
+branch. Older minor releases may receive a coordinated fix when the issue can
+be backported safely, but they are not guaranteed ongoing support.
+
+| Version | Supported |
+|---|---|
+| Latest release | Yes |
+| Current development branch | Yes |
+| Older releases | Best effort |
 
 ## Deployment expectations
 
-Triagewall assumes a single trusted operator on a private network. Two points
+TriageWall assumes a single trusted operator on a private network. Two points
 are frequently misread:
 
 - **The dashboard write cookie is not user authentication.** It provides
   same-origin CSRF resistance for the built-in UI — it proves a write came from
-  a page Triagewall served, not who sent it. There is no multi-user login or
+  a page TriageWall served, not who sent it. There is no multi-user login or
   SSO. Remote access requires a VPN or an authenticated reverse proxy. Set
   `TRIAGEWALL_DASHBOARD_COOKIE_SECURE=true` for any HTTPS deployment.
 - **API IP redaction requires a secret.** With
@@ -43,7 +51,7 @@ See [docs/api.md](docs/api.md) for the recommended production settings.
 ## Scope
 
 In scope:
-- Bugs in Triagewall's ingestion, triage, or dashboard code
+- Bugs in TriageWall's ingestion, triage, or dashboard code
 - Vulnerabilities in the prefilter logic
 - Authentication or authorization issues in the HTTP API (API keys, scopes,
   dashboard write cookie) and related configuration

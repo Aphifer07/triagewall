@@ -73,6 +73,12 @@ def create_legacy_database_without_asset_columns(db_path: Path) -> None:
         "",
     )
     schema_sql = schema_sql.replace(
+        "    config_generation INTEGER,\n"
+        "    prefilter_revision TEXT,\n"
+        "    asset_revision TEXT,\n",
+        "",
+    )
+    schema_sql = schema_sql.replace(
         "    source_type TEXT NOT NULL DEFAULT 'suricata',\n",
         "",
     )
@@ -174,6 +180,9 @@ class DatabaseStartupTests(unittest.TestCase):
 
             self.assertIn("src_asset_snapshot_id", columns)
             self.assertIn("dest_asset_snapshot_id", columns)
+            self.assertIn("config_generation", columns)
+            self.assertIn("prefilter_revision", columns)
+            self.assertIn("asset_revision", columns)
             self.assertEqual(historical, (None, None))
             self.assertEqual(snapshot_table, ("asset_snapshots",))
             self.assertEqual(sensor_table, ("sensor_event_context",))
@@ -212,6 +221,49 @@ class DatabaseStartupTests(unittest.TestCase):
                 existing_row,
                 (999999, "Existing test alert", "uncertain"),
             )
+
+    def test_existing_configuration_state_receives_legacy_mode_column(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "triage.db"
+            migrations.ensure_db_initialized(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("DROP TABLE operator_config_state")
+                conn.execute(
+                    """CREATE TABLE operator_config_state (
+                           id INTEGER PRIMARY KEY CHECK (id = 1),
+                           active_prefilter_revision_id INTEGER NOT NULL,
+                           active_asset_revision_id INTEGER NOT NULL,
+                           previous_prefilter_revision_id INTEGER,
+                           previous_asset_revision_id INTEGER,
+                           generation INTEGER NOT NULL CHECK (generation >= 1),
+                           updated_at TEXT NOT NULL
+                       )"""
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "operator_config_state.mode",
+            ):
+                migrations.verify_db_initialized(db_path)
+
+            migrations.ensure_db_initialized(db_path)
+            migrations.ensure_db_initialized(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info('operator_config_state')"
+                    )
+                }
+            finally:
+                conn.close()
+            self.assertIn("mode", columns)
 
     def test_non_owner_fails_closed_on_uninitialized_database(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -259,6 +311,9 @@ class DatabaseStartupTests(unittest.TestCase):
 
             self.assertNotIn("src_asset_snapshot_id", columns)
             self.assertNotIn("dest_asset_snapshot_id", columns)
+            self.assertNotIn("config_generation", columns)
+            self.assertNotIn("prefilter_revision", columns)
+            self.assertNotIn("asset_revision", columns)
 
     def test_compose_assigns_one_migration_owner_before_consumers(self):
         base = (PROJECT_ROOT / "docker-compose.yml").read_text()
@@ -276,10 +331,20 @@ class DatabaseStartupTests(unittest.TestCase):
             1,
         )
         self.assertIn("triagewall/migrate.py", base)
+        self.assertEqual(
+            len(re.findall(r"^  config-bootstrap:$", base, flags=re.MULTILINE)),
+            1,
+        )
+        self.assertIn("triagewall/config_bootstrap.py", base)
+        self.assertIn("PACKAGED_PREFILTER_PATH", base)
+        self.assertIn("LEGACY_PREFILTER_PATH", base)
+        self.assertIn("network_mode: none", base)
         self.assertGreaterEqual(
             base.count("condition: service_completed_successfully"),
-            2,
+            3,
         )
+        self.assertGreaterEqual(base.count("config-bootstrap:"), 3)
+        self.assertIn("config-bootstrap:", wazuh)
         self.assertIn("condition: service_completed_successfully", wazuh)
         self.assertNotIn("ensure_db_initialized", ingest_source)
         self.assertNotIn("ensure_spc_schema", ingest_source)

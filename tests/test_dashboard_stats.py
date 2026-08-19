@@ -115,6 +115,10 @@ class DashboardStatsTests(unittest.TestCase):
                 "today_total": 3,
                 "today_prefilter": 1,
                 "today_llm": 2,
+                "model_real_count": 0,
+                "model_fp_count": 1,
+                "model_uncertain_count": 1,
+                "unreviewed_model_count": 0,
             },
         )
 

@@ -1,11 +1,11 @@
 # Threat model
 
 This document describes the trust assumptions and known limitations of the
-currently shipped **Triagewall Core** application. Triagewall Lab is a future
+currently shipped **TriageWall Core** application. TriageWall Lab is a future
 component with a separate threat model and graduation gate; see
 [Core and Lab product boundary](core-lab-product-boundary.md).
 
-Triagewall targets a single trusted operator running services on a private
+TriageWall targets a single trusted operator running services on a private
 homelab network. It is not a multi-tenant or internet-facing application.
 
 ## What Core does
@@ -77,7 +77,7 @@ alerts. Their goals may include:
 - hostile strings that become HTML, logs, CSV formulas, or model instructions;
 - discovery of private asset or agent context through demo responses.
 
-An adversary with code execution on the Triagewall host, control of operator
+An adversary with code execution on the TriageWall host, control of operator
 configuration, control of the trusted network between Core and Ollama, or
 control of the sensor ruleset is outside this threat model.
 
@@ -160,7 +160,7 @@ inode.
   any archive that fell outside the scan.
 - Compressed archives (`.gz`, `.bz2`, `.xz`, `.zst`) are recognised as chain
   members — they are evidence that a rotation happened and they hold their slot
-  in the ordering — but Triagewall reads `eve.json` as plain JSON-Lines and
+  in the ordering — but TriageWall reads `eve.json` as plain JSON-Lines and
   never decompresses them. A compressed file can therefore never become a read
   source or a persisted checkpoint. If the next unread archive is compressed,
   ingest fails closed with the checkpoint left on the preceding file and asks
@@ -190,9 +190,14 @@ inode.
   contents stay free-form dictionaries by design.
 - Verdict, model and timeline-interval filters are typed. An unrecognized value
   returns 422 rather than silently behaving like no filter.
-- Free-form inputs are bounded: signature search, cursor length and feedback
-  notes each have a documented maximum, so one request cannot make the database
-  or the application do unbounded work.
+- Free-form inputs are bounded: queue search, cursor length and feedback notes
+  each have a documented maximum, so one request cannot make the database or
+  the application do unbounded work. Queue search evaluates at most the newest
+  10,000 retained alerts, reports when older rows were excluded, and has a
+  three-second SQLite progress deadline as a second fail-safe. It includes
+  private IP and historical asset fields only when the response disclosure
+  policy would show them; demo and IP-redaction modes do not expose a
+  membership oracle.
 
 ### Operator-facing output
 
@@ -215,7 +220,7 @@ auto-classified without Ollama review. Contextual conditions reduce the blast
 radius, and missing required context does not match, but legacy global SID
 rules remain supported. Operators must review suppressions conservatively.
 
-**False negatives are expected.** The local model is fallible. Triagewall
+**False negatives are expected.** The local model is fallible. TriageWall
 reduces review volume; it does not replace the underlying sensor or a human
 analyst.
 
@@ -240,7 +245,7 @@ Unauthenticated reads remain available only when
 **Not every write credential identifies a user.** An API key names a caller;
 the dashboard write cookie does not. It is same-origin CSRF resistance for the
 trusted built-in interface — it establishes that a write came from a page
-Triagewall served, not who sent it, and any browser that can load the dashboard
+TriageWall served, not who sent it, and any browser that can load the dashboard
 receives one. `TRIAGEWALL_DASHBOARD_COOKIE_SECURE=true` keeps it off plaintext
 transports, but the trusted-LAN boundary is what actually protects it.
 
@@ -251,8 +256,11 @@ digest would be reversible by exhaustive search over the address space, so
 enabling redaction without a valid secret fails startup. Because the mapping is
 deterministic within a deployment — which is what makes correlation useful — an
 attacker who learns the secret can still re-identify addresses, and one who can
-observe traffic can confirm a guessed address. Demo-mode masking is separate
-and unaffected.
+observe traffic can confirm a guessed address. When this mode is enabled, API
+verdict rows also withhold free-form reasoning, operator notes, raw sensor
+records, and asset snapshots because those channels can repeat or add cleartext
+addresses outside the structured endpoint fields. Demo-mode masking is
+separate and unaffected.
 
 **Retention remains an operator-controlled maintenance action.** The bounded,
 backup-first host runner restores monitoring between short deletion pauses and
@@ -270,7 +278,7 @@ then verify the schema read-only and fail closed rather than repairing it.
 
 ## Assumptions
 
-- The Triagewall host and operator-controlled configuration are trusted.
+- The TriageWall host and operator-controlled configuration are trusted.
 - Suricata and Wazuh remain the authoritative detection and alert stores.
 - The network between Core components and Ollama is private and trusted unless
   the operator adds transport protection.

@@ -595,7 +595,7 @@ Two further boundaries must not be blurred:
 Multi-source Garak coverage requires all of the following, none of which exist:
 
 1. A pinned Garak runner and configuration, with recorded versions.
-2. A model/endpoint harness that drives the **full isolated Triagewall pipeline**
+2. A model/endpoint harness that drives the **full isolated TriageWall pipeline**
    rather than the bare model.
 3. Probe coverage of **both** projection surfaces — Suricata and Wazuh — since
    they build different prompts from different fields.

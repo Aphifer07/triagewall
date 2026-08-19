@@ -1,6 +1,6 @@
-# Triagewall Roadmap
+# TriageWall Roadmap
 
-Triagewall started as a way to make a homelab IDS usable again: reduce
+TriageWall started as a way to make a homelab IDS usable again: reduce
 thousands of Suricata alerts to the handful worth reviewing. The longer-term
 goal is a local-first **homelab security awareness platform** that surfaces
 what matters across sensors without requiring the operator to remember to
@@ -10,9 +10,9 @@ The product strategy remains consistent:
 
 - **Integrate, do not reinvent.** Suricata, Wazuh, Zeek, Pi-hole, OpenVAS, and
   Garak provide detection, collection, scanning, and adversarial probes.
-  Triagewall adds local reasoning, prioritization, correlation, and release
+  TriageWall adds local reasoning, prioritization, correlation, and release
   evidence.
-- **Keep operational triage independent.** Triagewall Core must remain useful
+- **Keep operational triage independent.** TriageWall Core must remain useful
   without optional evaluation or awareness components.
 - **Require human approval for behavior changes.** Automation may test and
   report a prompt, policy, model, or threshold change; it does not silently
@@ -149,7 +149,7 @@ and performance gate over human labels and makes no adversarial claim. The two
 fail for different reasons and need different review.
 
 - [ ] **Garak injection gate (full isolated pipeline).** Exercise the complete
-  isolated Triagewall pipeline rather than the bare model. A regression is
+  isolated TriageWall pipeline rather than the bare model. A regression is
   blocked and reported for human review. Once implemented it should run
   periodically **and before applicable future releases** — especially any
   release that changes the model, the prompts, field isolation, or the source
@@ -205,9 +205,9 @@ fail for different reasons and need different review.
   model latency only after overload, retry, ordering, and recovery semantics
   are explicit.
 
-### Triagewall Core and Lab — accepted product direction
+### TriageWall Core and Lab — accepted product direction
 
-Triagewall will mature as one product family with two independently runnable
+TriageWall will mature as one product family with two independently runnable
 applications. See
 [Core and Lab product boundary](docs/core-lab-product-boundary.md).
 
@@ -233,30 +233,131 @@ applications. See
   separation, CI, upgrade, rollback, backup, removal, and user-documentation
   gates pass. Archive the private incubation repository after import.
 
-### v0.4 — September–October 2026
+### v0.4 — Analyst workbench — August 2026
 
-The awareness layer turns disconnected sensor findings into a concise
-explanation of what changed and what deserves attention.
+Turn the alert queue into a source-aware investigation and configuration
+workbench without weakening the production boundary.
 
-- [ ] Dashboard UI refresh and visual polish, preserving the existing
-  source-aware API and security contracts
-- [ ] **Daily digest** of material events, changes, and trends
-- [ ] **Coverage-gap detection** between known assets and enrolled sensors
-- [ ] **Cross-sensor correlation** for related IPs, domains, agents, and time
-  windows
-- [ ] **Assisted prefilter suggestions** requiring explicit human approval
-- [ ] **Constrained MITRE ATT&CK mapping** backed by controlled references
-- [ ] Operator-controlled webhooks for selected high-confidence findings
+- [x] **Dashboard UI foundation.** Ship the routed overview, triage,
+  behavioural, integrity, and alert-detail surfaces while preserving the
+  source-aware API and security contracts.
+- [x] **Investigation context and correlation.** Add bounded recurrence,
+  related activity, source-specific evidence, and queue-aware navigation as
+  detailed below.
+- [x] **Versioned operator-configuration foundation.** Separate immutable
+  shipped defaults from operator revisions and add drafts, validation, bounded
+  impact preview, atomic activation, optimistic locking, last-known-good
+  recovery, rollback, and audit history. See
+  [Operator configuration foundation](docs/operator-configuration-foundation.md).
+  Persistence, authorization, immutable drafts, validation, bounded previews,
+  atomic authority cutover, generation-aware last-known-good reload, audited
+  rollback, truthful consumer health, and per-verdict bundle provenance are
+  delivered alongside the operator editors and release-hardening coverage.
+- [x] **Dedicated configuration authorization.** Keep mutation disabled by
+  default and require an attributable API key with `config:write`; the
+  dashboard feedback cookie is not administrator authentication.
+- [x] **Prefilter rule editor.** Draft scoped rules from an alert, preview the
+  exact document and bounded historical impact, warn on broad matches, and
+  require explicit activation for future events.
+- [x] **Private asset-enrichment editor.** Manage exact-IP hostname, role,
+  criticality, exposure, and port context while preserving immutable snapshots
+  used by historical verdicts.
+- [x] **Unified analyst actions.** Connect feedback, related-alert filtering,
+  rule drafting, asset editing, and bounded evidence copying from the alert
+  workbench.
+- [x] **Bounded retained-alert search.** Search by signature, exact IP address,
+  or historical asset hostname with a disclosed candidate window, query
+  deadline, stable pagination identity, and queue-aware investigation reuse.
+- [x] **Guided configuration-key onboarding.** Generate a one-time plaintext
+  key and Compose-safe hash-only `config:write` record without external
+  dependencies.
+- [x] **Release hardening.** Cover authorization, audit, concurrency, atomic
+  activation, reload failure, rollback, both sensor paths, browser behaviour,
+  field isolation, and canary regressions before tagging v0.4.
 
-### v0.5 — Late 2026
+#### Analyst investigation context — delivered
 
-Vulnerability prioritization.
+The routed alert-detail page is the first functional investigation surface. It
+reads only what TriageWall already persists; no schema change, no new index,
+and no new sensor field were introduced.
 
-- [ ] Ingest Wazuh vulnerability findings and optionally OpenVAS results
-- [ ] Explain CVEs, prioritize by asset exposure and criticality, and provide
+- [x] **Recurrence for the selected alert.** Occurrence count, first and latest
+  occurrence, and verdict distribution inside a bounded window.
+- [x] **Related activity** by rule, source address, and destination address,
+  each stating why it is related.
+- [x] **Queue-aware navigation.** The complete queue query string travels
+  through the detail page, previous/next, and the back link, and neighbours are
+  resolved server-side against every filter the list endpoint supports — so
+  previous/next now work on a deep link or refresh, which the client-side
+  implementation could not do.
+- [x] **Source-aware presentation.** Wazuh rule, agent, manager, location, and
+  decoder context is presented separately from the Suricata flow envelope.
+  Neither is forced into the other's labels.
+
+**Exact versus navigational.** All correlation views examine at most 2,000 of
+the newest events in the requested window, selected through the `processed_at`
+index. Recurrence and the same-rule group use equality on
+`(source type, signature id)` inside that candidate set. Qualifying by source
+type is required for correctness, not neatness — Suricata keeps its SID and
+Wazuh keeps `rule.id` in the same column. Their counts are exact only when the
+candidate query exhausts the window; otherwise they are partial.
+
+The address groups are navigational aids, not complete correlation. They match
+exact `src_ip` or `dest_ip` values inside the same bounded candidate set and
+remain non-causal even when the window is exhausted. The API returns
+`candidate_limit`, `candidates_examined`, and `truncated`, and the UI labels a
+truncated result as partial. Shared addressing is an observation about
+addressing; it does not establish a shared cause.
+
+**Known data limitations.** These are shown as "not recorded" rather than
+inferred:
+
+- Model latency is not persisted, so no per-decision latency can be displayed.
+- There is no per-event integrity attestation. The boundary panel describes
+  current classifier posture, not what ran for a historical row.
+- Wazuh `manager`, `location`, `decoder`, and `rule.groups` are not columns.
+  They are read from the retained sensor record, so demo mode and API
+  IP-redaction mode — which withhold that record — show them as unavailable.
+- Wazuh rows carry no `flow_id`, `in_iface`, `category`, or `action`.
+- The window is capped at 24 hours. A wider window needs a production-shaped
+  benchmark against a defined query-time budget first.
+
+**Delivered in later v0.4 slices.** The initial investigation view remained
+read-only. Configuration editing subsequently landed through the separate
+versioned subsystem described above, with dedicated authorization, previews,
+activation, rollback, concurrency controls, and audit evidence rather than
+riding on the dashboard feedback boundary.
+
+### v0.5 — Lab to production — Late 2026
+
+Measure candidate behaviour in an isolated Lab, then promote an approved
+revision into Core through an explicit audited boundary.
+
+- [ ] Complete the replay provenance needed to reproduce a decision.
+- [ ] Specify and validate sanitized event-bundle v1.
+- [ ] Build the isolated Lab runtime for replay, comparison, injection tests,
+  and gold-set evaluation without live Core access.
+- [ ] Compare baseline and candidate outcomes without collapsing distinct
+  safety and performance signals into one score.
+- [ ] Require an authenticated operator action to promote a passing candidate;
+  Lab never self-promotes.
+- [ ] Retain the previous production revision, rollback path, and audit history.
+- [ ] Prove Core-only, Lab-only, and combined installation modes.
+
+### Later awareness and vulnerability work — no release commitment
+
+- **Daily digest** of material events, changes, and trends
+- **Coverage-gap detection** between known assets and enrolled sensors
+- **Cross-sensor narratives** for related IPs, domains, agents, and time windows
+- **Assisted prefilter suggestions** requiring explicit human approval
+- **Constrained MITRE ATT&CK mapping** backed by controlled references
+- Operator-controlled webhooks for selected high-confidence findings
+- Ingest Wazuh vulnerability findings and optionally OpenVAS results
+- Explain CVEs, prioritize by asset exposure and criticality, and provide
   plain-language remediation
-- Triagewall reasons on top of mature scanners; it does not become a
-  vulnerability scanner.
+
+TriageWall reasons on top of mature sensors and scanners; it does not become a
+SIEM or vulnerability scanner.
 
 ### v1.0 — Early 2027
 
@@ -295,11 +396,11 @@ upgrade, rollback, backup, retention, observability, and security guarantees.
 ## Out of scope
 
 - **Auto-blocking or active response.** Use Wazuh Active Response or firewall
-  policy. Triagewall is decision support.
+  policy. TriageWall is decision support.
 - **Cloud LLM integration.** It conflicts with the local-first telemetry
   boundary.
 - **Endpoint-agent functionality.** Use Wazuh agents.
-- **Building another SIEM or vulnerability scanner.** Triagewall reasons over
+- **Building another SIEM or vulnerability scanner.** TriageWall reasons over
   existing sensors and scanners.
 - **Unsupervised self-tuning or auto-rollback.** Regressions are blocked and
   reported; a human decides what changes production.

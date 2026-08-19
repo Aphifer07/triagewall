@@ -29,7 +29,18 @@ def _conditional_response(
     *,
     max_age: int,
     status_code: int,
+    no_store: bool = False,
 ) -> Response:
+    if no_store:
+        # Per-event responses change the moment an operator saves feedback, so
+        # they are never stored. No validator is emitted either: an ETag would
+        # let a revalidating cache answer 304 and hand back the pre-feedback
+        # body, which is exactly the staleness this avoids.
+        return JSONResponse(
+            body,
+            status_code=status_code,
+            headers={"Cache-Control": "private, no-store"},
+        )
     etag = weak_etag_for_payload(body)
     if_none_match = request.headers.get("if-none-match")
     headers = {
@@ -71,6 +82,7 @@ def validated_json_response(
     model: type[ModelT],
     max_age: int,
     status_code: int = 200,
+    no_store: bool = False,
 ) -> Response:
     """Serve ``payload`` only after it satisfies its declared response model.
 
@@ -82,7 +94,8 @@ def validated_json_response(
     and an undocumented field or wrong type cannot reach a v1 client.
 
     Conditional (304) handling, cache headers and non-200 status codes are all
-    preserved.
+    preserved. Pass ``no_store`` for responses that a client must never reuse;
+    validation still applies, but no validator is emitted.
     """
     try:
         validated = model.model_validate(payload)
@@ -103,4 +116,5 @@ def validated_json_response(
         validated.model_dump(mode="json"),
         max_age=max_age,
         status_code=status_code,
+        no_store=no_store,
     )

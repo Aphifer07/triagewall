@@ -1,638 +1,478 @@
-<!DOCTYPE html>
-<html lang="en" class="dark">
+<!doctype html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Triagewall — Local-LLM alert triage</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  body {
-    background: #0d1117;
-    color: #c9d1d9;
-    font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
-    font-feature-settings: "ss01", "cv01", "cv02";
-  }
-  .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .card { background: #161b22; border: 1px solid #21262d; }
-  .card-hover:hover { border-color: #30363d; }
-  .v-real { color: #ff7b72; }
-  .v-false_positive { color: #7ee787; }
-  .v-uncertain { color: #d29922; }
-  .badge { padding: 2px 8px; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.02em; }
-  .badge-real { background: rgba(255,123,114,.15); color: #ff7b72; }
-  .badge-false_positive { background: rgba(126,231,135,.15); color: #7ee787; }
-  .badge-uncertain { background: rgba(210,153,34,.15); color: #d29922; }
-  .badge-prefilter { background: rgba(110,118,129,.2); color: #8b949e; border: 1px solid #30363d; }
-  .badge-llm { background: rgba(88,166,255,.15); color: #58a6ff; }
-  .badge-spc { background: rgba(163,113,247,.15); color: #a371f7; border: 1px solid rgba(163,113,247,.3); }
-  .badge-sensor { background: rgba(121,192,255,.1); color: #79c0ff; border: 1px solid rgba(121,192,255,.25); }
-  .spc-panel { border-left: 3px solid #a371f7; }
-  .spc-row { border-bottom: 1px solid #21262d; }
-  .spc-row:last-child { border-bottom: none; }
-  .spc-feature-rate { color: #d29922; }
-  .spc-feature-novel { color: #a371f7; }
-  .reasoning { font-size: 0.875rem; color: #8b949e; line-height: 1.55; }
-  .demo-banner { background: #7c2d12; color: #fff; }
-  .focused { outline: 2px solid #d29922; outline-offset: -2px; }
-  .filter-pill { background: transparent; border: 1px solid #30363d; color: #8b949e; transition: all 0.15s; }
-  .filter-pill:hover { border-color: #58a6ff; color: #c9d1d9; }
-  .filter-pill.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
-  .hero-stat { font-feature-settings: "tnum"; letter-spacing: -0.02em; }
-  .freshness {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 0.75rem;
-    color: #6e7681;
-  }
-  .freshness::before {
-    content: "";
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: #3fb950;
-    box-shadow: 0 0 8px #3fb950;
-  }
-  kbd {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-bottom-width: 2px;
-    border-radius: 4px;
-    color: #c9d1d9;
-    padding: 1px 6px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.7rem;
-  }
-  .btn-agree {
-    background: rgba(46,160,67,.15);
-    color: #3fb950;
-    border: 1px solid rgba(46,160,67,.3);
-    transition: all 0.15s;
-  }
-  .btn-agree:hover { background: rgba(46,160,67,.25); border-color: rgba(46,160,67,.5); }
-  .btn-disagree {
-    background: transparent;
-    color: #8b949e;
-    border: 1px solid #30363d;
-    transition: all 0.15s;
-  }
-  .btn-disagree:hover { color: #ff7b72; border-color: rgba(255,123,114,.4); }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="TriageWall operator console for local Suricata and Wazuh alert triage.">
+  <title>TriageWall — Operator console</title>
+  <link rel="icon" href="/static/triagewall-mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/dashboard.css">
 </head>
-<body class="min-h-screen">
-<div id="app" class="max-w-6xl mx-auto p-6">
+<body class="view-loading">
+  <div id="app" class="app-shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <a class="brand" href="/triage" aria-label="TriageWall triage queue">
+        <img class="brand-mark" src="/static/triagewall-mark.svg" alt="" aria-hidden="true">
+        <strong>TriageWall</strong>
+      </a>
 
-  <div id="demoBanner" class="demo-banner hidden p-3 rounded mb-4 text-sm">
-    Demo mode — internal IPs masked, feedback disabled.
-    Source: <a class="underline" href="https://github.com/aaronphifer/triagewall" target="_blank">github.com/aaronphifer/triagewall</a>
-  </div>
+      <nav class="side-nav" aria-label="Console sections">
+        <a href="/overview" data-view-link="overview">
+          Overview
+        </a>
+        <a href="/triage" data-view-link="triage">
+          Triage queue
+          <span id="sidebarQueueCount" class="nav-count" title="Unreviewed model decisions in the last 24 hours, across all filters">—</span>
+          <span class="sr-only">unreviewed model decisions in the last 24 hours, across all filters</span>
+        </a>
+        <a href="/behavioral" data-view-link="behavioral">
+          Behavioral signals
+        </a>
+        <a href="/integrity" data-view-link="integrity">
+          Integrity
+        </a>
+        <a href="/configuration" data-view-link="configuration">
+          Configuration
+        </a>
+      </nav>
 
-  <header class="mb-8 flex items-end justify-between flex-wrap gap-4">
-    <div>
-      <h1 class="text-3xl font-bold text-white tracking-tight">Triagewall</h1>
-      <p class="text-gray-500 text-sm mt-1">Local-LLM alert triage for self-hosted SOCs.</p>
-    </div>
-    <div class="text-right">
-      <div class="freshness" id="freshness">Live · Updated never</div>
-      <div class="text-xs text-gray-600 mono mt-1" id="storageMeta">Storage unavailable</div>
-    </div>
-  </header>
-
-  <div id="staleBanner" class="hidden mb-6 rounded-lg border border-yellow-700/40 bg-yellow-900/30 text-yellow-100 px-4 py-3 text-sm">
-    <span class="font-semibold">⚠️ Ingestion stalled.</span>
-    <span id="staleBannerText">Last alert seen — minutes ago.</span>
-  </div>
-
-  <!-- Hero stat: 24h prefilter ratio -->
-  <div class="card rounded-lg p-6 mb-6">
-    <div class="flex items-end justify-between flex-wrap gap-4">
-      <div>
-        <div class="text-xs text-gray-500 uppercase tracking-widest font-semibold">Last 24 hours</div>
-        <div class="hero-stat text-5xl font-bold text-white mt-1">
-          <span id="heroPct">—</span><span class="text-3xl text-gray-500">% prefiltered</span>
+      <div class="system-card" aria-label="System status">
+        <div class="system-card-head">
+          <span>System</span>
+          <span class="status-dot" id="healthDot" aria-hidden="true"></span>
         </div>
-        <div class="text-sm text-gray-500 mt-2 mono" id="heroDetail">Loading…</div>
+        <strong id="healthLabel">Connecting</strong>
+        <dl>
+          <div><dt>Last event</dt><dd id="lastSeen">—</dd></div>
+          <div><dt>Storage</dt><dd id="storageMeta">—</dd></div>
+          <div><dt>Lifetime</dt><dd id="lifetimeTotal">—</dd></div>
+        </dl>
       </div>
-      <div class="text-right">
-        <div class="text-xs text-gray-500 uppercase tracking-widest font-semibold">All-time</div>
-        <div class="text-2xl font-semibold text-gray-300 mt-1 mono" id="lifetimeTotal">—</div>
-        <div class="text-xs text-gray-500 mt-1">alerts processed</div>
+
+      <div class="sidebar-foot">
+        <span>Local-first · no telemetry</span>
+        <a href="https://github.com/aaronphifer/triagewall" target="_blank" rel="noreferrer">Source code ↗</a>
       </div>
-    </div>
-  </div>
+    </aside>
 
-  <!-- Trends: 24h timeline -->
-  <div class="card rounded-lg p-6 mb-6">
-    <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
-      <div>
-        <div class="text-xs text-gray-500 uppercase tracking-widest font-semibold">Trends</div>
-        <div class="text-lg font-semibold text-gray-200 mt-1">Last 24 hours</div>
+    <main class="main-content">
+      <div id="demoBanner" class="notice notice-demo hidden" role="status">
+        <strong>Demo workspace</strong>
+        <span>Addresses are masked and feedback is disabled.</span>
       </div>
-      <div class="text-xs text-gray-600 mono" id="timelineMeta">Loading…</div>
-    </div>
-    <div class="h-64 md:h-80">
-      <canvas id="timelineChart"></canvas>
-    </div>
-  </div>
 
-  <!-- Secondary stats -->
-  <div id="stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"></div>
-
-  <!-- SPC behavioral anomalies (independent signal) -->
-  <div id="spcPanel" class="card spc-panel rounded-lg p-6 mb-6 hidden">
-    <div class="flex items-end justify-between flex-wrap gap-3 mb-3">
-      <div>
-        <div class="text-xs text-gray-500 uppercase tracking-widest font-semibold">Behavioral anomalies</div>
-        <div class="text-lg font-semibold text-gray-200 mt-1">Statistical baseline deviations</div>
-        <div class="text-xs text-gray-600 mt-1">Independent of LLM verdicts — an attacker can rewrite alert text, not their behavior.</div>
+      <div id="staleBanner" class="notice notice-warning hidden" role="alert">
+        <strong>Ingestion needs attention.</strong>
+        <span id="staleBannerText">The latest event is outside the expected freshness window.</span>
       </div>
-      <div class="text-xs mono" id="spcMeta"></div>
-    </div>
-    <div id="spcList" class="space-y-0"></div>
-  </div>
 
-  <!-- Filters -->
-  <div class="flex flex-wrap gap-2 mb-4 items-center">
-    <span class="text-xs text-gray-500 uppercase tracking-wider mr-1">Verdict:</span>
-    <button class="filter-pill filter-btn px-3 py-1 rounded-full text-xs font-medium" data-verdict="">All</button>
-    <button class="filter-pill filter-btn px-3 py-1 rounded-full text-xs font-medium" data-verdict="real">Real</button>
-    <button class="filter-pill filter-btn px-3 py-1 rounded-full text-xs font-medium" data-verdict="false_positive">False Positive</button>
-    <button class="filter-pill filter-btn px-3 py-1 rounded-full text-xs font-medium" data-verdict="uncertain">Uncertain</button>
-
-    <span class="text-gray-700 mx-2">·</span>
-
-    <span class="text-xs text-gray-500 uppercase tracking-wider mr-1">Source:</span>
-    <button class="filter-pill model-btn px-3 py-1 rounded-full text-xs font-medium active" data-model="llm">LLM only</button>
-    <button class="filter-pill model-btn px-3 py-1 rounded-full text-xs font-medium" data-model="">All</button>
-    <button class="filter-pill model-btn px-3 py-1 rounded-full text-xs font-medium" data-model="prefilter">Prefilter only</button>
-
-    <input id="sigFilter" class="card px-3 py-1.5 rounded text-sm flex-1 min-w-[200px] ml-2" placeholder="Filter by signature…">
-  </div>
-
-  <!-- Alert list -->
-  <div id="verdicts" class="space-y-2"></div>
-
-  <!-- Keyboard shortcuts hint -->
-  <div class="mt-8 pt-6 border-t border-gray-800 text-xs text-gray-600 flex flex-wrap gap-x-6 gap-y-2">
-    <span><kbd>J</kbd> / <kbd>K</kbd> navigate</span>
-    <span><kbd>A</kbd> agree</span>
-    <span><kbd>D</kbd> mark different</span>
-    <span><kbd>U</kbd> mark uncertain</span>
-    <span class="ml-auto">
-      <a href="https://github.com/aaronphifer/triagewall" target="_blank" class="hover:text-gray-400">github.com/aaronphifer/triagewall</a>
-    </span>
-  </div>
-</div>
-
-<script src="/static/polling.js"></script>
-<script>
-const API = "";
-let currentFilter = { verdict: "", signature: "", model: "llm" };
-let mode = "local";
-let focusedIndex = 0;
-let currentVerdicts = [];
-let timelineChartInstance = null;
-let _timelineCache = { at: 0, data: [] };
-
-function formatHourLabel(isoHour) {
-  // `isoHour` looks like "YYYY-MM-DDTHH:00:00"
-  const d = new Date(isoHour);
-  if (isNaN(d.getTime())) return isoHour;
-  return d.toLocaleTimeString([], { hour: 'numeric' });
-}
-
-async function fetchTimeline() {
-  const points = await loadTimeline();
-  const labels = points.map(p => formatHourLabel(p.timestamp));
-  const totalAlerts = points.map(p => p.total_alerts ?? 0);
-  const prefilterPercentages = points.map(p => p.prefilter_percentage ?? 0);
-
-  const el = document.getElementById("timelineChart");
-  if (!el) return points;
-  const ctx = el.getContext("2d");
-
-  if (timelineChartInstance) {
-    timelineChartInstance.data.labels = labels;
-    timelineChartInstance.data.datasets[0].data = totalAlerts;
-    timelineChartInstance.data.datasets[1].data = prefilterPercentages;
-    timelineChartInstance.update();
-    return points;
-  }
-
-  const data = {
-    labels,
-    datasets: [
-      {
-        type: 'bar',
-        label: 'Total alerts',
-        data: totalAlerts,
-        yAxisID: 'y',
-        backgroundColor: 'rgba(88, 166, 255, 0.22)',
-        borderColor: 'rgba(88, 166, 255, 0.55)',
-        borderWidth: 1,
-        borderRadius: 4,
-        barPercentage: 0.9,
-        categoryPercentage: 0.9,
-      },
-      {
-        type: 'line',
-        label: 'Prefilter %',
-        data: prefilterPercentages,
-        yAxisID: 'y1',
-        borderColor: 'rgba(126, 231, 135, 0.95)',
-        backgroundColor: 'rgba(126, 231, 135, 0.15)',
-        pointRadius: 2,
-        pointHoverRadius: 3,
-        tension: 0.25,
-      },
-    ]
-  };
-
-  const options = {
-    animation: { duration: 800 },
-    responsive: true,
-    maintainAspectRatio: false,
-    interaction: { mode: 'index', intersect: false },
-    plugins: {
-      legend: { labels: { color: '#8b949e' } },
-      tooltip: {
-        callbacks: {
-          label: (ctx) => {
-            const v = ctx.raw;
-            if (ctx.dataset.yAxisID === 'y1') return `${ctx.dataset.label}: ${Number(v).toFixed(1)}%`;
-            return `${ctx.dataset.label}: ${Number(v).toLocaleString()}`;
-          }
-        }
-      }
-    },
-    scales: {
-      x: {
-        ticks: { color: '#6e7681', maxRotation: 0, autoSkip: true },
-        grid: { color: 'rgba(48,54,61,0.45)' },
-      },
-      y: {
-        position: 'left',
-        ticks: { color: '#6e7681' },
-        grid: { color: 'rgba(48,54,61,0.45)' },
-      },
-      y1: {
-        position: 'right',
-        min: 0,
-        max: 100,
-        ticks: { color: '#6e7681', callback: (v) => `${v}%` },
-        grid: { drawOnChartArea: false },
-      },
-    }
-  };
-
-  timelineChartInstance = new Chart(ctx, { data, options });
-  return points;
-}
-
-async function loadTimeline() {
-  const now = Date.now();
-  // Cache for 60s to avoid extra load while verdicts poll every 5s.
-  if (_timelineCache.data?.length && (now - _timelineCache.at) < 60_000) {
-    return _timelineCache.data;
-  }
-  const res = await fetch(`${API}/api/timeline`);
-  const data = await res.json();
-  _timelineCache = { at: now, data };
-  return data;
-}
-
-function setActive(selector, dataKey, value) {
-  // "All" pills (data-* === "") represent absence of filter — don't visually highlight
-  document.querySelectorAll(selector).forEach(b => {
-    const isActive = value !== "" && b.dataset[dataKey] === value;
-    b.classList.toggle("active", isActive);
-  });
-}
-
-async function load() {
-  const params = new URLSearchParams();
-  if (currentFilter.verdict) params.set("verdict", currentFilter.verdict);
-  if (currentFilter.signature) params.set("signature", currentFilter.signature);
-  if (currentFilter.model) params.set("model", currentFilter.model);
-
-  // Check ingestion freshness
-  try {
-    const healthRes = await fetch(`${API}/api/health`);
-    const health = await healthRes.json();
-    const banner = document.getElementById("staleBanner");
-    const bannerText = document.getElementById("staleBannerText");
-    const age = Number(health.last_alert_age_seconds ?? NaN);
-    const storageMeta = document.getElementById("storageMeta");
-    if (storageMeta && health.storage) {
-      const total = formatBytes(health.storage.total_on_disk_bytes);
-      const reusable = formatBytes(health.storage.reusable_bytes);
-      storageMeta.textContent = `DB ${total} · ${reusable} reusable`;
-    }
-    const isStale = !healthRes.ok || health.status === "stale";
-    if (isStale) {
-      const mins = isFinite(age) ? Math.max(0, age) / 60.0 : NaN;
-      const minsText = isFinite(mins) ? mins.toFixed(1) : "—";
-      bannerText.textContent = `Last alert seen ${minsText} minutes ago.`;
-      banner.classList.remove("hidden");
-    } else {
-      banner.classList.add("hidden");
-    }
-  } catch (e) {
-    // If health can't be fetched, don't block the main UI.
-  }
-
-  // Update trends timeline (throttled)
-  try {
-    const points = await fetchTimeline();
-    const meta = document.getElementById("timelineMeta");
-    if (meta) meta.textContent = points?.length ? `${points.length} buckets` : `No data`;
-  } catch (e) {
-    const meta = document.getElementById("timelineMeta");
-    if (meta) meta.textContent = "Timeline unavailable";
-  }
-
-  const res = await fetch(`${API}/api/verdicts?${params}`);
-  const data = await res.json();
-  mode = data.mode;
-  if (mode === "demo") document.getElementById("demoBanner").classList.remove("hidden");
-  renderHero(data.stats);
-  renderStats(data.stats);
-  renderVerdicts(data.verdicts);
-  document.getElementById("freshness").textContent = `Live · Updated ${new Date().toLocaleTimeString()}`;
-}
-
-function renderHero(s) {
-  const t24 = s.today_total ?? 0;
-  const p24 = s.today_prefilter ?? 0;
-  const l24 = s.today_llm ?? 0;
-  const pct = t24 > 0 ? (100 * p24 / t24) : 0;
-  document.getElementById("heroPct").textContent = pct.toFixed(1);
-  document.getElementById("heroDetail").textContent =
-    `${p24.toLocaleString()} of ${t24.toLocaleString()} alerts auto-classified · ${l24.toLocaleString()} sent to LLM`;
-  document.getElementById("lifetimeTotal").textContent = (s.total ?? 0).toLocaleString();
-}
-
-async function loadSpc() {
-  try {
-    const res = await fetch(`${API}/api/spc-anomalies`);
-    const data = await res.json();
-    renderSpc(data);
-  } catch (e) {
-    // SPC panel is best-effort; never block the main UI.
-  }
-}
-
-function renderSpc(data) {
-  const panel = document.getElementById("spcPanel");
-  if (!data || data.available === false) {
-    panel.classList.add("hidden");
-    return;
-  }
-  const list = data.anomalies || [];
-  if (!list.length) {
-    panel.classList.add("hidden");
-    return;
-  }
-  panel.classList.remove("hidden");
-
-  const meta = document.getElementById("spcMeta");
-  if (meta) {
-    const n = data.count_24h ?? 0;
-    meta.textContent = n > 0 ? `${n} in last 24h` : `${list.length} total`;
-    meta.className = "text-xs mono " + (n > 0 ? "text-yellow-500" : "text-gray-600");
-  }
-
-  document.getElementById("spcList").innerHTML = list.map(a => {
-    const ts = a.detected_at
-      ? new Date(a.detected_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-      : '';
-    const isRate = a.feature === 'alert_rate';
-    const featureLabel = isRate
-      ? `<span class="spc-feature-rate font-semibold">rate spike</span>`
-      : `<span class="spc-feature-novel font-semibold">novel signature</span>`;
-    const sid = a.signature_id != null ? `<span class="text-gray-500 mono">SID ${escapeHtml(a.signature_id)}</span>` : '';
-    return `
-      <div class="spc-row py-3 flex items-start gap-3">
-        <span class="badge badge-spc mt-0.5">SPC</span>
-        <div class="flex-1 min-w-0">
-          <div class="flex items-center gap-2 flex-wrap text-sm">
-            ${featureLabel}
-            <span class="text-gray-300 mono">${escapeHtml(a.ip ?? '?')}</span>
-            ${sid}
-            <span class="text-xs text-gray-600 mono ml-auto">${ts}</span>
+      <section class="view-panel" data-view="triage" aria-labelledby="queue-title">
+        <header class="view-header queue-header">
+          <div class="queue-title-line">
+            <h1 id="queue-title">Triage queue</h1>
+            <span id="queueMeta">Loading decisions…</span>
           </div>
-          <div class="text-xs text-gray-500 mt-1">${escapeHtml(a.note ?? '')}</div>
+          <div class="queue-header-tools">
+            <label class="search-field queue-search" for="sigFilter">
+              <span class="sr-only">Search alerts by signature, IP address, or historical asset hostname</span>
+              <input id="sigFilter" type="search" maxlength="200" placeholder="signature, IP, or asset…">
+            </label>
+            <button id="filterToggleButton" class="text-button" type="button" aria-expanded="false">Filters</button>
+            <span class="live-chip"><span class="live-pulse" aria-hidden="true"></span><span id="freshness">Connecting</span></span>
+          </div>
+        </header>
+
+        <div class="queue-sticky">
+        <div class="queue-summary" aria-label="Queue summary and verdict filters" aria-describedby="queueScopeNote">
+          <button class="filter-btn queue-tag active" data-verdict="" type="button">All model <span id="queueAllCount">—</span></button>
+          <button class="filter-btn queue-tag" data-verdict="real" type="button">Real <span id="queueRealCount">—</span></button>
+          <button class="filter-btn queue-tag" data-verdict="uncertain" type="button">Uncertain <span id="queueUncertainCount">—</span></button>
+          <button class="filter-btn queue-tag" data-verdict="false_positive" type="button">False positive <span id="queueFalsePositiveCount">—</span></button>
+          <button id="unreviewedQuickFilter" class="queue-tag" type="button">Unreviewed <span id="queueUnreviewedCount">—</span></button>
+          <span class="queue-sort">sorted by newest ↓</span>
         </div>
-      </div>`;
-  }).join("");
-}
+        <p id="queueScopeNote" class="queue-scope-note">
+          These counts are global totals of model decisions from the last 24 hours.
+          They stay the same whichever filters, path, or page you select below —
+          including Policy, source, and review filters, which never change them.
+        </p>
 
-function renderStats(s) {
-  const agreePct = s.reviewed ? Math.round((s.agreed / s.reviewed) * 100) : null;
-  const cards = [
-    { label: "Real · 24h", val: (s.real_ ?? 0).toLocaleString(), cls: "v-real" },
-    { label: "False Positive · 24h", val: (s.fp ?? 0).toLocaleString(), cls: "v-false_positive" },
-    { label: "Uncertain · 24h", val: (s.unc ?? 0).toLocaleString(), cls: "v-uncertain" },
-    {
-      label: "Agreement · 24h",
-      val: agreePct === null ? "—" : `${agreePct}%`,
-      cls: "",
-      sub: s.reviewed
-        ? `${(s.reviewed ?? 0).toLocaleString()} recent alerts reviewed`
-        : null
-    },
-  ];
-  document.getElementById("stats").innerHTML = cards.map(c => `
-    <div class="card p-3 rounded">
-      <div class="text-xs text-gray-500 uppercase tracking-wider font-semibold">${c.label}</div>
-      <div class="text-2xl font-bold mono ${c.cls} mt-1">${c.val}</div>
-      ${c.sub ? `<div class="text-xs text-gray-600 mt-0.5">${c.sub}</div>` : ''}
-    </div>
-  `).join("");
-}
-
-function renderVerdicts(list) {
-  currentVerdicts = list;
-  if (focusedIndex >= list.length) focusedIndex = Math.max(0, list.length - 1);
-
-  if (!list.length) {
-    document.getElementById("verdicts").innerHTML = `
-      <div class="card p-8 rounded text-center">
-        <div class="text-gray-500 text-sm">Nothing matches the current filter.</div>
-        <div class="text-gray-600 text-xs mt-2">If "LLM only" is selected, this means your prefilter is doing its job — no recent alerts needed model classification.</div>
-      </div>`;
-    return;
-  }
-
-  document.getElementById("verdicts").innerHTML = list.map((v, i) => {
-    const conf = (v.confidence * 100).toFixed(0);
-    const isPrefilter = v.model_used === "prefilter";
-    const classificationBadge = isPrefilter
-      ? `<span class="badge badge-prefilter">prefilter</span>`
-      : `<span class="badge badge-llm mono">${escapeHtml(v.model_used ?? 'llm')}</span>`;
-    const sensor = v.sensor_context?.source ?? 'suricata';
-    const sensorBadge = `<span class="badge badge-sensor">${escapeHtml(sensor)}</span>`;
-    const ruleLabel = sensor === 'wazuh' ? 'Rule' : 'SID';
-    const agent = v.sensor_context?.agent;
-    const networkContext = v.src_ip || v.dest_ip
-      ? `${escapeHtml(v.src_ip ?? '?')}:${escapeHtml(v.src_port ?? '?')} → ${escapeHtml(v.dest_ip ?? '?')}:${escapeHtml(v.dest_port ?? '?')} <span class="text-gray-600">${escapeHtml(v.proto ?? '')}</span>`
-      : agent?.name
-        ? `Agent ${escapeHtml(agent.name)}`
-        : '?';
-
-    const reviewed = v.human_verdict
-      ? `<div class="text-xs mt-2 ${v.agreed ? 'text-green-400' : 'text-red-400'}">
-           Reviewed: <span class="mono">${v.human_verdict}</span>
-           <span class="text-gray-500">(${v.agreed ? 'agreed' : 'disagreed'})</span>
-         </div>`
-      : '';
-
-    const fbBtns = (mode === "demo" || v.human_verdict) ? '' : `
-      <div class="flex gap-2 mt-3">
-        <button onclick="event.stopPropagation(); feedback(${v.id}, '${v.verdict}')" class="btn-agree text-xs px-3 py-1.5 rounded font-medium">
-          ✓ Agree
-        </button>
-        <button onclick="event.stopPropagation(); feedbackOther(${v.id})" class="btn-disagree text-xs px-3 py-1.5 rounded font-medium">
-          Mark different
-        </button>
-      </div>`;
-
-    const ts = v.processed_at
-      ? new Date(v.processed_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      : '';
-
-    return `
-    <div class="card card-hover rounded p-4 ${i === focusedIndex ? 'focused' : ''}" data-idx="${i}" onclick="focusAlert(${i})">
-      <div class="flex items-start gap-3">
-        <div class="flex-1 min-w-0">
-          <div class="flex items-center gap-2 flex-wrap">
-            <span class="badge badge-${v.verdict}">${v.verdict.replace('_', ' ')}</span>
-            ${classificationBadge}
-            ${sensorBadge}
-            <span class="text-xs text-gray-500 mono">${conf}%</span>
-            <span class="text-xs text-gray-500 mono">${ruleLabel} ${escapeHtml(v.signature_id ?? '?')}</span>
-            <span class="text-xs text-gray-600 mono ml-auto">${ts}</span>
+        <div id="advancedFilters" class="filter-bar hidden" aria-label="Additional decision filters">
+          <div class="filter-group">
+            <span class="filter-label">Path</span>
+            <div class="segmented" role="group" aria-label="Filter by decision path">
+              <button class="model-btn active" data-model="llm" type="button">Model</button>
+              <button class="model-btn" data-model="prefilter" type="button">Policy</button>
+              <button class="model-btn" data-model="" type="button">All</button>
+            </div>
           </div>
-          <div class="font-semibold text-gray-200 mt-2 leading-snug">${escapeHtml(v.signature ?? '?')}</div>
-          <div class="text-xs text-gray-500 mt-1.5 mono">
-            ${networkContext}
-          </div>
-          <div class="reasoning mt-2.5">${escapeHtml(v.reasoning ?? '')}</div>
-          ${reviewed}
-          ${fbBtns}
+          <label class="select-field" for="sourceFilter">
+            <span>Source</span>
+            <select id="sourceFilter">
+              <option value="">All sources</option>
+              <option value="suricata">Suricata</option>
+              <option value="wazuh">Wazuh</option>
+            </select>
+          </label>
+          <label class="select-field" for="reviewFilter">
+            <span>Review</span>
+            <select id="reviewFilter">
+              <option value="">Any state</option>
+              <option value="unreviewed">Unreviewed</option>
+              <option value="agreed">Agreed</option>
+              <option value="corrected">Corrected</option>
+            </select>
+          </label>
         </div>
-      </div>
-    </div>`;
-  }).join("");
-}
 
-function focusAlert(idx) {
-  focusedIndex = idx;
-  document.querySelectorAll('[data-idx]').forEach(el => {
-    el.classList.toggle('focused', parseInt(el.dataset.idx) === idx);
-  });
-}
+        <div class="decision-columns" aria-hidden="true">
+          <span>Time</span>
+          <span>Signature</span>
+          <span>Source</span>
+          <span>Destination</span>
+          <span>Verdict</span>
+          <span>Conf.</span>
+        </div>
+        </div>
+        <div id="verdicts" class="decision-list" aria-live="polite"></div>
+        <div class="queue-footer" id="queueFooter">
+          <span id="paginationMeta">Newest decisions load automatically.</span>
+          <div>
+            <button id="returnLiveButton" class="text-button hidden" type="button">Return to live</button>
+            <button id="loadOlderButton" class="text-button hidden" type="button">Load older</button>
+          </div>
+        </div>
+      </section>
 
-async function feedback(id, agentVerdict, customVerdict = null) {
-  const human_verdict = customVerdict || agentVerdict;
-  const res = await fetch(`${API}/api/feedback/${id}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ human_verdict }),
-  });
-  if (res.ok) load();
-}
+      <section class="view-panel" data-view="overview" aria-labelledby="overview-title" hidden>
+        <header class="view-header">
+          <div>
+            <p class="view-context">SYSTEM</p>
+            <h1 id="overview-title">Overview</h1>
+          </div>
+          <span class="view-meta" id="timelineMeta">Loading activity</span>
+        </header>
 
-function feedbackOther(id) {
-  const choice = prompt("What's the correct verdict? (real / false_positive / uncertain)");
-  if (!choice) return;
-  const norm = choice.trim().toLowerCase();
-  if (!["real", "false_positive", "uncertain"].includes(norm)) {
-    alert("Invalid verdict");
-    return;
-  }
-  feedback(id, null, norm);
-}
+        <section class="prefilter-hero panel" aria-label="Twenty-four hour decision flow">
+          <div class="prefilter-hero-head">
+            <div>
+              <span class="metric-label">Last 24 hours</span>
+              <div class="prefilter-rate"><strong id="prefilterRate">—</strong><span>% resolved before the model</span></div>
+            </div>
+            <div class="lifetime-total"><span>Lifetime decisions</span><strong id="overviewLifetime">—</strong></div>
+          </div>
+          <div class="pipeline-band" aria-label="Policy and model decision share">
+            <span id="policyBand" class="policy-band"></span><span id="modelBand" class="model-band"></span>
+          </div>
+          <div class="pipeline-legend">
+            <span><i class="policy-key"></i><strong id="policyCount">—</strong> policy resolved</span>
+            <span><i class="model-key"></i><strong id="modelCount">—</strong> sent to local model</span>
+            <span id="newDecisionCount">— total</span>
+          </div>
+        </section>
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
+        <section class="metric-grid" aria-label="Current triage status">
+          <article class="metric-card metric-real">
+            <span class="metric-label">Real</span>
+            <strong id="realCount">—</strong>
+            <span>Last 24 hours</span>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">False positive</span>
+            <strong id="falsePositiveCount">—</strong>
+            <span>Includes deterministic policy</span>
+          </article>
+          <article class="metric-card metric-attention">
+            <span class="metric-label">Uncertain</span>
+            <strong id="uncertainCount">—</strong>
+            <span>Queued for operator review</span>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Operator agreement</span>
+            <strong id="agreementRate">—</strong>
+            <span id="agreementDetail">No reviews in this window</span>
+          </article>
+        </section>
 
-function formatBytes(value) {
-  const bytes = Number(value);
-  if (!Number.isFinite(bytes) || bytes < 0) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let size = bytes;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  const digits = unit === 0 ? 0 : size >= 10 ? 1 : 2;
-  return `${size.toFixed(digits)} ${units[unit]}`;
-}
+        <div class="overview-grid" aria-label="Activity and operating posture">
+          <article class="panel activity-panel">
+            <div class="panel-head">
+              <div>
+                <p class="section-kicker">Decision volume</p>
+                <h2>Last 24 hours</h2>
+              </div>
+              <div class="chart-legend" aria-label="Chart legend">
+                <span><i class="legend-bar"></i>Events</span>
+                <span><i class="legend-line"></i>Policy resolved</span>
+              </div>
+            </div>
+            <div id="timelineChart" class="timeline-chart" role="img" aria-label="Event volume and policy-resolution rate over the last 24 hours">
+              <div class="loading-state">Loading decision volume…</div>
+            </div>
+          </article>
 
-// Filter buttons
-document.querySelectorAll(".filter-btn").forEach(b =>
-  b.addEventListener("click", () => {
-    currentFilter.verdict = b.dataset.verdict;
-    setActive(".filter-btn", "verdict", b.dataset.verdict);
-    load();
-  })
-);
+          <article class="panel posture-panel">
+            <div class="panel-head">
+              <div>
+                <p class="section-kicker">Operating posture</p>
+                <h2>Pipeline status</h2>
+              </div>
+            </div>
+            <div class="posture-stack">
+              <div class="posture-row"><span>Ingest</span><strong id="postureIngest">Connecting</strong></div>
+              <div class="posture-row"><span>Decision path</span><strong>Policy → Local model</strong></div>
+              <div class="posture-row"><span>Sources</span><strong>Suricata + Wazuh</strong></div>
+              <div class="posture-row"><span>Data boundary</span><strong>Local only</strong></div>
+            </div>
+            <p class="posture-note">Reads sensor streams and records decisions. It does not change sensor rules or take response actions.</p>
+          </article>
+        </div>
+      </section>
 
-document.querySelectorAll(".model-btn").forEach(b =>
-  b.addEventListener("click", () => {
-    currentFilter.model = b.dataset.model;
-    setActive(".model-btn", "model", b.dataset.model);
-    load();
-  })
-);
+      <section class="view-panel" data-view="behavioral" aria-labelledby="behavioral-signal" hidden>
+        <header class="view-header">
+          <div>
+            <p class="view-context">INDEPENDENT DETECTION</p>
+            <h1 id="behavioral-signal">Behavioral signals</h1>
+          </div>
+          <p class="view-description">Statistical deviations evaluated separately from model verdicts.</p>
+        </header>
 
-document.getElementById("sigFilter").addEventListener("input", e => {
-  currentFilter.signature = e.target.value;
-  clearTimeout(window._t);
-  window._t = setTimeout(load, 300);
-});
+        <section id="spcPanel" class="panel signal-panel hidden" aria-label="Behavioral deviations">
+          <div class="panel-head">
+            <div>
+              <p class="section-kicker">RECENT DEVIATIONS</p>
+              <h2>Observed changes</h2>
+            </div>
+            <span class="signal-count" id="spcMeta"></span>
+          </div>
+          <div id="spcList" class="signal-list"></div>
+        </section>
+      </section>
 
-// Set initial active states
-setActive(".filter-btn", "verdict", currentFilter.verdict);
-setActive(".model-btn", "model", currentFilter.model);
+      <section class="view-panel" data-view="integrity" aria-labelledby="integrity-title" hidden>
+        <header class="view-header">
+          <div>
+            <p class="view-context">MODEL BOUNDARY</p>
+            <h1 id="integrity-title">Integrity</h1>
+          </div>
+          <p class="view-description">Implemented controls — not inferred incident counters.</p>
+        </header>
 
-// Keyboard shortcuts
-document.addEventListener("keydown", e => {
-  if (e.target.tagName === "INPUT") return;
+        <section class="integrity-grid" aria-label="Implemented model-boundary controls">
+          <article class="integrity-control">
+            <div class="control-head"><span>Canary response check</span><strong>IMPLEMENTED</strong></div>
+            <h2>Output leak detection</h2>
+            <p>A per-process secret is checked in both raw and decoded model output. A detected leak is conservatively classified as real for review.</p>
+            <code>triage._contains_canary</code>
+          </article>
+          <article class="integrity-control">
+            <div class="control-head"><span>Response contract</span><strong>FAIL CLOSED</strong></div>
+            <h2>Strict three-field JSON</h2>
+            <p>Only verdict, confidence, and reasoning are accepted. Malformed, partial, or extra-field responses become uncertain at zero confidence.</p>
+            <code>triage._invalid_model_response</code>
+          </article>
+          <article class="integrity-control">
+            <div class="control-head"><span>Suricata projection</span><strong>FAIL CLOSED</strong></div>
+            <h2>Allowlisted structure</h2>
+            <p>Known structured metadata may remain plain. Free text, network content, new fields, and type mismatches are base64-encapsulated by default.</p>
+            <code>field_isolation.format_alert_for_llm</code>
+          </article>
+          <article class="integrity-control">
+            <div class="control-head"><span>Wazuh projection</span><strong>BOUNDED</strong></div>
+            <h2>Source-specific isolation</h2>
+            <p>Strings are encapsulated and oversized evidence is truncated with a digest inside a fixed 32 KiB model-input budget.</p>
+            <code>wazuh_isolation.format_wazuh_for_llm</code>
+          </article>
+        </section>
 
-  const key = e.key.toLowerCase();
-  if (key === "j") {
-    if (focusedIndex < currentVerdicts.length - 1) focusAlert(focusedIndex + 1);
-    document.querySelector(`[data-idx="${focusedIndex}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    e.preventDefault();
-  } else if (key === "k") {
-    if (focusedIndex > 0) focusAlert(focusedIndex - 1);
-    document.querySelector(`[data-idx="${focusedIndex}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    e.preventDefault();
-  } else if (key === "a") {
-    const v = currentVerdicts[focusedIndex];
-    if (v && !v.human_verdict && mode !== "demo") feedback(v.id, v.verdict);
-    e.preventDefault();
-  } else if (key === "d") {
-    const v = currentVerdicts[focusedIndex];
-    if (v && !v.human_verdict && mode !== "demo") feedbackOther(v.id);
-    e.preventDefault();
-  } else if (key === "u") {
-    const v = currentVerdicts[focusedIndex];
-    if (v && !v.human_verdict && mode !== "demo") feedback(v.id, null, "uncertain");
-    e.preventDefault();
-  }
-});
+        <div class="integrity-lower">
+          <article class="panel defense-panel">
+            <div class="panel-head"><div><p class="section-kicker">DECISION PATH</p><h2>Defense chain</h2></div></div>
+            <ol class="defense-chain">
+              <li><span>01</span><div><strong>Project by source</strong><p>Only the bounded evidence shape for Suricata or Wazuh enters the model boundary.</p></div></li>
+              <li><span>02</span><div><strong>Encapsulate untrusted values</strong><p>Attacker-controlled strings are data inside explicit boundary markers, never trusted instructions.</p></div></li>
+              <li><span>03</span><div><strong>Validate the complete response</strong><p>The entire JSON response must match the exact contract before a verdict is accepted.</p></div></li>
+              <li><span>04</span><div><strong>Check the canary</strong><p>Raw and decoded output are scanned before the decision is persisted.</p></div></li>
+            </ol>
+          </article>
 
-startIndependentPolling({ loadMain: load, loadSpc });
-</script>
+          <article class="panel evidence-panel">
+            <div class="panel-head"><div><p class="section-kicker">EVIDENCE SCOPE</p><h2>What this page claims</h2></div></div>
+            <p>This is a posture view of controls in the shipped classifier. The dashboard does not currently persist canary-hit history, schema-rejection counts, suspicious payload fragments, or exact prompts.</p>
+            <p class="scope-note">Accordingly, this page does not claim “zero breaches,” a seven-day completion total, or proof that no injection can succeed.</p>
+            <div class="evidence-links">
+              <a href="https://github.com/aaronphifer/triagewall/blob/main/docs/THREAT_MODEL.md" target="_blank" rel="noreferrer">Threat model ↗</a>
+              <a href="https://github.com/aaronphifer/triagewall/blob/main/docs/experiments/phase2_field_isolation.md" target="_blank" rel="noreferrer">Isolation evidence ↗</a>
+              <a href="https://github.com/aaronphifer/triagewall/blob/main/docs/release-evidence-v0.3.md" target="_blank" rel="noreferrer">v0.3 release evidence ↗</a>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view-panel configuration-page" data-view="configuration" aria-labelledby="configuration-title" hidden>
+        <header class="view-header">
+          <div>
+            <p class="view-context">OPERATOR CONTROL</p>
+            <h1 id="configuration-title">Configuration</h1>
+          </div>
+          <span class="view-status" id="configConnectionStatus">Credential required</span>
+        </header>
+
+        <div class="configuration-shell">
+          <section id="configCredentialPanel" class="panel config-credential-panel" aria-labelledby="config-credential-title">
+            <div>
+              <p class="section-kicker">PRIVATE ADMINISTRATION</p>
+              <h2 id="config-credential-title">Connect with a configuration key</h2>
+              <p id="configCredentialHelp">The key must carry <code>config:write</code>. It is kept only in this page's memory and is cleared on reload or disconnect.</p>
+            </div>
+            <form id="configCredentialForm" class="config-credential-form" autocomplete="off">
+              <label for="configApiKey">API key
+                <input id="configApiKey" type="password" autocomplete="new-password" spellcheck="false" required>
+              </label>
+              <button class="action-btn action-primary" type="submit">Connect</button>
+            </form>
+          </section>
+
+          <div id="configWorkspace" class="config-workspace hidden">
+            <section class="config-summary-grid" aria-label="Configuration status">
+              <article class="panel config-summary-card"><span>Authority</span><strong id="configMode">—</strong></article>
+              <article class="panel config-summary-card"><span>Generation</span><strong id="configGeneration">—</strong></article>
+              <article class="panel config-summary-card"><span>Runtime consumers</span><strong id="configConsumers">—</strong></article>
+              <article class="panel config-summary-card"><span>Mutation</span><strong id="configWrites">—</strong></article>
+            </section>
+
+            <div class="config-toolbar">
+              <div class="segmented" role="group" aria-label="Configuration document">
+                <button id="configPrefilterTab" class="config-kind-button active" type="button" data-config-kind="prefilter_policy">Prefilter policy</button>
+                <button id="configAssetTab" class="config-kind-button" type="button" data-config-kind="asset_inventory">Asset inventory</button>
+              </div>
+              <button id="configReloadButton" class="text-button" type="button">Reload active</button>
+              <button id="configForgetButton" class="text-button" type="button">Disconnect</button>
+            </div>
+
+            <div class="config-editor-grid">
+              <section class="panel config-editor-panel">
+                <div id="configPrefilterPane">
+                  <div class="panel-head">
+                    <div><p class="section-kicker">STRUCTURED EDITOR</p><h2>False-positive rules</h2></div>
+                    <span id="configRuleCount" class="view-meta">0 rules</span>
+                  </div>
+                  <label class="config-field" for="configInternalCidrs">Internal CIDRs <small>Comma-separated canonical networks</small>
+                    <input id="configInternalCidrs" type="text" spellcheck="false">
+                  </label>
+                  <div id="configRuleList" class="config-item-list"></div>
+                  <form id="configPrefilterForm" class="config-form">
+                    <input id="configRuleIndex" type="hidden" value="">
+                    <div class="config-form-head"><h3 id="configRuleFormTitle">Add scoped rule</h3><button id="configRuleCancel" class="text-button hidden" type="button">Cancel edit</button></div>
+                    <label class="config-field" for="configRuleSignatures">Signature IDs<input id="configRuleSignatures" type="text" inputmode="numeric" placeholder="2019102" required></label>
+                    <label class="config-field config-span-2" for="configRuleReason">Reason<textarea id="configRuleReason" maxlength="4096" required></textarea></label>
+                    <label class="config-field" for="configRuleProtocol">Protocol<select id="configRuleProtocol"><option value="">Any</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option><option value="icmpv6">ICMPv6</option></select></label>
+                    <label class="config-field" for="configRuleNetworkDirection">Network direction<select id="configRuleNetworkDirection"><option value="">Any</option><option value="internal_to_internal">Internal → internal</option><option value="internal_to_external">Internal → external</option><option value="external_to_internal">External → internal</option><option value="external_to_external">External → external</option></select></label>
+                    <label class="config-field" for="configRuleFlowDirection">Flow direction<select id="configRuleFlowDirection"><option value="">Any</option><option value="to_server">To server</option><option value="to_client">To client</option></select></label>
+                    <label class="config-field" for="configRuleSourcePorts">Source ports<input id="configRuleSourcePorts" type="text" inputmode="numeric" placeholder="443, 8443"></label>
+                    <label class="config-field" for="configRuleDestinationPorts">Destination ports<input id="configRuleDestinationPorts" type="text" inputmode="numeric" placeholder="53, 443"></label>
+                    <label class="config-field" for="configRuleSourceCidrs">Source CIDRs<input id="configRuleSourceCidrs" type="text" spellcheck="false"></label>
+                    <label class="config-field" for="configRuleDestinationCidrs">Destination CIDRs<input id="configRuleDestinationCidrs" type="text" spellcheck="false"></label>
+                    <p id="configRulePreserved" class="config-message config-span-2" role="status"></p>
+                    <button class="action-btn action-primary config-span-2" type="submit">Apply rule to candidate</button>
+                  </form>
+                </div>
+
+                <div id="configAssetPane" class="hidden">
+                  <div class="panel-head">
+                    <div><p class="section-kicker">STRUCTURED EDITOR</p><h2>Exact-IP assets</h2></div>
+                    <span id="configAssetCount" class="view-meta">0 assets</span>
+                  </div>
+                  <div id="configAssetList" class="config-item-list"></div>
+                  <form id="configAssetForm" class="config-form">
+                    <input id="configAssetIndex" type="hidden" value="">
+                    <div class="config-form-head config-span-2"><h3 id="configAssetFormTitle">Add asset</h3><button id="configAssetCancel" class="text-button hidden" type="button">Cancel edit</button></div>
+                    <label class="config-field" for="configAssetHostname">Hostname<input id="configAssetHostname" type="text" maxlength="64" required></label>
+                    <label class="config-field" for="configAssetRole">Role<input id="configAssetRole" type="text" maxlength="64" required></label>
+                    <label class="config-field config-span-2" for="configAssetIps">IP addresses <small>Comma-separated IPv4 or IPv6 addresses</small><input id="configAssetIps" type="text" spellcheck="false" required></label>
+                    <label class="config-field" for="configAssetCriticality">Criticality<select id="configAssetCriticality"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></label>
+                    <label class="config-check"><input id="configAssetInternetFacing" type="checkbox"> Internet facing</label>
+                    <label class="config-field config-span-2" for="configAssetPorts">Exposed ports <small>Comma-separated protocol/port pairs, for example tcp/443</small><input id="configAssetPorts" type="text" spellcheck="false"></label>
+                    <button class="action-btn action-primary config-span-2" type="submit">Apply asset to candidate</button>
+                  </form>
+                </div>
+              </section>
+
+              <aside class="config-lifecycle-column">
+                <section class="panel config-lifecycle-panel">
+                  <div class="panel-head"><div><p class="section-kicker">EXACT CANDIDATE</p><h2>Review and activate</h2></div><span id="configDirtyState" class="view-meta">Active document</span></div>
+                  <pre id="configExactDocument" class="config-document" aria-label="Exact candidate JSON"></pre>
+                  <label class="config-field" for="configChangeNote">Change note<textarea id="configChangeNote" maxlength="2000" placeholder="Why this change is needed"></textarea></label>
+                  <div class="config-lifecycle-actions">
+                    <button id="configCreateDraft" class="action-btn" type="button">1. Create draft</button>
+                    <button id="configValidateDraft" class="action-btn" type="button" disabled>2. Validate</button>
+                    <button id="configPreviewDraft" class="action-btn" type="button" disabled>3. Preview impact</button>
+                  </div>
+                  <div id="configPreviewResult" class="config-preview hidden" aria-live="polite"></div>
+                  <div id="configActivationGuard" class="config-activation-guard hidden">
+                    <label class="config-check"><input id="configConfirmActivate" type="checkbox"> I reviewed the exact candidate and bounded preview.</label>
+                    <label class="config-check"><input id="configAcknowledgeBroad" type="checkbox"> I acknowledge any unscoped signature-only rules.</label>
+                    <label class="config-check"><input id="configAcknowledgeBase" type="checkbox"> I reviewed this candidate against the newest shipped baseline.</label>
+                    <label id="configAcknowledgeAssetPreview" class="config-check hidden"><input id="configConfirmAssetPreview" type="checkbox"> This preview could not evaluate every asset-scoped prefilter rule. I accept that suppression changes may be unreported.</label>
+                    <button id="configActivateDraft" class="action-btn action-primary" type="button" disabled>4. Activate for future events</button>
+                  </div>
+                  <p id="configLifecycleMessage" class="config-message" role="status"></p>
+                </section>
+              </aside>
+            </div>
+
+            <div class="config-history-grid">
+              <section class="panel config-history-panel">
+                <div class="panel-head"><div><p class="section-kicker">ROLLBACK</p><h2>Revision history</h2></div></div>
+                <div id="configRollbackGuard" class="config-rollback-guard hidden">
+                  <strong id="configRollbackTitle">Confirm rollback</strong>
+                  <p>Rollback creates a new generation for future records; it never rewrites history.</p>
+                  <pre id="configRollbackDocument" class="config-document" aria-label="Exact rollback target JSON"></pre>
+                  <label class="config-check"><input id="configRollbackAcknowledgeBroad" type="checkbox"> I acknowledge any unscoped signature-only rules.</label>
+                  <label class="config-check"><input id="configRollbackAcknowledgeBase" type="checkbox"> I reviewed this revision against the newest shipped baseline.</label>
+                  <label id="configRollbackAssetGuard" class="config-check hidden"><input id="configConfirmRollbackAssetPreview" type="checkbox"> Rollback has no suppression preview. I accept that this inventory may change asset-scoped prefilter decisions unreported.</label>
+                  <div class="config-inline-actions">
+                    <button id="configConfirmRollback" class="action-btn action-primary" type="button" disabled>Confirm rollback</button>
+                    <button id="configCancelRollback" class="text-button" type="button">Cancel</button>
+                  </div>
+                </div>
+                <div id="configRevisionList" class="config-history-list"></div>
+              </section>
+              <section class="panel config-history-panel"><div class="panel-head"><div><p class="section-kicker">ATTRIBUTION</p><h2>Recent audit</h2></div></div><div id="configAuditList" class="config-history-list"></div></section>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view-panel detail-page" data-view="detail" aria-labelledby="alert-page-title" hidden>
+        <header class="detail-route-header">
+          <a class="detail-back" href="/triage">← Triage queue</a>
+          <div class="detail-route-actions">
+            <button id="previousAlertButton" class="text-button" type="button" disabled>↑ Previous</button>
+            <button id="nextAlertButton" class="text-button" type="button" disabled>Next ↓</button>
+          </div>
+        </header>
+        <div id="detailPageContent" class="detail-page-content">
+          <div class="loading-state">Loading alert detail…</div>
+        </div>
+      </section>
+
+      <footer class="console-footer">
+        <div class="shortcut-list" aria-label="Keyboard shortcuts">
+          <span><kbd>J</kbd><kbd>K</kbd> Navigate</span>
+          <span><kbd>A</kbd> Agree</span>
+          <span><kbd>D</kbd> Review</span>
+          <span><kbd>U</kbd> Uncertain</span>
+        </div>
+        <span>AGPL-3.0</span>
+      </footer>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="/static/polling.js"></script>
+  <script src="/static/configuration.js"></script>
+  <script src="/static/dashboard.js"></script>
 </body>
 </html>

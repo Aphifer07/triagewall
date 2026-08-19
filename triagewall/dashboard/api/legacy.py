@@ -13,9 +13,9 @@ from triagewall.dashboard.api.v1.models import (
     FeedbackRequest,
     FeedbackResponse,
     LegacyHealthResponse,
+    LegacyStatsModel,
     LegacyVerdictsResponse,
     SpcAnomaliesResponse,
-    StatsModel,
     TimelineBucket,
 )
 
@@ -71,24 +71,36 @@ def create_legacy_router(
     def list_verdicts(
         request: Request,
         verdict: str | None = None,
-        signature: str | None = None,
+        signature: str | None = Query(
+            default=None,
+            max_length=services.MAX_SIGNATURE_SEARCH_LENGTH,
+        ),
         model: str | None = None,
         limit: int = Query(default=100, ge=1, le=500),
         _auth: AuthContext = Depends(require_read),
     ):
         with db_factory(readonly=True) as conn:
-            rows, _next = services.fetch_verdicts(
+            rows, _next, _search_scope, _search_window = services.fetch_verdicts(
                 conn,
                 verdict=verdict,
                 signature=signature,
                 model=model,
+                # This deprecated alias remains signature-only until removal;
+                # expanded workbench search is a v1 contract addition.
+                include_private_search=False,
+                # Reachable under default unauthenticated reads, so its search
+                # does the same bounded work as v1: the newest-candidate window
+                # and the query-time budget. Only the work is bounded; the
+                # frozen response shape, filters, and absent cursor are
+                # unchanged, and an unsearched read stays outside the deadline.
+                bounded_search=True,
                 limit=limit,
                 cursor=None,
             )
         stats_dict, _generated = services.get_cached_stats(db_factory)
         payload = {
             "mode": get_mode(),
-            "stats": StatsModel.model_validate(stats_dict).model_dump(),
+            "stats": LegacyStatsModel.model_validate(stats_dict).model_dump(),
             "verdicts": [row_to_dict(r) for r in rows],
         }
         return cached_json_response(request, payload, max_age=5)

@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 # Renaming or unlinking a file that another handle has open raises
@@ -33,12 +34,37 @@ from sensor_event import (
 )
 
 
+TEST_CONFIG_BUNDLE = SimpleNamespace(
+    generation=1,
+    prefilter_revision="sha256:" + "a" * 64,
+    asset_revision="sha256:" + "b" * 64,
+    prefilter_policy=triage.PREFILTER_POLICY,
+    asset_inventory=triage.ASSET_INVENTORY,
+)
+
+
+class TestConfigurationOwner:
+    def __init__(self, **_kwargs):
+        self.bundle = TEST_CONFIG_BUNDLE
+
+    def start(self, _conn):
+        return self.bundle
+
+    def maybe_reload(self, _conn):
+        return False
+
+
 class IngestCheckpointTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.executescript((PROJECT_ROOT / "triagewall" / "schema.sql").read_text())
+        self.bundle_patch = patch.object(
+            ingest, "ConfigurationBundleOwner", TestConfigurationOwner
+        )
+        self.bundle_patch.start()
 
     def tearDown(self):
+        self.bundle_patch.stop()
         self.conn.close()
 
     def test_model_failure_is_retryable_and_not_checkpointable(self):
@@ -506,6 +532,11 @@ class EveRotationCheckpointTests(unittest.TestCase):
         self.position_path = self.temp_path / "position.json"
         ingest._stop = False
         self.addCleanup(setattr, ingest, "_stop", False)
+        bundle_patch = patch.object(
+            ingest, "ConfigurationBundleOwner", TestConfigurationOwner
+        )
+        bundle_patch.start()
+        self.addCleanup(bundle_patch.stop)
 
     def write_position(self, offset, inode, size=0):
         self.position_path.write_text(
