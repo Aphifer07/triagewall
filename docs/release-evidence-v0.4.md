@@ -8,11 +8,13 @@ recorded below.
 
 | Field | Value |
 |---|---|
-| Operational candidate SHA | `980615be0e2021dbf0b4b09cfff94491d4c82fa8` |
+| Initial operational candidate SHA | `980615be0e2021dbf0b4b09cfff94491d4c82fa8` |
+| **Final operational candidate SHA** | **`fd479ab0582499e2bfffe2fd1184fb761a080120`** |
 | Previous deployed SHA | `436c259d17fcda0bb74ddd565bc884e70d2bfab4` |
 | Target branch | `v0.4-stabilization` |
-| Collection window (UTC) | 2026-08-18T17:52Z – 2026-08-19T03:01Z |
-| Production observation window (UTC) | 2026-08-18T17:54:17Z – 2026-08-18T17:59:17Z |
+| Collection window (UTC) | 2026-08-18T17:52Z – 2026-08-19T12:30Z |
+| Production observation window (UTC) | 2026-08-18T17:54:17Z – 2026-08-18T17:59:17Z (initial candidate) |
+| Post-review observation window (UTC) | 2026-08-19T12:24:28Z – 2026-08-19T12:29:28Z (final candidate) |
 | Environment | Single operator host, Docker Compose project `triage-agent` |
 | Topology | Core plus Wazuh — `docker-compose.yml` + `docker-compose.wazuh.yml`, `wazuh` profile |
 | Services | `dashboard`, `ingest` (Suricata), `wazuh-ingest`, plus one-shot `migrate` and `config-bootstrap` |
@@ -45,6 +47,7 @@ inventory appears only as its revision hash and asset count, both of which the
 | Isolated configuration-lifecycle matrix | PASS |
 | Calibrated gold-set gate | PASS |
 | Complete project gates | PASS |
+| Post-review runtime fixes (redaction handoff, deprecated alias) | PASS |
 | Readiness | Ready for the final release-marking commit |
 
 ## Deployment and tree-equivalence proof
@@ -246,9 +249,12 @@ Dashboard 5xx responses in the bounded access log: **0**.
 The bounded-search implementation was delivered by PR #71 and is byte-identical
 in the candidate: the `436c259d…980615be…` diff touches no search code path.
 The measurements below were therefore **collected against `436c259d…`** and
-remain applicable to `980615be…` because the later tree delta is
-presentation-only. Provenance was verified by re-inspecting the diff rather than
-assumed.
+remain applicable because no later commit changed a search code path.
+Provenance was verified by re-inspecting each diff rather than assumed. The
+delta from `980615be…` to the final candidate `fd479ab…` does change dashboard
+runtime code, but only the redaction handoff guard and the deprecated-alias
+bounding recorded in "Post-review runtime fixes" below; the v1 bounded-search
+implementation is untouched.
 
 | Check | Status | Rows | Elapsed |
 |---|---|---:|---:|
@@ -409,6 +415,111 @@ All gates required by `AGENTS.md`, run on the evidence branch:
    i.e. window identity appears recoverable from the cursor. This is stable and
    non-breaking, and is recorded as an observation for maintainer confirmation
    rather than a defect.
+
+## Post-review runtime fixes (final operational candidate)
+
+Two review findings on PR #75 were validated and fixed after the initial
+operational candidate `980615be…`. Because these are **runtime** changes, the
+earlier claim that every post-candidate change was documentation-only does not
+hold, and this section records the re-verification. The final operational
+candidate is `fd479ab0582499e2bfffe2fd1184fb761a080120`.
+
+### What changed, and why
+
+| File | Change | Why |
+|---|---|---|
+| `triagewall/dashboard/static/dashboard.js` | Recognize the documented redacted-address format; suppress source/destination asset actions for a pseudonym; refuse the handoff in `openConfigurationFromAlert` | Under IP redaction the API returns a pseudonym and withholds asset context, so an asset candidate seeded from one cannot validate |
+| `triagewall/dashboard/static/configuration.js` | Refuse a redacted asset handoff at the exported `seedFromAlert`, before any editor state changes | That entry point is reachable without the dashboard guard; a hidden button is only an affordance |
+| `triagewall/dashboard/api/legacy.py` | Deprecated `GET /api/verdicts` gains the v1 input cap and bounded search work | Reachable under default unauthenticated reads; an absent or rare term previously scanned the complete retained table |
+| `docs/api.md` | Clarify the alias contract | The frozen shape claim alone would have been misleading once an over-long term returns 422 |
+
+No schema, migration, ingestion-writer, retention, storage, Compose, or
+environment file is touched, and no DDL or DML is added anywhere under
+`triagewall/`. The change is dashboard-only and read-only.
+
+### Backup decision
+
+**No new backup was taken.** The inspection above confirms the delta cannot
+alter persistent data behaviour, so the existing verified backup
+`triage-pre-v04-20260817T113637Z.db` (SHA-256 prefix `94cf8e7a`,
+`integrity_check: ok`) and prior code revision remain a sufficient rollback
+point. A further ~21.8 GB copy would have cost roughly 36 minutes of monitoring
+downtime for zero risk reduction.
+
+### Focused deployment
+
+Built before disruption, then only the dashboard was recreated; the Suricata and
+Wazuh consumers were never stopped. `.env`, credentials, backups, operator
+files, and the separate legacy stack were untouched and `.env` was confirmed
+unchanged by digest.
+
+- Deployment window: 2026-08-19T12:20:49Z – 2026-08-19T12:22:40Z
+- **Dashboard downtime: 19 seconds. Monitoring interruption: none.**
+- Host checkout is exactly `fd479ab…`; tracked worktree clean; seven untracked
+  operator files preserved.
+
+### Post-review five-minute observation
+
+| Sample | UTC | Suricata checkpoint | Wazuh checkpoint | `/api/health` | Restarts d/i/w |
+|---|---|---:|---:|---|---|
+| 1 | 2026-08-19T12:24:28Z | 1787142243 | 1787142245 | 200 | 0/0/0 |
+| 2 | 2026-08-19T12:25:28Z | 1787142304 | 1787142305 | 200 | 0/0/0 |
+| 3 | 2026-08-19T12:26:28Z | 1787142363 | 1787142365 | 200 | 0/0/0 |
+| 4 | 2026-08-19T12:27:28Z | 1787142423 | 1787142425 | 200 | 0/0/0 |
+| 5 | 2026-08-19T12:28:28Z | 1787142484 | 1787142485 | 200 | 0/0/0 |
+| 6 | 2026-08-19T12:29:28Z | 1787142544 | 1787142545 | 200 | 0/0/0 |
+
+Both consumers advanced monotonically on every sample; restart counts stayed
+zero. Endpoints: `/` 200, `/triage` 200, `/configuration` 200, `/api/health`
+200, `/metrics` 200.
+
+Bounded log review (500 lines / 40 minutes per service) across dashboard,
+Suricata ingest, and Wazuh ingest: **0** tracebacks, **0** database or lock
+errors, **0** reload failures, **0** search timeouts, **0** fatals, and **0**
+dashboard 5xx responses. Storage: root 85 G free (80% used), data volume 1.4 T
+free (23%).
+
+### Deprecated-alias bounded search, in production
+
+Exercised without an API key, matching production's configured read policy. The
+probe term was an opaque token generated in memory, never an address or
+hostname, and was never printed or written.
+
+| Probe | Result |
+|---|---|
+| Absent term | **200**, **0 rows**, **2.292 s** — inside the three-second budget |
+| Response shape | `{mode, stats, verdicts}` — frozen legacy contract intact |
+| Over-200-character term | **422** in 0.002 s |
+| Unsearched legacy read | **200** in 0.003 s, shape intact |
+
+No returned rows, addresses, hostnames, identifiers, or terms were recorded. The
+2.292 s figure is the bounded worst case on the production-scale database; before
+this fix the same class of query was unbounded.
+
+### Redaction handoff evidence
+
+Production IP redaction was **not** enabled and no production environment
+variable was changed for evidence; the dashboard still runs with
+`TRIAGEWALL_API_REDACT_IPS=false`. The authoritative proof is the automated
+redaction matrix, which exercises the pseudonym paths deterministically:
+
+| Invariant | Coverage |
+|---|---|
+| Redacted source pseudonym hides the source asset action | `tests/test_dashboard_polling.js` |
+| Redacted destination pseudonym hides the destination asset action | `tests/test_dashboard_polling.js` |
+| Real address with no asset context still offers the action | `tests/test_dashboard_polling.js` |
+| Prefilter handoff survives redaction | `tests/test_dashboard_polling.js`, `tests/test_configuration_editor.js` |
+| Direct handoff on a redacted address seeds nothing, navigates nowhere, replaces no form, changes no editor state (both sides) | `tests/test_dashboard_polling.js`, `tests/test_configuration_editor.js` |
+| Only the complete documented pseudonym format counts as redacted | both suites |
+
+In production only a normal dashboard and `/configuration` smoke check was
+performed, and no production configuration was mutated.
+
+### Relationship to the evidence commit
+
+This document is committed after `fd479ab…`. The evidence commit differs from
+the final operational runtime candidate only by this evidence document; it
+changes no application behaviour.
 
 ## Readiness recommendation
 
