@@ -15,6 +15,11 @@ const VALID_FILTERS = {
 // stays the empty string, and the empty string is what the API sees -- the
 // model parameter is simply omitted from the request.
 const SIGNATURE_FILTER_DEBOUNCE_MS = 300;
+// When the API redacts addresses it returns the documented pseudonym format:
+// "ip_" followed by exactly 32 lowercase hex characters. A pseudonym is not an
+// address, so an asset candidate seeded from one can never validate. Match the
+// complete format only: arbitrary values starting with "ip_" are ordinary data.
+const REDACTED_ADDRESS_PATTERN = /^ip_[0-9a-f]{32}$/;
 const MODEL_ALL_PARAM = "all";
 const DEFAULT_MODEL_FILTER = "llm";
 const TRIAGE_QUEUE_PATHS = new Set(["/", "/triage"]);
@@ -55,6 +60,16 @@ let detailAbort = null;
 // and vice versa.
 let queueGeneration = 0;
 let queueAbort = null;
+
+function isRedactedAddress(value) {
+  return typeof value === "string" && REDACTED_ADDRESS_PATTERN.test(value);
+}
+
+// An endpoint is editable as an asset only when it is a real address. An
+// unknown asset is still editable: that is the case an operator most wants.
+function assetEndpointIsEditable(value) {
+  return Boolean(value) && !isRedactedAddress(value);
+}
 
 function formatHourLabel(isoHour) {
   const date = new Date(isoHour);
@@ -994,8 +1009,8 @@ function renderDetail(verdict) {
       <p class="boundary-note">Start from this retained evidence. A separate in-memory <code>config:write</code> key is still required.</p>
       <div class="detail-feedback-actions">
         ${sensor === "suricata" && verdict.signature_id != null ? '<button class="action-btn" type="button" data-config-from-alert="prefilter">Draft scoped policy rule</button>' : ""}
-        ${verdict.src_ip ? '<button class="action-btn" type="button" data-config-from-alert="asset-source">Edit source asset</button>' : ""}
-        ${verdict.dest_ip ? '<button class="action-btn" type="button" data-config-from-alert="asset-destination">Edit destination asset</button>' : ""}
+        ${assetEndpointIsEditable(verdict.src_ip) ? '<button class="action-btn" type="button" data-config-from-alert="asset-source">Edit source asset</button>' : ""}
+        ${assetEndpointIsEditable(verdict.dest_ip) ? '<button class="action-btn" type="button" data-config-from-alert="asset-destination">Edit destination asset</button>' : ""}
       </div>
     </section>`;
   const reviewSection = verdict.human_verdict
@@ -1244,6 +1259,11 @@ function closeDetail() {
 
 function openConfigurationFromAlert(action) {
   if (!activeDetail || !["prefilter", "asset-source", "asset-destination"].includes(action)) return;
+  // The hidden button is only an affordance. Stale markup, a queued click, or a
+  // direct call must not seed, navigate, or disturb editor state when the
+  // selected endpoint is a pseudonym rather than an address.
+  if (action === "asset-source" && !assetEndpointIsEditable(activeDetail.src_ip)) return;
+  if (action === "asset-destination" && !assetEndpointIsEditable(activeDetail.dest_ip)) return;
   window.TriagewallConfigEditor?.seedFromAlert(activeDetail, action);
   invalidateDetailNavigation();
   activeDetail = null;

@@ -3089,3 +3089,169 @@ class LongRetentionRecurrenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class DeprecatedVerdictsAliasBoundedSearchTests(unittest.TestCase):
+    """The deprecated alias must do bounded search work.
+
+    ``GET /api/verdicts`` is reachable under default unauthenticated reads. It
+    kept ``bounded_search=False`` and no input cap, so an absent or rare term
+    scanned the complete retained table without the newest-candidate window or
+    the query-time budget. Its frozen legacy contract must survive the fix.
+    """
+
+    ROW_COUNT = 12
+    OLD_SIGNATURE = "zz-old-signature-outside-the-candidate-window"
+    PROBE_IP = "198.51.100.77"
+    PROBE_HOSTNAME = "probe-asset-hostname"
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "triage.db"
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript((PROJECT_ROOT / "triagewall" / "schema.sql").read_text())
+        conn.execute(
+            "INSERT INTO asset_snapshots (id, snapshot_hash, asset_json, created_at)"
+            " VALUES (1, 'probe-hash', ?, ?)",
+            (
+                json.dumps({"hostname": self.PROBE_HOSTNAME}),
+                format_utc_timestamp(datetime.now(timezone.utc)),
+            ),
+        )
+        now = datetime.now(timezone.utc)
+        # Oldest row carries the unique signature, the probe address, and the
+        # asset snapshot, so it sits outside a small newest-candidate window.
+        for index in range(self.ROW_COUNT):
+            oldest = index == self.ROW_COUNT - 1
+            event_time = now - timedelta(minutes=index)
+            conn.execute(
+                """
+                INSERT INTO triage_events (
+                    timestamp, signature_id, signature, raw_alert, verdict,
+                    confidence, reasoning, model_used, processed_at,
+                    src_ip, dest_ip, src_asset_snapshot_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    format_utc_timestamp(event_time),
+                    2000 + index,
+                    self.OLD_SIGNATURE if oldest else f"recent signature {index}",
+                    "{}",
+                    "false_positive",
+                    0.9,
+                    "reason",
+                    "test-llm",
+                    format_utc_timestamp(event_time),
+                    self.PROBE_IP if oldest else "10.0.0.5",
+                    "192.168.1.20",
+                    1 if oldest else None,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+        self.old_db_path = dashboard.DB_PATH
+        self.old_mode = dashboard.MODE
+        self.old_keys = dashboard.auth_state.keys
+        self.old_allow = dashboard.auth_state.allow_unauthenticated_reads
+
+        dashboard.DB_PATH = self.db_path
+        dashboard.MODE = "local"
+        # The finding is specifically about the default unauthenticated read
+        # policy, so the alias is exercised exactly that way.
+        dashboard.auth_state.allow_unauthenticated_reads = True
+        dashboard.auth_state.keys = ()
+        services.reset_caches()
+        self.client = TestClient(dashboard.app)
+        self.host = {"host": "localhost"}
+
+    def tearDown(self):
+        dashboard.DB_PATH = self.old_db_path
+        dashboard.MODE = self.old_mode
+        dashboard.auth_state.keys = self.old_keys
+        dashboard.auth_state.allow_unauthenticated_reads = self.old_allow
+        services.reset_caches()
+        self.temp_dir.cleanup()
+
+    def _legacy(self, **params):
+        return self.client.get("/api/verdicts", params=params, headers=self.host)
+
+    def test_match_outside_the_candidate_window_is_not_returned(self):
+        with patch.object(services, "MAX_QUEUE_SEARCH_CANDIDATE_ROWS", 3):
+            legacy = self._legacy(signature=self.OLD_SIGNATURE)
+            v1 = self.client.get(
+                "/api/v1/verdicts",
+                params={"signature": self.OLD_SIGNATURE},
+                headers=self.host,
+            )
+
+        self.assertEqual(legacy.status_code, 200)
+        self.assertEqual(legacy.json()["verdicts"], [])
+        # v1 already bounds this; the alias must agree.
+        self.assertEqual(v1.json()["verdicts"], [])
+
+    def test_a_recent_signature_still_matches(self):
+        with patch.object(services, "MAX_QUEUE_SEARCH_CANDIDATE_ROWS", 3):
+            response = self._legacy(signature="recent signature 0")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["verdicts"]), 1)
+
+    def test_legacy_response_shape_is_frozen(self):
+        response = self._legacy(signature="recent signature 0")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.json()), {"mode", "stats", "verdicts"})
+
+    def test_alias_stays_signature_only(self):
+        ip_search = self._legacy(signature=self.PROBE_IP)
+        hostname_search = self._legacy(signature=self.PROBE_HOSTNAME)
+
+        # Private search is a v1 contract addition; the alias must not gain it.
+        self.assertEqual(ip_search.json()["verdicts"], [])
+        self.assertEqual(hostname_search.json()["verdicts"], [])
+
+    def test_overlong_signature_is_rejected(self):
+        response = self._legacy(
+            signature="x" * (services.MAX_SIGNATURE_SEARCH_LENGTH + 1)
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_unsearched_reads_are_outside_the_search_deadline(self):
+        with patch.object(
+            services, "QUEUE_SEARCH_TIMEOUT_SECONDS", -1.0, create=True
+        ), patch.object(
+            services, "QUEUE_SEARCH_PROGRESS_OPCODES", 1, create=True
+        ):
+            absent = self._legacy()
+            whitespace = self._legacy(signature="   ")
+
+        self.assertEqual(absent.status_code, 200)
+        self.assertEqual(whitespace.status_code, 200)
+        self.assertEqual(len(whitespace.json()["verdicts"]), self.ROW_COUNT)
+
+    def test_search_time_budget_is_enforced(self):
+        with patch.object(
+            services, "QUEUE_SEARCH_TIMEOUT_SECONDS", -1.0, create=True
+        ), patch.object(
+            services, "QUEUE_SEARCH_PROGRESS_OPCODES", 1, create=True
+        ):
+            response = self._legacy(signature="zz-absent-term")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["detail"],
+            "search exceeded its query-time budget; narrow the filters and retry",
+        )
+
+    def test_bounded_zero_match_query_completes_promptly(self):
+        started = time.monotonic()
+        response = self._legacy(signature="zz-absent-term")
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["verdicts"], [])
+        # Generous relative to the 3s production budget; this is a guard
+        # against an unbounded scan, not a performance benchmark.
+        self.assertLess(elapsed, 10.0)

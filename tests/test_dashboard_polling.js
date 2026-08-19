@@ -83,7 +83,13 @@ function runDashboard({
   searchWindow = "search-window-token",
   defer = () => false,
   fail = () => false,
+  // Extra fields merged into the stubbed detail verdict so redaction and
+  // asset-context shapes can be modelled per test.
+  detailVerdict = null,
 }) {
+  // Records what the dashboard asked the configuration editor to do, so a
+  // refused handoff can be proven by absence rather than by reading markup.
+  const configEditorCalls = [];
   const elements = new Map();
   const documentListeners = new Map();
   const intervals = [];
@@ -278,6 +284,7 @@ function runDashboard({
           signature: `signature-${id}`,
           confidence: 0.9,
           sensor_context: { source: "suricata" },
+          ...(detailVerdict ?? {}),
         },
       };
     }
@@ -391,6 +398,14 @@ function runDashboard({
         windowListeners.get(type).push(handler);
       },
       scrollTo() {},
+      TriagewallConfigEditor: {
+        seedFromAlert(verdict, action) {
+          configEditorCalls.push({ call: "seedFromAlert", action });
+        },
+        load() {
+          configEditorCalls.push({ call: "load" });
+        },
+      },
     },
     fetch: fetchStub,
     // The real polling module, with its scheduler captured so ticks are fired
@@ -414,6 +429,7 @@ function runDashboard({
   const probe = `
 ;globalThis.__probe = {
   open: (id, options) => openDetailById(id, options),
+  configFromAlert: (action) => openConfigurationFromAlert(action),
   setFilter: (key, value) => { currentFilter[key] = value; },
   applyFilters: () => applyFilters(),
   loadOlder: () => loadOlder(),
@@ -451,6 +467,7 @@ function runDashboard({
     replacedUrls,
     location,
     api: sandbox.__probe,
+    configEditorCalls,
     deferred,
     releaseDeferred: (predicate = () => true) => {
       const queued = deferred.filter(({ url }) => predicate(url));
@@ -2731,4 +2748,125 @@ test("overview uses a truthful policy-to-model decision band", () => {
   assert.match(script, /stats\.today_llm/);
   assert.match(script, /stats\.model_real_count/);
   assert.match(script, /stats\.unreviewed_model_count/);
+});
+
+// --- Redacted asset handoffs -------------------------------------------------
+// With IP redaction enabled the API returns documented pseudonyms ("ip_" plus
+// exactly 32 lowercase hex characters) in src_ip/dest_ip and withholds
+// asset_context. A pseudonym is not an address, so an asset candidate seeded
+// from one cannot validate. The button must disappear, and because a button is
+// only an affordance, the handoff path must refuse independently.
+
+const REDACTED_SOURCE = `ip_${"a".repeat(32)}`;
+const REDACTED_DESTINATION = `ip_${"0123456789abcdef".repeat(2)}`;
+
+async function openDetailWith(detailVerdict) {
+  const harness = runDashboard({ pathname: "/triage", detailVerdict });
+  await harness.settle();
+  harness.api.open(7);
+  await harness.settle();
+  return harness;
+}
+
+test("a redacted source pseudonym hides the source asset action", async () => {
+  const harness = await openDetailWith({
+    src_ip: REDACTED_SOURCE,
+    dest_ip: "203.0.113.10",
+  });
+  const html = harness.document.getElementById("detailPageContent").innerHTML;
+
+  assert.doesNotMatch(html, /data-config-from-alert="asset-source"/);
+  assert.match(html, /data-config-from-alert="asset-destination"/);
+});
+
+test("a redacted destination pseudonym hides the destination asset action", async () => {
+  const harness = await openDetailWith({
+    src_ip: "203.0.113.10",
+    dest_ip: REDACTED_DESTINATION,
+  });
+  const html = harness.document.getElementById("detailPageContent").innerHTML;
+
+  assert.doesNotMatch(html, /data-config-from-alert="asset-destination"/);
+  assert.match(html, /data-config-from-alert="asset-source"/);
+});
+
+test("a real address with no asset context still offers the asset action", async () => {
+  const harness = await openDetailWith({
+    src_ip: "203.0.113.10",
+    dest_ip: "203.0.113.11",
+    asset_context: null,
+  });
+  const html = harness.document.getElementById("detailPageContent").innerHTML;
+
+  // Unknown assets are exactly the ones an operator most wants to add.
+  assert.match(html, /data-config-from-alert="asset-source"/);
+  assert.match(html, /data-config-from-alert="asset-destination"/);
+});
+
+test("prefilter handoff survives IP redaction when its own fields are present", async () => {
+  const harness = await openDetailWith({
+    src_ip: REDACTED_SOURCE,
+    dest_ip: REDACTED_DESTINATION,
+    signature_id: 2010935,
+    sensor_context: { source: "suricata" },
+  });
+  const html = harness.document.getElementById("detailPageContent").innerHTML;
+
+  // The prefilter rule is keyed by signature, not by address.
+  assert.match(html, /data-config-from-alert="prefilter"/);
+  assert.doesNotMatch(html, /data-config-from-alert="asset-source"/);
+  assert.doesNotMatch(html, /data-config-from-alert="asset-destination"/);
+});
+
+for (const [side, action] of [
+  ["source", "asset-source"],
+  ["destination", "asset-destination"],
+]) {
+  test(`a directly invoked ${side} asset handoff on a redacted address is refused`, async () => {
+    const harness = await openDetailWith({
+      src_ip: REDACTED_SOURCE,
+      dest_ip: REDACTED_DESTINATION,
+    });
+    const pushesBefore = harness.pushedUrls.length;
+    const stateBefore = harness.api.state();
+
+    // Stale markup or a direct call must not reach the editor.
+    harness.api.configFromAlert(action);
+    await harness.settle();
+
+    assert.deepEqual(harness.configEditorCalls, []);
+    assert.equal(harness.pushedUrls.length, pushesBefore);
+    assert.ok(!harness.pushedUrls.some((url) => String(url).includes("/configuration")));
+    assert.ok(!harness.location.pathname.startsWith("/configuration"));
+    assert.equal(harness.api.state().activeDetail?.id, stateBefore.activeDetail?.id);
+  });
+}
+
+test("an unredacted asset handoff still reaches the configuration editor", async () => {
+  const harness = await openDetailWith({
+    src_ip: "203.0.113.10",
+    dest_ip: "203.0.113.11",
+  });
+
+  harness.api.configFromAlert("asset-source");
+  await harness.settle();
+
+  assert.ok(
+    harness.configEditorCalls.some(
+      (entry) => entry.call === "seedFromAlert" && entry.action === "asset-source",
+    ),
+  );
+  assert.ok(harness.pushedUrls.some((url) => String(url).includes("/configuration")));
+});
+
+test("only the documented pseudonym format counts as redacted", async () => {
+  // Arbitrary "ip_" strings are ordinary values and must not be suppressed.
+  const harness = await openDetailWith({
+    src_ip: "ip_not-a-pseudonym",
+    dest_ip: `ip_${"A".repeat(32)}`,
+  });
+  const html = harness.document.getElementById("detailPageContent").innerHTML;
+
+  assert.match(html, /data-config-from-alert="asset-source"/);
+  assert.match(html, /data-config-from-alert="asset-destination"/);
 });

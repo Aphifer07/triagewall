@@ -519,4 +519,14 @@ The aliases keep their historical behaviour until removal: their shapes are
 frozen, and unrecognized filter values are still ignored rather than rejected.
 New clients should use `/api/v1/*`, where those values are 422s.
 
+`GET /api/verdicts` keeps that frozen `{mode, stats, verdicts}` shape, its
+lenient filter vocabulary, and its lack of cursor fields, but its `signature`
+search does the same bounded work as v1: the term is capped at 200 characters,
+matching is limited to the newest 10,000 retained candidates, and the query-time
+budget applies. An over-long term returns 422 and an exhausted budget returns
+503. The alias remains **signature-only** — it does not search source or
+destination addresses or historical asset hostnames, which stay a v1 addition.
+Requests without a `signature`, or with a whitespace-only one, remain ordinary
+unsearched reads outside that deadline.
+
 Removal target: **2026-12-31**.

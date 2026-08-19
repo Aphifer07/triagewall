@@ -882,6 +882,20 @@
 
   async function seedFromAlert(verdict, action) {
     const side = action === "asset-source" ? "source" : "destination";
+    // This entry point is exported, so it is reachable without the dashboard's
+    // guard. A redacted address is the documented pseudonym format ("ip_" plus
+    // exactly 32 lowercase hex characters), which cannot produce a valid asset
+    // candidate. Refuse before touching pendingSeed, any form, or the dirty
+    // markers so a refused handoff changes no editor state at all.
+    if (action !== "prefilter") {
+      const address = side === "source" ? verdict?.src_ip : verdict?.dest_ip;
+      if (typeof address === "string" && /^ip_[0-9a-f]{32}$/.test(address)) {
+        setMessage(
+          "This alert's address is redacted, so it cannot seed an asset record.",
+        );
+        return undefined;
+      }
+    }
     pendingSeed = action === "prefilter" ? {
       action,
       signatureId: verdict?.signature_id,

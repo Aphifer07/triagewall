@@ -1955,3 +1955,77 @@ test("rollback requires an explicit selection and forwards dedicated acknowledge
     true,
   );
 });
+
+// The handoff entry point is exported on TriagewallConfigEditor, so it is
+// reachable without the dashboard's button guard. A redacted pseudonym cannot
+// produce a valid asset candidate, and refusing it must not disturb the form.
+for (const [side, action, field] of [
+  ["source", "asset-source", "src_ip"],
+  ["destination", "asset-destination", "dest_ip"],
+]) {
+  test(`a redacted ${side} address is refused by the exported handoff`, async () => {
+    const harness = runEditor({
+      confirmReply: () => {
+        throw new Error("a refused handoff must not prompt");
+      },
+      assetRows: SEED_ASSET_ROWS,
+    });
+    await connect(harness);
+    await typeAssetHostname(harness, "half-typed-host");
+    harness.document.getElementById("configAssetIps").value = "10.9.9.9";
+    await harness.document.getElementById("configAssetIps").dispatch("input");
+    const callsBefore = harness.calls.length;
+
+    await harness.editor.seedFromAlert(
+      { [field]: `ip_${"b".repeat(32)}`, asset_context: null },
+      action,
+    );
+
+    // No prompt, no seed, no refresh, and the operator's input is intact.
+    assert.equal(harness.prompts.length, 0);
+    assert.equal(
+      harness.document.getElementById("configAssetHostname").value,
+      "half-typed-host",
+    );
+    assert.equal(harness.document.getElementById("configAssetIps").value, "10.9.9.9");
+    assert.equal(harness.editor.state().dirtyForms.join(","), "asset");
+    assert.equal(harness.calls.length, callsBefore);
+  });
+}
+
+test("only the documented pseudonym format is refused by the exported handoff", async () => {
+  const harness = runEditor({ confirmReply: () => true, assetRows: SEED_ASSET_ROWS });
+  await connect(harness);
+
+  // Uppercase hex and a short tag are not the documented format.
+  await harness.editor.seedFromAlert(
+    { src_ip: `ip_${"A".repeat(32)}`, asset_context: {} },
+    "asset-source",
+  );
+
+  assert.equal(
+    harness.document.getElementById("configAssetIps").value,
+    `ip_${"A".repeat(32)}`,
+  );
+});
+
+test("a prefilter handoff is unaffected by address redaction", async () => {
+  const harness = runEditor({ confirmReply: () => true, assetRows: SEED_ASSET_ROWS });
+  await connect(harness);
+
+  await harness.editor.seedFromAlert(
+    {
+      src_ip: `ip_${"c".repeat(32)}`,
+      dest_ip: `ip_${"d".repeat(32)}`,
+      signature_id: 2010935,
+      signature: "ET SCAN probe",
+      proto: "TCP",
+    },
+    "prefilter",
+  );
+
+  assert.equal(
+    harness.document.getElementById("configRuleSignatures").value,
+    "2010935",
+  );
+});

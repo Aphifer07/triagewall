@@ -71,7 +71,10 @@ def create_legacy_router(
     def list_verdicts(
         request: Request,
         verdict: str | None = None,
-        signature: str | None = None,
+        signature: str | None = Query(
+            default=None,
+            max_length=services.MAX_SIGNATURE_SEARCH_LENGTH,
+        ),
         model: str | None = None,
         limit: int = Query(default=100, ge=1, le=500),
         _auth: AuthContext = Depends(require_read),
@@ -85,7 +88,12 @@ def create_legacy_router(
                 # This deprecated alias remains signature-only until removal;
                 # expanded workbench search is a v1 contract addition.
                 include_private_search=False,
-                bounded_search=False,
+                # Reachable under default unauthenticated reads, so its search
+                # does the same bounded work as v1: the newest-candidate window
+                # and the query-time budget. Only the work is bounded; the
+                # frozen response shape, filters, and absent cursor are
+                # unchanged, and an unsearched read stays outside the deadline.
+                bounded_search=True,
                 limit=limit,
                 cursor=None,
             )
