@@ -242,17 +242,18 @@ function runEditor({
   const fetch = async (url, options = {}) => {
     const target = String(url);
     calls.push({ url: target, options });
+    // A deferred request only settles when the test releases it, which is how
+    // a response is made to arrive after newer state exists. Deferral is
+    // applied before failure so a *delayed* failure is expressible too.
+    if (defer && defer(target, options)) {
+      await new Promise((resolve) => released.push(resolve));
+    }
     if (fail(target, options)) {
       return {
         ok: false,
         status: 409,
         json: async () => ({ detail: "configuration generation is stale" }),
       };
-    }
-    // A deferred request only settles when the test releases it, which is how
-    // a response is made to arrive after newer state exists.
-    if (defer && defer(target, options)) {
-      await new Promise((resolve) => released.push(resolve));
     }
     return { ok: true, status: 200, json: async () => bodyFor(target, options) };
   };
@@ -2029,3 +2030,261 @@ test("a prefilter handoff is unaffected by address redaction", async () => {
     "2010935",
   );
 });
+
+// --- Stale lifecycle responses and structural list mutations -----------------
+// Three review findings: create-draft published against state read after its
+// await, activation/rollback force-reloading over newer work, and list removals
+// leaving a stale indexed edit handle.
+
+const TWO_RULES = [
+  { signature_ids: [1001], reason: "first rule", match: { protocols: ["tcp"] } },
+  { signature_ids: [1002], reason: "second rule", match: { protocols: ["udp"] } },
+];
+const TWO_ASSETS = [
+  { hostname: "asset-one", ips: ["10.0.0.11"], criticality: "low" },
+  { hostname: "asset-two", ips: ["10.0.0.12"], criticality: "low" },
+];
+
+function closestStub(selector, dataset) {
+  return {
+    target: {
+      closest: (query) => (query === selector ? { dataset } : null),
+    },
+  };
+}
+
+const removeRuleClick = (index) =>
+  closestStub("[data-config-rule-remove]", { configRuleRemove: String(index) });
+const removeAssetClick = (index) =>
+  closestStub("[data-config-asset-remove]", { configAssetRemove: String(index) });
+const editRuleClick = (index) =>
+  closestStub("[data-config-rule-edit]", { configRuleEdit: String(index) });
+const editAssetClick = (index) =>
+  closestStub("[data-config-asset-edit]", { configAssetEdit: String(index) });
+const kindClick = (kind) =>
+  closestStub("[data-config-kind]", { configKind: kind });
+
+// Prepares a candidate and a change note. Awaited fully, so the create-draft
+// click that follows is the only thing still in flight and its identity is
+// captured before any disturbance.
+async function primeDraft(harness) {
+  harness.document.getElementById("configChangeNote").value = "why this change";
+  await harness.document.getElementById("configChangeNote").dispatch("input");
+  harness.document.getElementById("configInternalCidrs").value = "10.0.1.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+}
+
+function clickCreateDraft(harness) {
+  return harness.document.getElementById("configCreateDraft").dispatch("click");
+}
+
+for (const [name, disturb] of [
+  ["candidate edit", async (harness) => {
+    harness.document.getElementById("configInternalCidrs").value = "10.0.2.0/24";
+    await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  }],
+  ["kind switch", async (harness) => {
+    await harness.document
+      .getElementById("configWorkspace")
+      .dispatch("click", kindClick("asset_inventory"));
+  }],
+  ["disconnect", async (harness) => {
+    await harness.document.getElementById("configForgetButton").dispatch("click");
+  }],
+]) {
+  test(`a create-draft response superseded by a ${name} publishes no handle`, async () => {
+    const harness = runEditor({ defer: (url) => url.endsWith("/drafts") });
+    await connectDeferred(harness);
+    await primeDraft(harness);
+    const creating = clickCreateDraft(harness);
+
+    await disturb(harness);
+    await harness.release();
+    await creating;
+
+    const after = harness.editor.state();
+    assert.equal(after.lifecycle.draftId, null, `${name}: stale draft handle published`);
+    assert.equal(after.lifecycle.kind, null, `${name}: stale lifecycle kind published`);
+  });
+}
+
+test("a superseded create-draft does not clear the change-note scope", async () => {
+  const harness = runEditor({ defer: (url) => url.endsWith("/drafts") });
+  await connectDeferred(harness);
+  await primeDraft(harness);
+  const creating = clickCreateDraft(harness);
+
+  // The note was never applied to this draft's context, so it stays unapplied.
+  harness.document.getElementById("configInternalCidrs").value = "10.0.2.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  await harness.release();
+  await creating;
+
+  assert.ok(harness.editor.state().dirtyForms.includes("note"));
+  assert.equal(
+    harness.document.getElementById("configChangeNote").value,
+    "why this change",
+  );
+});
+
+test("a superseded create-draft failure does not overwrite newer status", async () => {
+  const harness = runEditor({
+    defer: (url) => url.endsWith("/drafts"),
+    fail: (url) => url.endsWith("/drafts"),
+  });
+  await connectDeferred(harness);
+  await primeDraft(harness);
+  const creating = clickCreateDraft(harness);
+
+  await harness.document
+    .getElementById("configWorkspace")
+    .dispatch("click", kindClick("asset_inventory"));
+  const messageBefore = harness.document.getElementById("configLifecycleMessage").textContent;
+  await harness.release();
+  await creating.catch(() => {});
+
+  assert.equal(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    messageBefore,
+  );
+});
+
+// Activation and rollback both end by refreshing server state, and both were
+// force-reloading over whatever the operator did while the request was pending.
+async function driveToActivation(harness) {
+  harness.document.getElementById("configInternalCidrs").value = "10.0.1.0/24";
+  await harness.document.getElementById("configInternalCidrs").dispatch("change");
+  await harness.document.getElementById("configCreateDraft").dispatch("click");
+  await harness.document.getElementById("configValidateDraft").dispatch("click");
+  await harness.document.getElementById("configPreviewDraft").dispatch("click");
+  harness.document.getElementById("configConfirmActivate").checked = true;
+  await harness.document.getElementById("configConfirmActivate").dispatch("change");
+}
+
+test("a pending activation does not erase work created while it was in flight", async () => {
+  const harness = runEditor({ defer: (url) => url.endsWith("/activate") });
+  await connect(harness);
+  await driveToActivation(harness);
+  const activating = harness.document.getElementById("configActivateDraft").dispatch("click");
+
+  // Newer operator work arrives while activation is pending.
+  await typeRuleReason(harness, "Half-typed reason");
+  await harness.release();
+  await activating;
+
+  const after = harness.editor.state();
+  assert.ok(after.dirtyForms.includes("rule"), "newer form work was erased");
+  assert.equal(
+    harness.document.getElementById("configRuleReason").value,
+    "Half-typed reason",
+  );
+  // The activation did change server state, so the operator must not be left
+  // believing it failed.
+  assert.match(
+    harness.document.getElementById("configLifecycleMessage").textContent,
+    /activated/i,
+  );
+});
+
+test("a pending rollback does not erase work created while it was in flight", async () => {
+  const harness = runEditor({ defer: (url) => url.endsWith("/rollback") });
+  await connect(harness);
+  await harness.document.getElementById("configWorkspace").dispatch("click", rollbackClick(9));
+  const rollingBack = harness.document.getElementById("configConfirmRollback").dispatch("click");
+
+  await typeRuleReason(harness, "Half-typed reason");
+  await harness.release();
+  await rollingBack;
+
+  // The rollback must genuinely have been sent, or this proves nothing.
+  assert.ok(harness.calls.some((call) => call.url.endsWith("/rollback")));
+  const after = harness.editor.state();
+  assert.ok(after.dirtyForms.includes("rule"), "newer form work was erased");
+  assert.equal(
+    harness.document.getElementById("configRuleReason").value,
+    "Half-typed reason",
+  );
+});
+
+// Structural list mutations must not leave an indexed edit handle behind.
+for (const [name, editIndex, removeIndex] of [
+  ["the same rule", 1, 1],
+  ["an earlier rule that shifts the index", 1, 0],
+  ["a later rule", 0, 1],
+]) {
+  test(`removing ${name} clears the open rule edit handle`, async () => {
+    const harness = runEditor({ prefilterRules: TWO_RULES, assetRows: TWO_ASSETS });
+    await connect(harness);
+    // Unrelated work that must survive.
+    harness.document.getElementById("configChangeNote").value = "why this change";
+    await harness.document.getElementById("configChangeNote").dispatch("input");
+    await typeAssetHostname(harness, "half-typed-asset");
+
+    await harness.document
+      .getElementById("configWorkspace")
+      .dispatch("click", editRuleClick(editIndex));
+    assert.equal(
+      harness.document.getElementById("configRuleIndex").value,
+      String(editIndex),
+    );
+
+    await harness.document
+      .getElementById("configWorkspace")
+      .dispatch("click", removeRuleClick(removeIndex));
+
+    assert.equal(harness.document.getElementById("configRuleIndex").value, "");
+    const after = harness.editor.state();
+    assert.ok(!after.dirtyForms.includes("rule"), "stale rule edit handle survived");
+    // Unrelated scopes are not this mutation's to discard.
+    assert.ok(after.dirtyForms.includes("note"));
+    assert.ok(after.dirtyForms.includes("asset"));
+    assert.equal(
+      harness.document.getElementById("configChangeNote").value,
+      "why this change",
+    );
+    assert.equal(
+      harness.document.getElementById("configAssetHostname").value,
+      "half-typed-asset",
+    );
+  });
+}
+
+for (const [name, editIndex, removeIndex] of [
+  ["the same asset", 1, 1],
+  ["an earlier asset that shifts the index", 1, 0],
+  ["a later asset", 0, 1],
+]) {
+  test(`removing ${name} clears the open asset edit handle`, async () => {
+    const harness = runEditor({ prefilterRules: TWO_RULES, assetRows: TWO_ASSETS });
+    await connect(harness);
+    harness.document.getElementById("configChangeNote").value = "why this change";
+    await harness.document.getElementById("configChangeNote").dispatch("input");
+    await typeRuleReason(harness, "half-typed-rule");
+
+    await harness.document
+      .getElementById("configWorkspace")
+      .dispatch("click", editAssetClick(editIndex));
+    assert.equal(
+      harness.document.getElementById("configAssetIndex").value,
+      String(editIndex),
+    );
+
+    await harness.document
+      .getElementById("configWorkspace")
+      .dispatch("click", removeAssetClick(removeIndex));
+
+    assert.equal(harness.document.getElementById("configAssetIndex").value, "");
+    const after = harness.editor.state();
+    assert.ok(!after.dirtyForms.includes("asset"), "stale asset edit handle survived");
+    assert.ok(after.dirtyForms.includes("note"));
+    assert.ok(after.dirtyForms.includes("rule"));
+    assert.equal(
+      harness.document.getElementById("configChangeNote").value,
+      "why this change",
+    );
+    assert.equal(
+      harness.document.getElementById("configRuleReason").value,
+      "half-typed-rule",
+    );
+  });
+}

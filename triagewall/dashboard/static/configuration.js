@@ -583,16 +583,22 @@
   }
 
   async function createDraft() {
+    // The returned handle describes exactly the candidate, kind, parent, and
+    // generation this request was sent for. Reading any of that back after the
+    // await would let an edit, kind switch, reload, or disconnect attach the
+    // older draft's identity -- and its canonical document -- to newer work.
+    const identity = lifecycleIdentity();
     try {
-      const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts`, {
+      const payload = await configRequest(`/api/v1/config/${identity.selectedKind}/drafts`, {
         method: "POST",
         body: JSON.stringify({
-          document: workingDocuments[selectedKind],
-          parent_revision_id: summary.active[selectedKind].id,
-          expected_generation: summary.generation,
+          document: workingDocuments[identity.selectedKind],
+          parent_revision_id: identity.parentRevisionId,
+          expected_generation: identity.generation,
           note: element("configChangeNote").value.trim() || null,
         }),
       });
+      if (!ownsCurrentLifecycle(identity)) return;
       // An identical candidate may already exist when editor state was lost.
       // The server returns it only when it is still resumable against the
       // current active parent and generation, so the lifecycle continues from
@@ -603,10 +609,12 @@
         ? payload.validated_revision_id ?? null
         : null;
       // The note has now been applied to an immutable draft, so it is no
-      // longer unapplied work.
+      // longer unapplied work. Only reached while this draft's context still
+      // owns the editor, so a superseded response never clears a note the
+      // operator wrote for newer work.
       clearFormScope(FORM_SCOPES.note);
       lifecycle = {
-        kind: selectedKind,
+        kind: identity.selectedKind,
         draftId: payload.draft.id,
         validatedId: validatedRevisionId,
         preview: null,
@@ -616,6 +624,9 @@
         : `Immutable draft #${payload.draft.id} created. Validate it next.`);
       renderLifecycle();
     } catch (error) {
+      // A failure belongs to the context that asked for it; a superseded one
+      // reports nothing over newer work.
+      if (!ownsCurrentLifecycle(identity)) return;
       setMessage(error.status === 409 ? `${error.message} Reload active configuration before retrying.` : error.message, true);
     }
   }
@@ -729,19 +740,34 @@
       );
       return;
     }
+    // The editor stays interactive while activation is pending, so the refresh
+    // that follows success must be bound to the lifecycle that asked for it.
+    const identity = lifecycleIdentity();
     try {
-      const payload = await configRequest(`/api/v1/config/${selectedKind}/drafts/${lifecycle.draftId}/activate`, {
+      const payload = await configRequest(`/api/v1/config/${identity.selectedKind}/drafts/${identity.draftId}/activate`, {
         method: "POST",
         body: JSON.stringify({
-          expected_generation: summary.generation,
+          expected_generation: identity.generation,
           acknowledge_broad_rules: element("configAcknowledgeBroad").checked,
           acknowledge_shipped_base_change: element("configAcknowledgeBase").checked,
           acknowledge_incomplete_asset_preview: element("configConfirmAssetPreview").checked,
         }),
       });
+      if (!ownsCurrentLifecycle(identity)) {
+        // Activation did change server state, so this is not a failure and must
+        // not be reported as one. It is also not a licence to force-reload over
+        // the work the operator started while the request was in flight, which
+        // a forced load would discard without the usual confirmation. Keep that
+        // work and say plainly that the view is now behind the server.
+        setMessage(
+          `Generation ${payload.generation} activated. Your newer unapplied work was kept, so this view still shows the previous generation -- reload active configuration when you are ready to discard it.`,
+        );
+        return;
+      }
       await load(true);
       setMessage(`Generation ${payload.generation} activated. Runtime consumers will reload between records.`);
     } catch (error) {
+      if (!ownsCurrentLifecycle(identity)) return;
       setMessage(error.status === 409 ? `${error.message} Review the acknowledgement controls or reload active configuration.` : error.message, true);
     }
   }
@@ -762,19 +788,29 @@
       );
       return;
     }
+    // Rollback is an activation, so it carries the same hazard: its refresh
+    // must belong to the lifecycle that requested it.
+    const identity = lifecycleIdentity();
     try {
-      const payload = await configRequest(`/api/v1/config/${selectedKind}/revisions/${revisionId}/rollback`, {
+      const payload = await configRequest(`/api/v1/config/${identity.selectedKind}/revisions/${revisionId}/rollback`, {
         method: "POST",
         body: JSON.stringify({
-          expected_generation: summary.generation,
+          expected_generation: identity.generation,
           acknowledge_broad_rules: element("configRollbackAcknowledgeBroad").checked,
           acknowledge_shipped_base_change: element("configRollbackAcknowledgeBase").checked,
           acknowledge_incomplete_asset_preview: element("configConfirmRollbackAssetPreview").checked,
         }),
       });
+      if (!ownsCurrentLifecycle(identity)) {
+        setMessage(
+          `Rolled back to revision #${revisionId} as generation ${payload.generation}. Your newer unapplied work was kept, so this view still shows the previous generation -- reload active configuration when you are ready to discard it.`,
+        );
+        return;
+      }
       await load(true);
       setMessage(`Rolled back to revision #${revisionId} as generation ${payload.generation}.`);
     } catch (error) {
+      if (!ownsCurrentLifecycle(identity)) return;
       setMessage(error.status === 409 ? `${error.message} Review the rollback acknowledgements or reload active configuration.` : error.message, true);
     }
   }
@@ -1103,6 +1139,11 @@
     if (ruleRemove) {
       workingDocuments.prefilter_policy.auto_false_positive.splice(Number(ruleRemove.dataset.configRuleRemove), 1);
       selectedKind = "prefilter_policy";
+      // The open rule form addresses a position in the array that just moved,
+      // so Apply would write to whichever rule shifted into it. Cancel that
+      // edit. Only the rule scope is dropped: the asset form, the change note,
+      // and the CIDR field are not this removal's to discard.
+      resetRuleForm();
       return markDirty();
     }
     const assetEdit = target.closest?.("[data-config-asset-edit]");
@@ -1111,6 +1152,9 @@
     if (assetRemove) {
       workingDocuments.asset_inventory.assets.splice(Number(assetRemove.dataset.configAssetRemove), 1);
       selectedKind = "asset_inventory";
+      // Same indexed-edit hazard on the asset list, and the same narrow scope:
+      // the rule form, change note, and CIDR field survive.
+      resetAssetForm();
       return markDirty();
     }
     const rollback = target.closest?.("[data-config-rollback]");
