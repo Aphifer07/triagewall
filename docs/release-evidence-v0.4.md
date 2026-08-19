@@ -10,7 +10,7 @@ is reviewed and release publication is explicitly authorized.
 | Operational candidate SHA | `980615be0e2021dbf0b4b09cfff94491d4c82fa8` |
 | Previous deployed SHA | `436c259d17fcda0bb74ddd565bc884e70d2bfab4` |
 | Target branch | `v0.4-stabilization` |
-| Collection window (UTC) | 2026-08-18T17:52Z – 2026-08-18T18:05Z |
+| Collection window (UTC) | 2026-08-18T17:52Z – 2026-08-19T03:01Z |
 | Production observation window (UTC) | 2026-08-18T17:54:17Z – 2026-08-18T17:59:17Z |
 | Environment | Single operator host, Docker Compose project `triage-agent` |
 | Topology | Core plus Wazuh — `docker-compose.yml` + `docker-compose.wazuh.yml`, `wazuh` profile |
@@ -36,6 +36,7 @@ inventory appears only as its revision hash and asset count, both of which the
 | Deployment to production host | PASS (no rollback) |
 | Backup decision | No new backup required — justified below |
 | Five-minute health and checkpoint observation | PASS (6/6 samples) |
+| Source-specific persisted verdicts (Suricata and Wazuh) | PASS |
 | Bounded log review | PASS (all counters zero) |
 | Bounded-search behaviour | PASS |
 | Investigation / navigation window stability | PASS |
@@ -152,6 +153,73 @@ remained zero for all three services throughout.
 
 Endpoint checks on the deployed candidate: `/` 200, `/triage` 200,
 `/configuration` 200, `/api/health` 200, `/metrics` 200.
+
+### Source-specific persisted verdicts
+
+Checkpoint advancement alone does not prove a sensor path is producing work.
+Both ingesters deliberately advance their durable checkpoint for records that
+never become a verdict: the Suricata reader returns a checkpoint-only result for
+empty lines, undecodable JSON, non-object events, `event_type != "alert"`,
+malformed alert objects, and duplicates, and the Wazuh reader counts `scanned`
+records separately from triaged ones. `/api/health` is also a single global
+aggregate (`MAX(processed_at)` over `triage_events`, with no source predicate),
+so one healthy source can satisfy it while the other persists nothing.
+
+The evidence below therefore counts **persisted verdicts per authoritative
+source**, independently of checkpoints and aggregate health.
+
+| Source | Persisted verdicts | First processed (UTC) | Latest processed (UTC) |
+| --- | ---: | --- | --- |
+| Suricata | 1,325,568 | 2026-08-18T17:54:10.580947Z | 2026-08-19T03:00:02.587064Z |
+| Wazuh | 11 | 2026-08-18T19:09:19.526048Z | 2026-08-19T02:47:23.164576Z |
+
+- **Query window start:** 2026-08-18T17:54:04Z — candidate `980615be…`
+  deployment completion, so every counted row was persisted *after* the
+  candidate was running.
+- **Query window end:** 2026-08-19T03:00:53Z.
+- The query was **read-only** (SQLite opened with `mode=ro`; a write probe in
+  the same connection was rejected as read-only) and made no database writes.
+- Rows were grouped by **authoritative source provenance** —
+  `triage_events` inner-joined to `sensor_event_context` on
+  `triage_event_id`, grouped by `source_type`. The inner join means legacy rows
+  without provenance cannot contribute to either count, and source is never
+  inferred from alert contents.
+- Both counts are **newly persisted rows after candidate deployment**, and both
+  are greater than zero.
+- **Checkpoint advancement and aggregate health were not used as substitutes**
+  for this proof; they are reported separately above.
+- Only the aggregate count and the boundary timestamps were retrieved. **No**
+  event identifiers, signatures, verdict text, confidence values, addresses,
+  hostnames, raw alerts, or asset data were selected or recorded.
+
+The exact query shape contains no sensitive values:
+
+```sql
+SELECT c.source_type,
+       COUNT(*)            AS persisted_verdicts,
+       MIN(e.processed_at) AS first_processed,
+       MAX(e.processed_at) AS latest_processed
+FROM triage_events AS e
+JOIN sensor_event_context AS c ON c.triage_event_id = e.id
+WHERE e.processed_at >= :window_start
+GROUP BY c.source_type
+ORDER BY c.source_type;
+```
+
+**Scope of this claim.** This proves that both production sensor paths
+persisted verdicts while the candidate was deployed. It does **not** claim
+continuous per-source availability outside the observed window, and it does not
+claim both sources persisted verdicts within the five-minute sampling window
+specifically — the first Wazuh verdict in this query window landed at
+2026-08-18T19:09:19Z, after that sampling window had closed. Wazuh volume is
+expected to be orders of magnitude lower than
+Suricata volume on this deployment; the material assertion is that the count is
+positive and attributable, not that the two rates are comparable.
+
+During this collection window both consumers remained running with **zero
+restarts**, both checkpoints continued advancing, `/api/health` remained **200**,
+and bounded log review found **no** ingestion or database errors in either
+consumer.
 
 ### Bounded log review
 

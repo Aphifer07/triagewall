@@ -18,6 +18,30 @@ def v04_release_state_is_valid(changelog: str, evidence_exists: bool) -> bool:
     return not released or evidence_exists
 
 
+PERSISTED_VERDICT_HEADING = "### Source-specific persisted verdicts"
+
+PERSISTED_VERDICT_ROW = re.compile(
+    r"^\|\s*(Suricata|Wazuh)\s*\|\s*([\d,]+)\s*\|",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def persisted_verdict_section(document: str) -> str:
+    """Return the source-specific persisted-verdict section, or "" if absent."""
+    if PERSISTED_VERDICT_HEADING not in document:
+        return ""
+    tail = document.split(PERSISTED_VERDICT_HEADING, 1)[1]
+    return tail.split("\n## ", 1)[0].split("\n### ", 1)[0]
+
+
+def persisted_verdict_counts(section: str) -> dict:
+    """Map lowercase source name to its persisted-verdict count."""
+    return {
+        match.group(1).lower(): int(match.group(2).replace(",", ""))
+        for match in PERSISTED_VERDICT_ROW.finditer(section)
+    }
+
+
 class ReleaseDocumentationTests(unittest.TestCase):
     def test_demo_pulls_default_model_before_starting_stack(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -61,6 +85,50 @@ class ReleaseDocumentationTests(unittest.TestCase):
                     v04_release_state_is_valid(changelog, evidence_exists),
                     expected,
                 )
+
+
+    def test_v04_evidence_proves_persisted_verdicts_for_both_sources(self):
+        """Checkpoint movement alone is not proof: skipped, non-alert, invalid,
+        and duplicate records advance a checkpoint without persisting a verdict,
+        and /api/health is a global aggregate that one source can satisfy."""
+        document = (
+            ROOT / "docs" / "release-evidence-v0.4.md"
+        ).read_text(encoding="utf-8")
+        section = persisted_verdict_section(document)
+
+        self.assertTrue(
+            section,
+            "v0.4 evidence must contain a "
+            f"'{PERSISTED_VERDICT_HEADING}' section",
+        )
+
+        counts = persisted_verdict_counts(section)
+        for source in ("suricata", "wazuh"):
+            with self.subTest(source=source):
+                self.assertIn(
+                    source,
+                    counts,
+                    f"{source} needs a persisted-verdict row",
+                )
+                self.assertGreater(
+                    counts[source],
+                    0,
+                    f"{source} must show a positive persisted-verdict count",
+                )
+
+        self.assertRegex(
+            section,
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",
+            "the section must identify a bounded query window",
+        )
+        self.assertIn("query window", section.lower())
+        self.assertIn("persisted verdict", section.lower())
+        self.assertIn(
+            "checkpoint",
+            section.lower(),
+            "the section must distinguish persisted verdicts from "
+            "checkpoint movement",
+        )
 
 
 if __name__ == "__main__":
