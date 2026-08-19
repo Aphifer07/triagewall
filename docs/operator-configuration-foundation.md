@@ -1,6 +1,6 @@
 # Operator configuration foundation
 
-Status: Accepted; implementation in progress for v0.4
+Status: Accepted; implemented in v0.4
 
 ## Purpose
 
@@ -22,26 +22,30 @@ The foundation must preserve these properties:
 - historical verdict context is not rewritten when configuration changes;
 - Core remains useful without Lab and no Lab process receives live Core access.
 
-## Current state
+## Pre-v0.4 baseline
 
-The current implementation is safe but intentionally static:
+This section records the pre-v0.4 system that motivated the design below. It
+does not describe the implemented v0.4 runtime, which the following sections
+specify.
 
-- `triagewall/config/prefilter.json` is mounted read-only into Suricata ingest.
-- The private asset inventory is mounted read-only into both ingest services.
-- `triage.py` validates both documents and loads them into process globals once
+That earlier implementation was safe but intentionally static:
+
+- `triagewall/config/prefilter.json` was mounted read-only into Suricata ingest.
+- The private asset inventory was mounted read-only into both ingest services.
+- `triage.py` validated both documents and loaded them into process globals once
   at startup.
-- Invalid documents fail process startup rather than silently broadening a
+- Invalid documents failed process startup rather than silently broadening a
   suppression or dropping asset context.
-- The dashboard can write operator feedback to the shared SQLite database, but
-  it does not mount either configuration file.
-- The dashboard write cookie proves same-origin provenance only. It does not
-  identify an operator and grants only feedback capability.
-- Asset snapshots preserve the inventory revision for matched assets. The
+- The dashboard could write operator feedback to the shared SQLite database, but
+  it did not mount either configuration file.
+- The dashboard write cookie proved same-origin provenance only. It did not
+  identify an operator and granted only feedback capability.
+- Asset snapshots preserved the inventory revision for matched assets. The
   effective prefilter revision and the inventory revision for unmatched events
-  are not yet persisted as first-class decision provenance.
+  were not yet persisted as first-class decision provenance.
 
-These boundaries rule out direct dashboard edits to the mounted JSON files.
-They also make SQLite the existing durable coordination boundary shared by the
+These boundaries ruled out direct dashboard edits to the mounted JSON files.
+They also made SQLite the existing durable coordination boundary shared by the
 dashboard, Suricata ingest, Wazuh ingest, migrations, backup, and rollback.
 
 ## Decision

@@ -4,6 +4,8 @@ All notable changes to TriageWall are documented in this file.
 
 ## Unreleased
 
+## [v0.4](https://github.com/aaronphifer/triagewall/releases/tag/v0.4) - 2026-08-18
+
 ### Added
 
 - A redesigned routed analyst workbench with overview, triage queue,
