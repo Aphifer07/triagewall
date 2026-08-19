@@ -1,9 +1,10 @@
 # v0.4 release evidence
 
-**Release status: UNRELEASED.** This document records the operational evidence
-collected for the v0.4 candidate. No `v0.4` tag and no GitHub release exist. The
-`CHANGELOG.md` entry deliberately remains under `Unreleased` until this evidence
-is reviewed and release publication is explicitly authorized.
+**Release status: APPROVED FOR PUBLICATION.** This document records the
+operational evidence collected for the v0.4 candidate and accepted before the
+release marking. The `v0.4` tag and GitHub release are bound to the final release
+commit on `main`; the operational evidence remains bound to the candidate SHA
+recorded below.
 
 | Field | Value |
 |---|---|
@@ -418,6 +419,7 @@ configuration lifecycle is proved end to end in isolation for both configuration
 kinds including the full denial matrix, and the calibrated gold-set gate matches
 its approved baseline.
 
-**Recommendation: v0.4 is ready for the final release-marking commit.** The
-release remains unpublished pending review of this document and explicit
-authorization to tag and publish.
+**Release decision: the evidence supports v0.4 publication.** Tagging and
+publishing occur only after the reviewed release marking is integrated into
+`main`, so the release tag identifies the final public tree rather than the
+stabilization or operational-candidate commit.

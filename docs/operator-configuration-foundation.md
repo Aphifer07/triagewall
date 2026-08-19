@@ -1,6 +1,6 @@
 # Operator configuration foundation
 
-Status: Accepted; implementation in progress for v0.4
+Status: Accepted; implemented in v0.4
 
 ## Purpose
 
