@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="triagewall/dashboard/static/triagewall-mark.svg" alt="TriageWall logo" width="96">
+</p>
+
 # TriageWall
 
 > Local-first AI alert triage for Suricata and Wazuh.
