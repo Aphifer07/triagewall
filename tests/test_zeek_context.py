@@ -144,6 +144,7 @@ class ZeekContractBoundsTests(unittest.TestCase):
             source_instance="zeek-local",
             match_strategy="exact_tuple_interval",
             record_count=1,
+            candidate_count=1,
         )
 
         self.assertEqual(result.record_count, 1)
@@ -160,6 +161,7 @@ class ZeekContractBoundsTests(unittest.TestCase):
                         status=ZeekLookupStatus.MATCHED,
                         context_json=context,
                         record_count=1,
+                        candidate_count=1,
                     )
 
     def test_non_match_cannot_smuggle_context_into_the_future_prompt(self):
@@ -168,6 +170,15 @@ class ZeekContractBoundsTests(unittest.TestCase):
                 status=ZeekLookupStatus.NO_MATCH,
                 context_json="{}",
                 record_count=1,
+            )
+
+    def test_matched_result_cannot_hide_multiple_candidates(self):
+        with self.assertRaises(ZeekContextContractError):
+            ZeekLookupResult(
+                status=ZeekLookupStatus.MATCHED,
+                context_json="{}",
+                record_count=1,
+                candidate_count=2,
             )
 
 

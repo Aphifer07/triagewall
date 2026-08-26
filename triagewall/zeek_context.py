@@ -33,6 +33,7 @@ DEFAULT_MAX_CONTEXT_BYTES = 16 * 1024
 
 MAX_WINDOW_SECONDS = 5 * 60.0
 MAX_RECORDS = 32
+MAX_CANDIDATES = MAX_RECORDS + 1
 MAX_CONTEXT_BYTES = 64 * 1024
 MAX_PROVENANCE_TEXT_CHARS = 128
 
@@ -173,6 +174,7 @@ class ZeekLookupResult:
     source_instance: str | None = None
     match_strategy: str | None = None
     record_count: int = 0
+    candidate_count: int = 0
     truncated: bool = False
 
     def __post_init__(self) -> None:
@@ -186,6 +188,13 @@ class ZeekLookupResult:
         ):
             raise ZeekContextContractError(
                 f"record_count must be between 0 and {MAX_RECORDS}"
+            )
+        if (
+            type(self.candidate_count) is not int
+            or not 0 <= self.candidate_count <= MAX_CANDIDATES
+        ):
+            raise ZeekContextContractError(
+                f"candidate_count must be between 0 and {MAX_CANDIDATES}"
             )
         if self.context_json is not None:
             if not isinstance(self.context_json, str):
@@ -216,11 +225,25 @@ class ZeekLookupResult:
 
         carries_context = self.context_json is not None
         if self.status is ZeekLookupStatus.MATCHED:
-            if not carries_context or self.record_count < 1:
+            if (
+                not carries_context
+                or self.record_count < 1
+                or self.candidate_count != 1
+            ):
                 raise ZeekContextContractError(
-                    "matched results require context and at least one record"
+                    "matched results require context and exactly one candidate"
                 )
-        elif carries_context or self.record_count != 0 or self.truncated:
+        elif self.status is ZeekLookupStatus.AMBIGUOUS:
+            if carries_context or self.record_count != 0 or self.candidate_count < 2:
+                raise ZeekContextContractError(
+                    "ambiguous results require multiple candidates and no context"
+                )
+        elif (
+            carries_context
+            or self.record_count != 0
+            or self.candidate_count != 0
+            or self.truncated
+        ):
             raise ZeekContextContractError(
                 "non-matched results cannot carry automatic model context"
             )
