@@ -84,6 +84,35 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  zeek-ingest:
+    profiles: ["zeek"]
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command:
+      - python3
+      - triagewall/zeek_ingest.py
+    environment:
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONDONTWRITEBYTECODE: "1"
+      ZEEK_CONN_PATH: ${ZEEK_CONN_PATH:-/var/log/zeek/current/conn.log}
+      ZEEK_INDEX_PATH: ${ZEEK_INDEX_PATH:-/var/lib/triagewall/zeek-context.db}
+      ZEEK_SOURCE_ID: ${ZEEK_SOURCE_ID:-zeek-local}
+      ZEEK_POLL_INTERVAL: ${ZEEK_POLL_INTERVAL:-2}
+      ZEEK_MAX_RECORDS_PER_POLL: ${ZEEK_MAX_RECORDS_PER_POLL:-1000}
+      ZEEK_EOF_STABLE_OBSERVATIONS: ${ZEEK_EOF_STABLE_OBSERVATIONS:-2}
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/var/lib/triagewall
+      - ${HOST_ZEEK_LOG_DIR:-/opt/zeek/logs}:/var/log/zeek:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    restart: unless-stopped
+
   dashboard:
     build:
       context: .

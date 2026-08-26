@@ -1,6 +1,7 @@
 """Standalone Zeek conn.log index, correlation, and checkpoint tests."""
 
 import json
+import hashlib
 import sqlite3
 import sys
 import unittest
@@ -22,11 +23,13 @@ from zeek_index import (
     ZeekIncompleteRecordError,
     ZeekLogCheckpoint,
     ensure_zeek_index,
+    index_conn_failure,
     index_conn_line,
     load_checkpoint,
     lookup_connection,
     normalize_conn_record,
     prune_index,
+    rotate_checkpoint,
 )
 
 
@@ -294,6 +297,23 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
 
         self.assertIsNone(load_checkpoint(self.conn, SOURCE_INSTANCE))
 
+    def test_checkpoint_offsets_are_bounded_to_sqlite_integers(self):
+        for field in ("offset", "file_size"):
+            values = {
+                "source_instance": SOURCE_INSTANCE,
+                "log_name": "conn",
+                "device": 7,
+                "inode": 11,
+                "offset": 0,
+                "file_size": 0,
+            }
+            values[field] = (1 << 63)
+            if field == "offset":
+                values["file_size"] = 1 << 63
+            with self.subTest(field=field):
+                with self.assertRaises(ZeekConnValidationError):
+                    ZeekLogCheckpoint(**values)
+
     def test_conn_index_rejects_a_different_log_checkpoint(self):
         raw = json_line(conn_record())
         checkpoint = ZeekLogCheckpoint(
@@ -363,6 +383,74 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
         self.assertTrue(result.indexed)
         self.assertEqual(new_checkpoint.inode, 12)
         self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), new_checkpoint)
+
+    def test_bounded_external_failure_commits_with_exact_cursor(self):
+        raw = b"oversized-record\n"
+        checkpoint = ZeekLogCheckpoint(
+            source_instance=SOURCE_INSTANCE,
+            log_name="conn",
+            device=7,
+            inode=11,
+            offset=len(raw),
+            file_size=len(raw),
+        )
+
+        result = index_conn_failure(
+            self.conn,
+            checkpoint,
+            expected_checkpoint=None,
+            record_bytes=len(raw),
+            record_sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+            error_code="record_too_large",
+            error="record exceeded the reader bound",
+        )
+
+        self.assertEqual(result.failure_code, "record_too_large")
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+
+    def test_external_failure_rejects_invalid_digest_without_checkpoint(self):
+        checkpoint = ZeekLogCheckpoint(
+            source_instance=SOURCE_INSTANCE,
+            log_name="conn",
+            device=7,
+            inode=11,
+            offset=10,
+            file_size=10,
+        )
+
+        with self.assertRaises(ZeekConnValidationError):
+            index_conn_failure(
+                self.conn,
+                checkpoint,
+                expected_checkpoint=None,
+                record_bytes=10,
+                record_sha256="not-a-digest",
+                error_code="record_too_large",
+                error="record exceeded the reader bound",
+            )
+
+        self.assertIsNone(load_checkpoint(self.conn, SOURCE_INSTANCE))
+
+    def test_rotation_handoff_rejects_an_undrained_checkpoint(self):
+        raw = json_line(conn_record())
+        _result, checkpoint = self.add_line(raw, file_size=len(raw) + 1)
+        successor = ZeekLogCheckpoint(
+            source_instance=SOURCE_INSTANCE,
+            log_name="conn",
+            device=7,
+            inode=12,
+            offset=0,
+            file_size=0,
+        )
+
+        with self.assertRaises(ZeekCheckpointConflict):
+            rotate_checkpoint(
+                self.conn,
+                successor,
+                expected_checkpoint=checkpoint,
+            )
+
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
 
 
 class ConnectionLookupTests(ZeekIndexTestCase):

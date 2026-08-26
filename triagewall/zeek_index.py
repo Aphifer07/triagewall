@@ -60,6 +60,7 @@ MAX_PRUNE_ROWS = 100_000
 UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,127}$")
 PRINTABLE_TEXT_RE = re.compile(r"^[\x20-\x7e]+$")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 SCHEMA_STATEMENTS = (
@@ -173,13 +174,19 @@ class ZeekLogCheckpoint:
                 raise ZeekConnValidationError(
                     f"checkpoint {label} must be a non-negative SQLite integer"
                 )
-        if type(self.offset) is not int or self.offset < 0:
+        if (
+            type(self.offset) is not int
+            or not 0 <= self.offset <= MAX_SQLITE_INTEGER
+        ):
             raise ZeekConnValidationError(
-                "checkpoint offset must be a non-negative integer"
+                "checkpoint offset must be a non-negative SQLite integer"
             )
-        if type(self.file_size) is not int or self.file_size < self.offset:
+        if (
+            type(self.file_size) is not int
+            or not self.offset <= self.file_size <= MAX_SQLITE_INTEGER
+        ):
             raise ZeekConnValidationError(
-                "checkpoint file_size must be an integer at least as large as offset"
+                "checkpoint file_size must be a SQLite integer at least as large as offset"
             )
 
 
@@ -550,10 +557,10 @@ def _insert_connection(
     return "duplicate" if stored == expected else "uid_conflict"
 
 
-def _store_failure(
+def _store_failure_digest(
     conn: sqlite3.Connection,
-    raw: bytes,
     checkpoint: ZeekLogCheckpoint,
+    record_sha256: str,
     error_code: str,
     error: str,
     recorded_at: float,
@@ -569,7 +576,7 @@ def _store_failure(
             checkpoint.device,
             checkpoint.inode,
             checkpoint.offset,
-            "sha256:" + hashlib.sha256(raw).hexdigest(),
+            record_sha256,
             error_code,
             error[:MAX_FAILURE_ERROR_CHARS],
             recorded_at,
@@ -662,10 +669,10 @@ def index_conn_line(
                     "Zeek uid already exists with different normalized content"
                 )
         if failure_code is not None:
-            _store_failure(
+            _store_failure_digest(
                 conn,
-                raw,
                 next_checkpoint,
+                "sha256:" + hashlib.sha256(raw).hexdigest(),
                 failure_code,
                 failure_message or failure_code,
                 observed_at,
@@ -677,6 +684,130 @@ def index_conn_line(
             duplicate=duplicate,
             failure_code=failure_code,
         )
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def index_conn_failure(
+    conn: sqlite3.Connection,
+    next_checkpoint: ZeekLogCheckpoint,
+    *,
+    expected_checkpoint: ZeekLogCheckpoint | None,
+    record_bytes: int,
+    record_sha256: str,
+    error_code: str,
+    error: str,
+    clock: Callable[[], float] = time.time,
+) -> IndexedLineResult:
+    """Atomically checkpoint bounded metadata for a complete rejected line."""
+
+    if next_checkpoint.log_name != "conn":
+        raise ZeekConnValidationError(
+            "conn.log failures require the 'conn' checkpoint name"
+        )
+    if (
+        type(record_bytes) is not int
+        or not 1 <= record_bytes <= MAX_SQLITE_INTEGER
+    ):
+        raise ZeekConnValidationError(
+            "record_bytes must be a positive SQLite integer"
+        )
+    if not isinstance(record_sha256, str) or SHA256_RE.fullmatch(
+        record_sha256
+    ) is None:
+        raise ZeekConnValidationError("record_sha256 must be a sha256 digest")
+    error_code = _validate_safe_name(error_code, "error_code", 64)
+    if (
+        not isinstance(error, str)
+        or not error
+        or len(error) > MAX_FAILURE_ERROR_CHARS
+        or PRINTABLE_TEXT_RE.fullmatch(error) is None
+    ):
+        raise ZeekConnValidationError(
+            f"error must contain at most {MAX_FAILURE_ERROR_CHARS} printable characters"
+        )
+
+    observed_at = _epoch_timestamp(clock())
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = load_checkpoint(
+            conn,
+            next_checkpoint.source_instance,
+            next_checkpoint.log_name,
+        )
+        _validate_checkpoint_transition(
+            current,
+            expected_checkpoint,
+            next_checkpoint,
+            record_bytes,
+        )
+        _store_failure_digest(
+            conn,
+            next_checkpoint,
+            record_sha256,
+            error_code,
+            error,
+            observed_at,
+        )
+        _store_checkpoint(conn, next_checkpoint, observed_at)
+        conn.commit()
+        return IndexedLineResult(indexed=False, failure_code=error_code)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def rotate_checkpoint(
+    conn: sqlite3.Connection,
+    next_checkpoint: ZeekLogCheckpoint,
+    *,
+    expected_checkpoint: ZeekLogCheckpoint,
+    clock: Callable[[], float] = time.time,
+) -> None:
+    """Persist a proven, fully drained handoff to a successor at byte zero."""
+
+    if next_checkpoint.log_name != "conn":
+        raise ZeekConnValidationError(
+            "conn.log rotation requires the 'conn' checkpoint name"
+        )
+    if (
+        next_checkpoint.source_instance != expected_checkpoint.source_instance
+        or next_checkpoint.log_name != expected_checkpoint.log_name
+    ):
+        raise ZeekCheckpointConflict(
+            "Zeek rotation cannot change source or log name"
+        )
+    if next_checkpoint.offset != 0:
+        raise ZeekCheckpointConflict(
+            "a rotated Zeek successor must begin at byte zero"
+        )
+    if (
+        next_checkpoint.device == expected_checkpoint.device
+        and next_checkpoint.inode == expected_checkpoint.inode
+    ):
+        raise ZeekCheckpointConflict(
+            "Zeek rotation requires a different file identity"
+        )
+    if expected_checkpoint.offset != expected_checkpoint.file_size:
+        raise ZeekCheckpointConflict(
+            "the checkpointed Zeek file is not proven fully drained"
+        )
+
+    observed_at = _epoch_timestamp(clock())
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = load_checkpoint(
+            conn,
+            expected_checkpoint.source_instance,
+            expected_checkpoint.log_name,
+        )
+        if current != expected_checkpoint:
+            raise ZeekCheckpointConflict(
+                "Zeek log checkpoint changed during rotation"
+            )
+        _store_checkpoint(conn, next_checkpoint, observed_at)
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
