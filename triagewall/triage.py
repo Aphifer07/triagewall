@@ -384,13 +384,15 @@ def _call_ollama_prompt(
     return verdict
 
 
-def call_ollama(alert: dict, asset_context=None) -> dict:
-    """Classify one Suricata alert, including the existing prefilter."""
+def call_ollama_suricata_model(alert: dict, asset_context=None) -> dict:
+    """Classify one Suricata alert with Ollama, without applying policy.
+
+    Keeping the model call separate from the deterministic prefilter creates
+    the insertion point for optional evidence providers.  Callers must decide
+    policy before invoking this function.
+    """
     if asset_context is None:
         asset_context = get_asset_context(alert)
-    pre = prefilter_verdict(alert, asset_context=asset_context)
-    if pre is not None:
-        return pre
     user_prompt = f"Classify this Suricata alert:\n\n{format_alert_for_llm(alert)}"
     sid = alert.get("alert", {}).get("signature_id", "?")
     return _call_ollama_prompt(
@@ -398,6 +400,20 @@ def call_ollama(alert: dict, asset_context=None) -> dict:
         user_prompt,
         f"Suricata SID {sid}",
     )
+
+
+def call_ollama(alert: dict, asset_context=None) -> dict:
+    """Classify one Suricata alert, including the existing prefilter.
+
+    This compatibility entrypoint preserves the v0.4 public behavior while
+    keeping policy and model execution as distinct stages.
+    """
+    if asset_context is None:
+        asset_context = get_asset_context(alert)
+    pre = prefilter_verdict(alert, asset_context=asset_context)
+    if pre is not None:
+        return pre
+    return call_ollama_suricata_model(alert, asset_context=asset_context)
 
 
 def call_ollama_wazuh(
