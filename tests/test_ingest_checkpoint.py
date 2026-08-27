@@ -132,6 +132,47 @@ class IngestCheckpointTests(unittest.TestCase):
             0,
         )
 
+    def test_enabled_zeek_passes_provider_and_normalized_event_to_triage(self):
+        raw = json.dumps({
+            "event_type": "alert",
+            "timestamp": "2026-07-19T00:00:00Z",
+            "flow_id": 42,
+            "src_ip": "192.0.2.10",
+            "src_port": 51000,
+            "dest_ip": "198.51.100.20",
+            "dest_port": 443,
+            "proto": "tcp",
+            "alert": {"signature_id": 20, "signature": "Enrich me"},
+        })
+        verdict = {"verdict": "real", "confidence": 0.8, "reasoning": "test"}
+        provider = object()
+        with patch.object(
+            ingest, "ZEEK_ENRICHMENT_ENABLED", True, create=True
+        ), patch.object(
+            ingest, "ZEEK_CONTEXT_PROVIDER", provider, create=True
+        ), patch.object(
+            ingest, "get_asset_context", return_value={
+                "source": None,
+                "destination": None,
+            }
+        ), patch.object(
+            ingest, "call_ollama", return_value=verdict
+        ) as call_ollama, patch.object(
+            ingest, "insert_with_retry", return_value=True
+        ), patch.object(ingest.spc, "observe"):
+            result = ingest.process_line(self.conn, raw)
+
+        self.assertTrue(result.processed)
+        call_ollama.assert_called_once()
+        classification_event = call_ollama.call_args.args[0]
+        self.assertEqual(classification_event["proto"], "TCP")
+        self.assertIs(
+            call_ollama.call_args.kwargs["zeek_context_provider"],
+            provider,
+        )
+        normalized_event = call_ollama.call_args.kwargs["normalized_event"]
+        self.assertEqual(normalized_event.flow_id, 42)
+
     def test_missing_timestamp_is_quarantined_before_triage(self):
         raw = json.dumps({
             "event_type": "alert",

@@ -81,6 +81,7 @@ from sensor_event import (
     normalize_suricata_event,
     suricata_classification_alert,
 )
+from zeek_provider import SQLiteZeekContextProvider
 
 # --- Config ---
 DEMO_MODE = parse_boolean(
@@ -93,6 +94,22 @@ DB_PATH = Path(
     os.environ.get("DB_PATH")
     or os.environ.get("TRIAGE_DB")
     or str(_REPO_ROOT / "triage.db")
+)
+ZEEK_ENRICHMENT_ENABLED = parse_boolean(
+    os.environ.get("ZEEK_ENRICHMENT_ENABLED", "false"),
+    "ZEEK_ENRICHMENT_ENABLED",
+)
+ZEEK_INDEX_PATH = Path(
+    os.environ.get(
+        "ZEEK_INDEX_PATH",
+        "/var/lib/triagewall/zeek-context.db",
+    )
+)
+ZEEK_SOURCE_ID = os.environ.get("ZEEK_SOURCE_ID", "zeek-local")
+ZEEK_CONTEXT_PROVIDER = (
+    SQLiteZeekContextProvider(ZEEK_INDEX_PATH, ZEEK_SOURCE_ID)
+    if ZEEK_ENRICHMENT_ENABLED
+    else None
 )
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))  # seconds
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
@@ -735,10 +752,13 @@ def process_line(conn, line):
     sig = normalized_event.signature
     try:
         asset_context = get_asset_context(classification_event)
-        verdict = call_ollama(
-            classification_event,
-            asset_context=asset_context,
-        )
+        call_kwargs = {"asset_context": asset_context}
+        if ZEEK_ENRICHMENT_ENABLED:
+            call_kwargs.update(
+                normalized_event=normalized_event,
+                zeek_context_provider=ZEEK_CONTEXT_PROVIDER,
+            )
+        verdict = call_ollama(classification_event, **call_kwargs)
         insert_kwargs = {"asset_context": asset_context}
         if RUNTIME_CONFIG_OWNER is not None:
             insert_kwargs["config_bundle"] = RUNTIME_CONFIG_OWNER.bundle

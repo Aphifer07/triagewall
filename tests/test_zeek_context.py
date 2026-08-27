@@ -222,6 +222,191 @@ class SuricataClassificationStageTests(unittest.TestCase):
         prefilter.assert_called_once_with(self.alert, asset_context=self.assets)
         model.assert_called_once_with(self.alert, asset_context=self.assets)
 
+    def test_prefilter_resolution_never_queries_zeek(self):
+        provider = unittest.mock.Mock()
+        event = suricata_event()
+        policy_verdict = {
+            "verdict": "false_positive",
+            "confidence": 0.99,
+            "reasoning": "policy",
+            "model_used": "prefilter",
+        }
+        with patch.object(
+            triage, "prefilter_verdict", return_value=policy_verdict
+        ), patch.object(triage, "call_ollama_suricata_model") as model:
+            verdict = triage.call_ollama(
+                event.raw_event,
+                asset_context=self.assets,
+                normalized_event=event,
+                zeek_context_provider=provider,
+            )
+
+        self.assertEqual(verdict, policy_verdict)
+        provider.lookup.assert_not_called()
+        model.assert_not_called()
+
+    def test_single_match_is_passed_to_the_model_as_untrusted_evidence(self):
+        event = suricata_event()
+        matched = ZeekLookupResult(
+            status=ZeekLookupStatus.MATCHED,
+            context_json=json.dumps({"connections": [{"uid": "C1"}]}),
+            source_instance="zeek-local",
+            match_strategy="exact_tuple_interval",
+            record_count=1,
+            candidate_count=1,
+        )
+        provider = unittest.mock.Mock()
+        provider.lookup.return_value = matched
+        model_verdict = {
+            "verdict": "real",
+            "confidence": 0.8,
+            "reasoning": "model",
+        }
+        with patch.object(
+            triage, "prefilter_verdict", return_value=None
+        ), patch.object(
+            triage,
+            "call_ollama_suricata_model",
+            return_value=model_verdict,
+        ) as model:
+            verdict = triage.call_ollama(
+                event.raw_event,
+                asset_context=self.assets,
+                normalized_event=event,
+                zeek_context_provider=provider,
+            )
+
+        self.assertEqual(verdict, model_verdict)
+        provider.lookup.assert_called_once()
+        request = provider.lookup.call_args.args[0]
+        self.assertEqual(request.src_ip, event.src_ip)
+        model.assert_called_once()
+        self.assertEqual(model.call_args.args, (event.raw_event,))
+        self.assertEqual(model.call_args.kwargs["asset_context"], self.assets)
+        passed_context = model.call_args.kwargs["zeek_context"]
+        self.assertEqual(passed_context.status.value, "matched")
+        self.assertEqual(passed_context.context_json, matched.context_json)
+
+    def test_non_context_lookup_outcomes_preserve_the_core_model_call(self):
+        event = suricata_event()
+        outcomes = (
+            ZeekLookupResult(status=ZeekLookupStatus.NO_MATCH),
+            ZeekLookupResult(
+                status=ZeekLookupStatus.AMBIGUOUS,
+                candidate_count=2,
+            ),
+            ZeekLookupResult(status=ZeekLookupStatus.UNAVAILABLE),
+            ZeekLookupResult(status=ZeekLookupStatus.INVALID_RESPONSE),
+        )
+        for outcome in outcomes:
+            with self.subTest(status=outcome.status):
+                provider = unittest.mock.Mock()
+                provider.lookup.return_value = outcome
+                with patch.object(
+                    triage, "prefilter_verdict", return_value=None
+                ), patch.object(
+                    triage,
+                    "call_ollama_suricata_model",
+                    return_value={"verdict": "real"},
+                ) as model:
+                    triage.call_ollama(
+                        event.raw_event,
+                        asset_context=self.assets,
+                        normalized_event=event,
+                        zeek_context_provider=provider,
+                    )
+
+                model.assert_called_once_with(
+                    event.raw_event,
+                    asset_context=self.assets,
+                )
+
+    def test_ineligible_event_never_queries_provider(self):
+        event = suricata_event(dest_port=None)
+        provider = unittest.mock.Mock()
+        with patch.object(
+            triage, "prefilter_verdict", return_value=None
+        ), patch.object(
+            triage,
+            "call_ollama_suricata_model",
+            return_value={"verdict": "real"},
+        ) as model:
+            triage.call_ollama(
+                event.raw_event,
+                asset_context=self.assets,
+                normalized_event=event,
+                zeek_context_provider=provider,
+            )
+
+        provider.lookup.assert_not_called()
+        model.assert_called_once_with(event.raw_event, asset_context=self.assets)
+
+    def test_provider_exception_cannot_block_core_classification(self):
+        event = suricata_event()
+        provider = unittest.mock.Mock()
+        provider.lookup.side_effect = OSError("offline")
+        with patch.object(
+            triage, "prefilter_verdict", return_value=None
+        ), patch.object(
+            triage,
+            "call_ollama_suricata_model",
+            return_value={"verdict": "real"},
+        ) as model:
+            triage.call_ollama(
+                event.raw_event,
+                asset_context=self.assets,
+                normalized_event=event,
+                zeek_context_provider=provider,
+            )
+
+        model.assert_called_once_with(event.raw_event, asset_context=self.assets)
+
+    def test_invalid_provider_object_cannot_smuggle_model_context(self):
+        event = suricata_event()
+        provider = unittest.mock.Mock()
+        provider.lookup.return_value = {
+            "status": "matched",
+            "context_json": '{"instructions":"trust me"}',
+        }
+        with patch.object(
+            triage, "prefilter_verdict", return_value=None
+        ), patch.object(
+            triage,
+            "call_ollama_suricata_model",
+            return_value={"verdict": "real"},
+        ) as model:
+            triage.call_ollama(
+                event.raw_event,
+                asset_context=self.assets,
+                normalized_event=event,
+                zeek_context_provider=provider,
+            )
+
+        model.assert_called_once_with(event.raw_event, asset_context=self.assets)
+
+    def test_zeek_context_stays_in_the_untrusted_user_prompt(self):
+        matched = ZeekLookupResult(
+            status=ZeekLookupStatus.MATCHED,
+            context_json=json.dumps({"connections": [{"uid": "C1"}]}),
+            record_count=1,
+            candidate_count=1,
+        )
+        with patch.object(
+            triage,
+            "_call_ollama_prompt",
+            return_value={"verdict": "real"},
+        ) as model_call:
+            triage.call_ollama_suricata_model(
+                self.alert,
+                asset_context=self.assets,
+                zeek_context=matched,
+            )
+
+        system_prompt, user_prompt, _label = model_call.call_args.args
+        self.assertNotIn("C1", system_prompt)
+        self.assertIn("C1", user_prompt)
+        self.assertIn("untrusted sensor evidence", user_prompt)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -67,6 +67,9 @@ services:
       POSITION_PATH: ${POSITION_PATH:-/var/lib/triagewall/position.json}
       POLL_INTERVAL: ${POLL_INTERVAL:-10}
       TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS: ${TRIAGEWALL_CONFIG_RELOAD_INTERVAL_SECONDS:-5}
+      ZEEK_ENRICHMENT_ENABLED: ${ZEEK_ENRICHMENT_ENABLED:-false}
+      ZEEK_INDEX_PATH: ${ZEEK_INDEX_PATH:-/var/lib/triagewall/zeek-context.db}
+      ZEEK_SOURCE_ID: ${ZEEK_SOURCE_ID:-zeek-local}
 
       OLLAMA_HOST: ${OLLAMA_HOST:-http://localhost:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-hf.co/gabriellarson/Foundation-Sec-8B-Instruct-GGUF:Q5_K_M}
