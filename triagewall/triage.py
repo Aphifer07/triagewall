@@ -16,6 +16,7 @@ import hashlib
 import secrets
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 import urllib.request
 import urllib.error
@@ -27,6 +28,9 @@ from sensor_event import SensorEvent, normalize_suricata_event
 from time_utils import format_utc_timestamp, utc_now_iso
 from zeek_context import (
     ZeekContextProvider,
+    ZeekEligibility,
+    ZeekEligibilityReason,
+    ZeekEnrichmentOutcome,
     ZeekLookupResult,
     ZeekLookupStatus,
     evaluate_zeek_eligibility,
@@ -431,22 +435,34 @@ def _validated_zeek_result(result) -> ZeekLookupResult:
     )
 
 
-def _matched_zeek_context(
+@dataclass(frozen=True)
+class SuricataClassification:
+    """Core verdict plus optional Zeek provenance for persistence."""
+
+    verdict: dict
+    zeek_enrichment: ZeekEnrichmentOutcome | None = None
+
+
+def _lookup_zeek_context(
     event: SensorEvent,
     provider: ZeekContextProvider,
-) -> ZeekLookupResult | None:
+) -> ZeekEnrichmentOutcome:
     eligibility = evaluate_zeek_eligibility(event)
     if not eligibility.eligible:
-        return None
+        return ZeekEnrichmentOutcome(
+            eligibility=eligibility,
+            lookup=ZeekLookupResult(status=ZeekLookupStatus.DISABLED),
+        )
     try:
-        result = _validated_zeek_result(provider.lookup(eligibility.request))
+        provider_result = provider.lookup(eligibility.request)
     except Exception:
-        # Zeek is optional evidence. Provider failure must not prevent the
-        # original Suricata classification and checkpoint from completing.
-        return None
-    if result.status is ZeekLookupStatus.MATCHED:
-        return result
-    return None
+        result = ZeekLookupResult(status=ZeekLookupStatus.UNAVAILABLE)
+    else:
+        try:
+            result = _validated_zeek_result(provider_result)
+        except Exception:
+            result = ZeekLookupResult(status=ZeekLookupStatus.INVALID_RESPONSE)
+    return ZeekEnrichmentOutcome(eligibility=eligibility, lookup=result)
 
 
 def call_ollama_suricata_model(
@@ -471,24 +487,32 @@ def call_ollama_suricata_model(
     )
 
 
-def call_ollama(
+def classify_suricata(
     alert: dict,
     asset_context=None,
     *,
     normalized_event: SensorEvent | None = None,
     zeek_context_provider: ZeekContextProvider | None = None,
-) -> dict:
-    """Classify one Suricata alert, including the existing prefilter.
+) -> SuricataClassification:
+    """Classify one Suricata alert and retain optional enrichment provenance.
 
-    This compatibility entrypoint preserves the v0.4 public behavior while
-    keeping policy and model execution as distinct stages.
+    Zeek remains optional evidence: every non-match, invalid response, or
+    provider failure falls back to the unchanged Core model call.
     """
     if asset_context is None:
         asset_context = get_asset_context(alert)
     pre = prefilter_verdict(alert, asset_context=asset_context)
     if pre is not None:
-        return pre
-    matched_context = None
+        enrichment = None
+        if zeek_context_provider is not None:
+            enrichment = ZeekEnrichmentOutcome(
+                eligibility=ZeekEligibility(
+                    ZeekEligibilityReason.PREFILTER_RESOLVED
+                ),
+                lookup=ZeekLookupResult(status=ZeekLookupStatus.DISABLED),
+            )
+        return SuricataClassification(pre, enrichment)
+    enrichment = None
     if zeek_context_provider is not None:
         if normalized_event is None:
             try:
@@ -496,17 +520,38 @@ def call_ollama(
             except Exception:
                 normalized_event = None
         if normalized_event is not None:
-            matched_context = _matched_zeek_context(
+            enrichment = _lookup_zeek_context(
                 normalized_event,
                 zeek_context_provider,
             )
-    if matched_context is not None:
-        return call_ollama_suricata_model(
+    if (
+        enrichment is not None
+        and enrichment.lookup.status is ZeekLookupStatus.MATCHED
+    ):
+        verdict = call_ollama_suricata_model(
             alert,
             asset_context=asset_context,
-            zeek_context=matched_context,
+            zeek_context=enrichment.lookup,
         )
-    return call_ollama_suricata_model(alert, asset_context=asset_context)
+    else:
+        verdict = call_ollama_suricata_model(alert, asset_context=asset_context)
+    return SuricataClassification(verdict, enrichment)
+
+
+def call_ollama(
+    alert: dict,
+    asset_context=None,
+    *,
+    normalized_event: SensorEvent | None = None,
+    zeek_context_provider: ZeekContextProvider | None = None,
+) -> dict:
+    """Compatibility entrypoint preserving the v0.4 verdict-only API."""
+    return classify_suricata(
+        alert,
+        asset_context=asset_context,
+        normalized_event=normalized_event,
+        zeek_context_provider=zeek_context_provider,
+    ).verdict
 
 
 def call_ollama_wazuh(
@@ -553,6 +598,7 @@ def insert_triage_row(
     verdict: dict,
     asset_context=None,
     config_bundle=None,
+    zeek_enrichment: ZeekEnrichmentOutcome | None = None,
 ) -> None:
     """Insert one alert + its verdict into triage_events."""
     event = (
@@ -629,6 +675,27 @@ def insert_triage_row(
             event.sensor.agent_name,
         ),
     )
+    if zeek_enrichment is not None:
+        lookup = zeek_enrichment.lookup
+        conn.execute(
+            """INSERT INTO zeek_alert_enrichment (
+                   triage_event_id, eligibility_reason, lookup_status,
+                   source_instance, match_strategy, record_count,
+                   candidate_count, truncated, context_json, recorded_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                cursor.lastrowid,
+                zeek_enrichment.eligibility.reason.value,
+                lookup.status.value,
+                lookup.source_instance,
+                lookup.match_strategy,
+                lookup.record_count,
+                lookup.candidate_count,
+                int(lookup.truncated),
+                lookup.context_json,
+                utc_now_iso(),
+            ),
+        )
     conn.commit()
 
 

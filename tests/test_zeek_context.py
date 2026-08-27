@@ -1,7 +1,9 @@
 """Contract and pipeline-seam tests for optional Zeek enrichment."""
 
 import json
+import sqlite3
 import sys
+import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -25,6 +27,7 @@ from triagewall.zeek_context import (
     DisabledZeekContextProvider,
     ZeekContextContractError,
     ZeekEligibilityReason,
+    ZeekEnrichmentOutcome,
     ZeekLookupRequest,
     ZeekLookupResult,
     ZeekLookupStatus,
@@ -89,6 +92,72 @@ class ZeekEligibilityTests(unittest.TestCase):
         decision = evaluate_zeek_eligibility(event)
 
         self.assertEqual(decision.reason, ZeekEligibilityReason.UNSUPPORTED_SOURCE)
+
+
+class ZeekPersistenceTests(unittest.TestCase):
+    def test_insert_retains_bounded_match_and_policy_provenance(self):
+        event = suricata_event()
+        outcome = ZeekEnrichmentOutcome(
+            eligibility=evaluate_zeek_eligibility(event),
+            lookup=ZeekLookupResult(
+                status=ZeekLookupStatus.MATCHED,
+                context_json=json.dumps({"connections": [{"uid": "C1"}]}),
+                source_instance="zeek-local",
+                match_strategy="exact_tuple_interval",
+                record_count=1,
+                candidate_count=1,
+            ),
+        )
+        verdict = {
+            "verdict": "real",
+            "confidence": 0.9,
+            "reasoning": "test",
+            "model_used": "test-model",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = sqlite3.connect(Path(temp_dir) / "triage.db")
+            conn.executescript(
+                (PROJECT_ROOT / "triagewall" / "schema.sql").read_text()
+            )
+            triage.insert_triage_row(
+                conn,
+                event.raw_event,
+                verdict,
+                zeek_enrichment=outcome,
+            )
+            row = conn.execute(
+                """SELECT eligibility_reason, lookup_status, context_json,
+                          source_instance, match_strategy
+                   FROM zeek_alert_enrichment"""
+            ).fetchone()
+            conn.close()
+
+        self.assertEqual(row[0:2], ("eligible", "matched"))
+        self.assertEqual(json.loads(row[2])["connections"][0]["uid"], "C1")
+        self.assertEqual(row[3:], ("zeek-local", "exact_tuple_interval"))
+
+    def test_schema_rejects_context_claimed_by_a_non_match(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = sqlite3.connect(Path(temp_dir) / "triage.db")
+            conn.executescript(
+                (PROJECT_ROOT / "triagewall" / "schema.sql").read_text()
+            )
+            conn.execute(
+                """INSERT INTO triage_events
+                   (timestamp, signature_id, signature, raw_alert)
+                   VALUES ('2026-08-27T00:00:00Z', 1, 'test', '{}')"""
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO zeek_alert_enrichment (
+                           triage_event_id, eligibility_reason, lookup_status,
+                           record_count, candidate_count, truncated,
+                           context_json, recorded_at
+                       ) VALUES (1, 'eligible', 'no_match', 0, 0, 0,
+                                 '{"connections":[]}',
+                                 '2026-08-27T00:00:00Z')"""
+                )
+            conn.close()
 
 
 class ZeekContractBoundsTests(unittest.TestCase):
@@ -234,16 +303,24 @@ class SuricataClassificationStageTests(unittest.TestCase):
         with patch.object(
             triage, "prefilter_verdict", return_value=policy_verdict
         ), patch.object(triage, "call_ollama_suricata_model") as model:
-            verdict = triage.call_ollama(
+            classification = triage.classify_suricata(
                 event.raw_event,
                 asset_context=self.assets,
                 normalized_event=event,
                 zeek_context_provider=provider,
             )
 
-        self.assertEqual(verdict, policy_verdict)
+        self.assertEqual(classification.verdict, policy_verdict)
         provider.lookup.assert_not_called()
         model.assert_not_called()
+        self.assertEqual(
+            classification.zeek_enrichment.eligibility.reason.value,
+            "prefilter_resolved",
+        )
+        self.assertEqual(
+            classification.zeek_enrichment.lookup.status.value,
+            "disabled",
+        )
 
     def test_single_match_is_passed_to_the_model_as_untrusted_evidence(self):
         event = suricata_event()
@@ -286,6 +363,35 @@ class SuricataClassificationStageTests(unittest.TestCase):
         passed_context = model.call_args.kwargs["zeek_context"]
         self.assertEqual(passed_context.status.value, "matched")
         self.assertEqual(passed_context.context_json, matched.context_json)
+
+    def test_classification_retains_non_match_provenance(self):
+        event = suricata_event()
+        provider = unittest.mock.Mock()
+        provider.lookup.return_value = ZeekLookupResult(
+            status=ZeekLookupStatus.NO_MATCH
+        )
+        with patch.object(
+            triage, "prefilter_verdict", return_value=None
+        ), patch.object(
+            triage,
+            "call_ollama_suricata_model",
+            return_value={"verdict": "real"},
+        ):
+            classification = triage.classify_suricata(
+                event.raw_event,
+                asset_context=self.assets,
+                normalized_event=event,
+                zeek_context_provider=provider,
+            )
+
+        self.assertEqual(
+            classification.zeek_enrichment.eligibility.reason.value,
+            "eligible",
+        )
+        self.assertEqual(
+            classification.zeek_enrichment.lookup.status.value,
+            "no_match",
+        )
 
     def test_non_context_lookup_outcomes_preserve_the_core_model_call(self):
         event = suricata_event()
@@ -403,8 +509,8 @@ class SuricataClassificationStageTests(unittest.TestCase):
             )
 
         system_prompt, user_prompt, _label = model_call.call_args.args
-        self.assertNotIn("C1", system_prompt)
-        self.assertIn("C1", user_prompt)
+        self.assertNotIn('"uid": "C1"', system_prompt)
+        self.assertIn('"uid": "C1"', user_prompt)
         self.assertIn("untrusted sensor evidence", user_prompt)
 
 

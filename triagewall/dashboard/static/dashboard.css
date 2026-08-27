@@ -1476,6 +1476,22 @@ kbd {
   font-size: 0.68rem;
 }
 
+.zeek-context-details {
+  margin-top: 12px;
+}
+
+.zeek-context-details summary {
+  cursor: pointer;
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+}
+
+.zeek-context-details .raw-event,
+.zeek-context-empty {
+  margin-top: 10px;
+}
+
 .integrity-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

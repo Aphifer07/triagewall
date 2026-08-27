@@ -48,6 +48,7 @@ class ZeekEligibilityReason(str, Enum):
     """Why an already-normalized sensor event is or is not eligible."""
 
     ELIGIBLE = "eligible"
+    PREFILTER_RESOLVED = "prefilter_resolved"
     UNSUPPORTED_SOURCE = "unsupported_source"
     MISSING_ENDPOINT = "missing_endpoint"
     UNSUPPORTED_PROTOCOL = "unsupported_protocol"
@@ -246,6 +247,27 @@ class ZeekLookupResult:
         ):
             raise ZeekContextContractError(
                 "non-matched results cannot carry automatic model context"
+            )
+
+
+@dataclass(frozen=True)
+class ZeekEnrichmentOutcome:
+    """Auditable policy and lookup outcome for one Suricata alert."""
+
+    eligibility: ZeekEligibility
+    lookup: ZeekLookupResult
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.eligibility, ZeekEligibility):
+            raise ZeekContextContractError("enrichment eligibility must be recognized")
+        if not isinstance(self.lookup, ZeekLookupResult):
+            raise ZeekContextContractError("enrichment lookup must be recognized")
+        if (
+            not self.eligibility.eligible
+            and self.lookup.status is not ZeekLookupStatus.DISABLED
+        ):
+            raise ZeekContextContractError(
+                "ineligible enrichment outcomes must use the disabled lookup status"
             )
 
 

@@ -827,6 +827,22 @@ test("source-specific context is derived only from the retained record", () => {
   assert.match(script, /typeof value === "object"\) return null;/);
 });
 
+test("Zeek context is summarized safely and deeper lookup stays exact", () => {
+  const script = readDashboardScript();
+
+  assert.match(script, /function zeekPanelMarkup\(zeek/);
+  assert.match(script, /id="zeekContextPanel"/);
+  assert.match(script, /Not evaluated\. Zeek enrichment was disabled/);
+  assert.match(script, /JSON\.stringify\(zeek\.context, null, 2\)/);
+  assert.match(script, /<pre class="raw-event">\$\{escapeHtml\(contextJson\)\}<\/pre>/);
+  assert.match(
+    script,
+    /\/api\/v1\/verdicts\/\$\{eventId\}\/zeek-context/,
+  );
+  assert.match(script, /Refresh exact match/);
+  assert.doesNotMatch(script, /window_before_seconds|window_after_seconds/);
+});
+
 test("a deep link still loads the detail view on the initial load", async () => {
   const harness = runDashboard({ pathname: "/triage/7" });
   await harness.settle();

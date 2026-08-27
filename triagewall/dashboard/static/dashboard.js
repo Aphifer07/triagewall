@@ -995,6 +995,71 @@ function renderInvestigationUnavailable() {
   if (relatedHost) relatedHost.innerHTML = `<h3>Related activity</h3>${message}`;
 }
 
+function zeekStatusLabel(value) {
+  return String(value ?? "not evaluated").replaceAll("_", " ");
+}
+
+function zeekPanelMarkup(zeek, { live = false } = {}) {
+  if (!zeek) {
+    return `
+      <h3>Zeek network context</h3>
+      <p class="detail-empty">Not evaluated. Zeek enrichment was disabled or this alert predates the integration.</p>`;
+  }
+  const eligible = zeek.eligibility_reason === "eligible";
+  const contextJson = zeek.context ? JSON.stringify(zeek.context, null, 2) : null;
+  const action = mode === "local" && eligible
+    ? '<button class="text-button" type="button" data-refresh-zeek>Refresh exact match</button>'
+    : "";
+  return `
+    <div class="raw-head">
+      <div><h3>Zeek network context</h3><p>${live ? "Fresh bounded lookup from the local index." : "Enrichment evidence recorded with this verdict."}</p></div>
+      ${action}
+    </div>
+    <dl class="detail-grid detail-facts">
+      ${detailField("Eligibility", zeekStatusLabel(zeek.eligibility_reason))}
+      ${detailField("Lookup", zeekStatusLabel(zeek.lookup_status))}
+      ${detailField("Source instance", zeek.source_instance)}
+      ${detailField("Match strategy", zeek.match_strategy)}
+      ${detailField("Candidates", zeek.candidate_count)}
+      ${detailField(live ? "Looked up" : "Recorded", formatTimestamp(zeek.recorded_at))}
+    </dl>
+    ${contextJson ? `
+      <details class="zeek-context-details">
+        <summary>Show connection record</summary>
+        <pre class="raw-event">${escapeHtml(contextJson)}</pre>
+      </details>` : '<p class="detail-empty zeek-context-empty">No single connection record was available for automatic enrichment.</p>'}`;
+}
+
+function renderZeekContextPanel(zeek, options = {}) {
+  const host = document.getElementById("zeekContextPanel");
+  if (host) host.innerHTML = zeekPanelMarkup(zeek, options);
+}
+
+async function refreshZeekContext() {
+  const eventId = Number(activeDetail?.id);
+  if (!Number.isInteger(eventId) || eventId < 1) return;
+  const generation = detailGeneration;
+  if (!detailRequestIsCurrent(generation, eventId)) return;
+  const button = document.querySelector("[data-refresh-zeek]");
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch(`${API}/api/v1/verdicts/${eventId}/zeek-context`, {
+      cache: "no-store",
+      signal: detailAbort?.signal,
+    });
+    if (!detailRequestIsCurrent(generation, eventId)) return;
+    if (!response.ok) throw new Error(`Zeek lookup failed (${response.status})`);
+    const data = await response.json();
+    if (!detailRequestIsCurrent(generation, eventId)) return;
+    activeDetail = { ...activeDetail, zeek_context: data.live };
+    renderZeekContextPanel(data.live, { live: true });
+  } catch (error) {
+    if (!detailRequestIsCurrent(generation, eventId)) return;
+    showToast(error.message, true);
+    if (button) button.disabled = false;
+  }
+}
+
 function renderDetail(verdict) {
   activeDetail = verdict;
   const sensor = verdict.sensor_context?.source ?? "suricata";
@@ -1076,6 +1141,10 @@ function renderDetail(verdict) {
         </section>
 
         ${renderSourceContext(verdict, sensor)}
+
+        <section class="detail-section" id="zeekContextPanel">
+          ${zeekPanelMarkup(verdict.zeek_context)}
+        </section>
 
         <section class="detail-section" id="relatedPanel">
           <h3>Related activity</h3>
@@ -1529,6 +1598,10 @@ document.getElementById("loadOlderButton").addEventListener("click", loadOlder);
 document.getElementById("returnLiveButton").addEventListener("click", returnToLive);
 
 document.getElementById("detailPageContent").addEventListener("click", async (event) => {
+  if (event.target.closest("[data-refresh-zeek]")) {
+    await refreshZeekContext();
+    return;
+  }
   const configButton = event.target.closest("[data-config-from-alert]");
   if (configButton) {
     openConfigurationFromAlert(configButton.dataset.configFromAlert);

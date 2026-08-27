@@ -156,22 +156,31 @@ class IngestCheckpointTests(unittest.TestCase):
                 "destination": None,
             }
         ), patch.object(
-            ingest, "call_ollama", return_value=verdict
-        ) as call_ollama, patch.object(
+            ingest,
+            "classify_suricata",
+            return_value=SimpleNamespace(
+                verdict=verdict,
+                zeek_enrichment="provenance",
+            ),
+        ) as classify_suricata, patch.object(
             ingest, "insert_with_retry", return_value=True
-        ), patch.object(ingest.spc, "observe"):
+        ) as insert_with_retry, patch.object(ingest.spc, "observe"):
             result = ingest.process_line(self.conn, raw)
 
         self.assertTrue(result.processed)
-        call_ollama.assert_called_once()
-        classification_event = call_ollama.call_args.args[0]
+        classify_suricata.assert_called_once()
+        classification_event = classify_suricata.call_args.args[0]
         self.assertEqual(classification_event["proto"], "TCP")
         self.assertIs(
-            call_ollama.call_args.kwargs["zeek_context_provider"],
+            classify_suricata.call_args.kwargs["zeek_context_provider"],
             provider,
         )
-        normalized_event = call_ollama.call_args.kwargs["normalized_event"]
+        normalized_event = classify_suricata.call_args.kwargs["normalized_event"]
         self.assertEqual(normalized_event.flow_id, 42)
+        self.assertEqual(
+            insert_with_retry.call_args.kwargs["zeek_enrichment"],
+            "provenance",
+        )
 
     def test_missing_timestamp_is_quarantined_before_triage(self):
         raw = json.dumps({
