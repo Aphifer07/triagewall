@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -229,6 +230,8 @@ class RotationTests(ZeekFollowerTestCase):
             compressed.write(first + second)
         self.live_path.unlink()
         self.live_path.write_bytes(json_line("C3", timestamp=BASE_EPOCH + 2))
+        adjacent_mtime = datetime(2026, 8, 26, 17, 30).timestamp()
+        os.utime(self.live_path, (adjacent_mtime, adjacent_mtime))
         physical = self.live_path.stat()
         reused_identity = zeek_follower_module._Source(
             path=self.live_path,
@@ -238,6 +241,7 @@ class RotationTests(ZeekFollowerTestCase):
             compressed=False,
             physical_device=int(physical.st_dev),
             physical_inode=int(physical.st_ino),
+            modified_at=float(physical.st_mtime),
         )
         real_safe_source = zeek_follower_module._safe_source
 
@@ -321,6 +325,41 @@ class RotationTests(ZeekFollowerTestCase):
             restarted.poll(self.conn)
 
         self.assertIn("dated archive chain has a gap", str(context.exception))
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        self.assertEqual(self.stored_uids(), ["C1"])
+
+    def test_dated_archive_to_live_requires_adjacent_interval_evidence(self):
+        current = self.directory / "current"
+        current.mkdir()
+        self.live_path = current / "conn.log"
+        first = json_line("C1")
+        self.live_path.write_bytes(first)
+        initial = self.follower(archive_root=self.directory)
+        initial.poll(self.conn)
+        initial.close()
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+
+        archive_directory = self.directory / "2026-08-26"
+        archive_directory.mkdir()
+        with gzip.open(
+            archive_directory / "conn.16-00-00_17-00-00.log.gz",
+            "wb",
+        ) as compressed:
+            compressed.write(first)
+        self.live_path.unlink()
+        self.live_path.write_bytes(json_line("C3", timestamp=BASE_EPOCH + 2))
+        missing_interval_mtime = datetime(2026, 8, 26, 18, 30).timestamp()
+        os.utime(
+            self.live_path,
+            (missing_interval_mtime, missing_interval_mtime),
+        )
+        restarted = self.follower(archive_root=self.directory)
+
+        restarted.poll(self.conn)
+        with self.assertRaises(ZeekFollowerError) as context:
+            restarted.poll(self.conn)
+
+        self.assertIn("dated archive-to-live handoff", str(context.exception))
         self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
         self.assertEqual(self.stored_uids(), ["C1"])
 

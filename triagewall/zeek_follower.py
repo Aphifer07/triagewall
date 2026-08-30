@@ -75,6 +75,7 @@ class _Source:
     compressed: bool
     physical_device: int | None = None
     physical_inode: int | None = None
+    modified_at: float | None = None
 
     @property
     def physical_identity(self) -> tuple[int, int]:
@@ -161,6 +162,7 @@ def _safe_source(path: Path) -> _Source:
         inode=int(metadata.st_ino),
         size=int(metadata.st_size),
         compressed=_is_compressed(path),
+        modified_at=float(metadata.st_mtime),
     )
 
 
@@ -493,6 +495,7 @@ class ZeekFollower:
                     compressed=self._stream_source.compressed,
                     physical_device=physical_identity[0],
                     physical_inode=physical_identity[1],
+                    modified_at=float(opened.st_mtime),
                 )
             self.close()
 
@@ -653,6 +656,29 @@ class ZeekFollower:
                                 "the ZeekControl dated archive chain has a gap or "
                                 "an unverifiable filename; the follower will not "
                                 "skip an archive"
+                            )
+                    if current_is_dated and not successor_is_dated:
+                        current_interval = _zeekcontrol_archive_interval(source.path)
+                        live_modified = (
+                            None
+                            if successor.modified_at is None
+                            else datetime.fromtimestamp(successor.modified_at)
+                        )
+                        if (
+                            successor.path != self.live_path
+                            or current_interval is None
+                            or live_modified is None
+                            or not (
+                                current_interval[1]
+                                <= live_modified
+                                < current_interval[1]
+                                + (current_interval[1] - current_interval[0])
+                            )
+                        ):
+                            raise ZeekFollowerError(
+                                "the ZeekControl dated archive-to-live handoff "
+                                "cannot be proven adjacent; the follower will not "
+                                "skip a possibly missing archive"
                             )
                     return successor
                 return None

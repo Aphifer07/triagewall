@@ -144,6 +144,10 @@ matching files, 64 identity candidates, and 512 MiB of decompressed
 verification work. Consecutive dated archives must retain ZeekControl's
 standard `conn.HH:MM:SS-HH:MM:SS.log` interval names; an absent interval or an
 unverifiable intermediate filename stops handoff before the later archive.
+The final dated-to-live handoff also requires the live file's modification time
+to fall inside the immediately following interval of the same duration. If that
+adjacency cannot be established, ingest stops rather than treating a missing
+later archive as an empty interval.
 
 The standalone index prunes both accepted connections and rejected-record
 metadata automatically. Defaults retain seven days and run a bounded cleanup
