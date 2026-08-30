@@ -41,6 +41,7 @@ MAX_ARCHIVE_RECOVERY_CANDIDATES = 64
 MAX_ARCHIVE_VERIFY_BYTES = 512 * 1024 * 1024
 MAX_RECORDS_PER_POLL = 100_000
 READ_CHUNK_BYTES = 64 * 1024
+MAX_SUCCESSOR_PREFIX_BYTES = 64 * 1024
 COMPRESSED_SUFFIXES = (".gz", ".bz2", ".xz", ".zst")
 _NUMBERED_ROTATION_RE = re.compile(r"^\.(\d+)$")
 _DATED_ARCHIVE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -293,6 +294,21 @@ def _open_compressed_stream(raw_stream, path: Path):
 
 
 def _stream_matches_checkpoint(stream, checkpoint: ZeekLogCheckpoint) -> bool:
+    if checkpoint.offset == 0:
+        if checkpoint.prefix_bytes is None or checkpoint.prefix_sha256 is None:
+            return False
+        stream.seek(0)
+        prefix = stream.read(checkpoint.prefix_bytes)
+        if len(prefix) != checkpoint.prefix_bytes:
+            return False
+        digest = "sha256:" + hashlib.sha256(prefix).hexdigest()
+        if digest != checkpoint.prefix_sha256:
+            return False
+        if checkpoint.file_size > checkpoint.prefix_bytes:
+            stream.seek(checkpoint.file_size - 1)
+            if len(stream.read(1)) != 1:
+                return False
+        return True
     if checkpoint.record_bytes is None or checkpoint.record_sha256 is None:
         return False
     start = checkpoint.offset - checkpoint.record_bytes
@@ -314,7 +330,13 @@ def _source_matches_checkpoint(
     source: _Source,
     checkpoint: ZeekLogCheckpoint,
 ) -> bool:
-    verification_extent = max(checkpoint.offset, checkpoint.file_size)
+    verification_extent = (
+        checkpoint.prefix_bytes
+        if checkpoint.offset == 0 and not source.compressed
+        else max(checkpoint.offset, checkpoint.file_size)
+    )
+    if verification_extent is None:
+        return False
     if verification_extent > MAX_ARCHIVE_VERIFY_BYTES:
         raise ZeekFollowerError(
             "Zeek checkpoint exceeds the bounded recovery verification limit"
@@ -346,6 +368,63 @@ def _source_matches_checkpoint(
             stream.close()
         if raw_stream is not None:
             raw_stream.close()
+
+
+def _successor_prefix_anchor(
+    source: _Source,
+) -> tuple[int, int, str] | None:
+    raw_stream = None
+    stream = None
+    try:
+        raw_stream = source.path.open("rb")
+        opened = os.fstat(raw_stream.fileno())
+        if (int(opened.st_dev), int(opened.st_ino)) != source.physical_identity:
+            raise ZeekFollowerError(
+                "Zeek successor identity changed during prefix verification"
+            )
+        stream = (
+            _open_compressed_stream(raw_stream, source.path)
+            if source.compressed
+            else raw_stream
+        )
+        prefix = stream.read(MAX_SUCCESSOR_PREFIX_BYTES)
+        observed = os.fstat(raw_stream.fileno())
+        if (int(observed.st_dev), int(observed.st_ino)) != source.physical_identity:
+            raise ZeekFollowerError(
+                "Zeek successor identity changed during prefix verification"
+            )
+    except ZeekFollowerError:
+        raise
+    except (OSError, EOFError, gzip.BadGzipFile, lzma.LZMAError) as exc:
+        source_kind = "compressed Zeek archive" if source.compressed else "Zeek log"
+        raise ZeekFollowerError(
+            f"could not authenticate {source_kind} successor {source.path}: {exc}"
+        ) from exc
+    finally:
+        if stream is not None and stream is not raw_stream:
+            stream.close()
+        if raw_stream is not None:
+            raw_stream.close()
+
+    if not prefix:
+        return None
+    if not source.compressed:
+        opened_size = int(observed.st_size)
+        if len(prefix) != min(opened_size, MAX_SUCCESSOR_PREFIX_BYTES):
+            return None
+        checkpoint_size = opened_size
+    else:
+        checkpoint_size = len(prefix)
+    if (
+        len(prefix) < MAX_SUCCESSOR_PREFIX_BYTES
+        and not prefix.endswith((b"\n", b"\r"))
+    ):
+        return None
+    return (
+        checkpoint_size,
+        len(prefix),
+        "sha256:" + hashlib.sha256(prefix).hexdigest(),
+    )
 
 
 def _read_record(stream) -> _RecordRead:
@@ -503,7 +582,7 @@ class ZeekFollower:
         live = _safe_source(self.live_path)
         opened_as_live = source.physical_identity == (live.device, live.inode)
         self._open_source(source, opened_as_live=opened_as_live)
-        if checkpoint is not None and checkpoint.offset > 0:
+        if checkpoint is not None:
             if self._stream is None or not _stream_matches_checkpoint(
                 self._stream,
                 checkpoint,
@@ -531,8 +610,7 @@ class ZeekFollower:
         verified_matches = [
             item
             for item in matches
-            if checkpoint.offset == 0
-            or _source_matches_checkpoint(item, checkpoint)
+            if _source_matches_checkpoint(item, checkpoint)
         ]
         if len(verified_matches) == 1:
             match = verified_matches[0]
@@ -543,7 +621,16 @@ class ZeekFollower:
             raise ZeekFollowerError(
                 "the checkpointed inode is ambiguous in the Zeek rotation chain"
             )
-        if checkpoint.record_bytes is None or checkpoint.record_sha256 is None:
+        if checkpoint.offset == 0 and (
+            checkpoint.prefix_bytes is None or checkpoint.prefix_sha256 is None
+        ):
+            raise ZeekFollowerError(
+                "the zero-offset Zeek checkpoint has no durable successor prefix; "
+                "the follower will not trust a reused file identity"
+            )
+        if checkpoint.offset > 0 and (
+            checkpoint.record_bytes is None or checkpoint.record_sha256 is None
+        ):
             raise ZeekFollowerError(
                 "the checkpointed inode is missing from the Zeek rotation chain; "
                 "no durable record anchor is available for archive recovery"
@@ -557,7 +644,14 @@ class ZeekFollower:
             raise ZeekFollowerError(
                 "Zeek archive recovery exceeds its bounded candidate limit"
             )
-        estimated_work = max(checkpoint.offset, checkpoint.file_size) * len(candidates)
+        estimated_work = sum(
+            (
+                checkpoint.prefix_bytes
+                if checkpoint.offset == 0 and not item.compressed
+                else max(checkpoint.offset, checkpoint.file_size)
+            )
+            for item in candidates
+        )
         if estimated_work > MAX_ARCHIVE_VERIFY_BYTES:
             raise ZeekFollowerError(
                 "Zeek archive recovery exceeds its bounded verification budget"
@@ -569,8 +663,11 @@ class ZeekFollower:
         ]
         if len(anchor_matches) != 1:
             reason = "ambiguous" if len(anchor_matches) > 1 else "missing"
+            anchor_name = (
+                "successor prefix" if checkpoint.offset == 0 else "record anchor"
+            )
             raise ZeekFollowerError(
-                f"the checkpointed inode is missing and its record anchor is {reason} "
+                f"the checkpointed inode is missing and its {anchor_name} is {reason} "
                 "in the Zeek archives; "
                 "the follower will not skip to the live file"
             )
@@ -846,13 +943,21 @@ class ZeekFollower:
                 successor = self._successor(source, chain)
             if successor is None:
                 return ZeekPollResult(scanned, indexed, failures, rotated)
+            if successor.size == 0:
+                return ZeekPollResult(scanned, indexed, failures, rotated)
+            successor_anchor = _successor_prefix_anchor(successor)
+            if successor_anchor is None:
+                return ZeekPollResult(scanned, indexed, failures, rotated)
+            successor_size, prefix_bytes, prefix_sha256 = successor_anchor
             next_checkpoint = ZeekLogCheckpoint(
                 source_instance=self.source_instance,
                 log_name="conn",
                 device=successor.device,
                 inode=successor.inode,
                 offset=0,
-                file_size=0 if successor.compressed else successor.size,
+                file_size=successor_size,
+                prefix_bytes=prefix_bytes,
+                prefix_sha256=prefix_sha256,
             )
             rotate_checkpoint(
                 conn,

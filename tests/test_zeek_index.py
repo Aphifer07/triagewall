@@ -191,6 +191,8 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
         }
         self.assertIn("record_bytes", columns)
         self.assertIn("record_sha256", columns)
+        self.assertIn("prefix_bytes", columns)
+        self.assertIn("prefix_sha256", columns)
         self.assertIn("idx_zeek_conn_indexed", indexes)
 
     def test_schema_is_separate_from_the_core_verdict_database(self):
@@ -492,13 +494,16 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
     def test_rotation_handoff_rejects_an_undrained_checkpoint(self):
         raw = json_line(conn_record())
         _result, checkpoint = self.add_line(raw, file_size=len(raw) + 1)
+        successor_raw = b"x"
         successor = ZeekLogCheckpoint(
             source_instance=SOURCE_INSTANCE,
             log_name="conn",
             device=7,
             inode=12,
             offset=0,
-            file_size=0,
+            file_size=len(successor_raw),
+            prefix_bytes=len(successor_raw),
+            prefix_sha256="sha256:" + hashlib.sha256(successor_raw).hexdigest(),
         )
 
         with self.assertRaises(ZeekCheckpointConflict):
@@ -513,13 +518,16 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
     def test_rotation_handoff_allows_an_explicitly_reused_file_identity(self):
         raw = json_line(conn_record())
         _result, checkpoint = self.add_line(raw)
+        successor_raw = b"x"
         successor = ZeekLogCheckpoint(
             source_instance=SOURCE_INSTANCE,
             log_name="conn",
             device=checkpoint.device,
             inode=checkpoint.inode,
             offset=0,
-            file_size=0,
+            file_size=len(successor_raw),
+            prefix_bytes=len(successor_raw),
+            prefix_sha256="sha256:" + hashlib.sha256(successor_raw).hexdigest(),
         )
 
         rotate_checkpoint(
@@ -534,16 +542,43 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
     def test_rotation_handoff_rejects_unproven_reused_file_identity(self):
         raw = json_line(conn_record())
         _result, checkpoint = self.add_line(raw)
+        successor_raw = b"x"
         successor = ZeekLogCheckpoint(
             source_instance=SOURCE_INSTANCE,
             log_name="conn",
             device=checkpoint.device,
             inode=checkpoint.inode,
             offset=0,
-            file_size=0,
+            file_size=len(successor_raw),
+            prefix_bytes=len(successor_raw),
+            prefix_sha256="sha256:" + hashlib.sha256(successor_raw).hexdigest(),
         )
 
         with self.assertRaises(ZeekCheckpointConflict):
+            rotate_checkpoint(
+                self.conn,
+                successor,
+                expected_checkpoint=checkpoint,
+            )
+
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+
+    def test_rotation_handoff_rejects_an_unanchored_successor(self):
+        raw = json_line(conn_record())
+        _result, checkpoint = self.add_line(raw)
+        successor = ZeekLogCheckpoint(
+            source_instance=SOURCE_INSTANCE,
+            log_name="conn",
+            device=7,
+            inode=12,
+            offset=0,
+            file_size=1,
+        )
+
+        with self.assertRaisesRegex(
+            ZeekCheckpointConflict,
+            "durable prefix anchor",
+        ):
             rotate_checkpoint(
                 self.conn,
                 successor,

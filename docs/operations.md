@@ -149,6 +149,13 @@ to fall inside the immediately following interval of the same duration. If that
 adjacency cannot be established, ingest stops rather than treating a missing
 later archive as an empty interval.
 
+Each rotation into a successor stores a bounded digest of its initial logical
+bytes before committing its zero-offset checkpoint. An empty or incomplete
+successor is left pending until at least one complete record (or the full
+64-KiB prefix bound) can be authenticated after a restart. A legacy zero-offset
+checkpoint without this prefix evidence fails closed instead of trusting a
+potentially reused file identity.
+
 The standalone index prunes both accepted connections and rejected-record
 metadata automatically. Defaults retain seven days and run a bounded cleanup
 every 60 seconds (`ZEEK_RETENTION_DAYS`, `ZEEK_PRUNE_INTERVAL`,

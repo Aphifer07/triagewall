@@ -174,6 +174,65 @@ class CompleteRecordTests(ZeekFollowerTestCase):
         self.assertEqual(self.stored_uids(), ["C1"])
         self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
 
+    def test_restart_rejects_unanchored_zero_offset_reused_identity(self):
+        self.live_path.write_bytes(json_line("C1"))
+        initial = self.follower()
+        initial.poll(self.conn)
+        initial.close()
+
+        self.live_path.unlink()
+        successor = json_line("B1", timestamp=BASE_EPOCH + 1)
+        self.live_path.write_bytes(successor)
+        successor_stat = self.live_path.stat()
+        self.conn.execute(
+            """UPDATE zeek_log_checkpoints
+               SET device = ?, inode = ?, offset = 0, file_size = ?,
+                   record_bytes = NULL, record_sha256 = NULL
+               WHERE source_instance = ? AND log_name = 'conn'""",
+            (
+                int(successor_stat.st_dev),
+                int(successor_stat.st_ino),
+                len(successor),
+                SOURCE_INSTANCE,
+            ),
+        )
+        self.conn.commit()
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+
+        self.live_path.unlink()
+        replacement = json_line("R1", timestamp=BASE_EPOCH + 1)
+        self.assertEqual(len(replacement), len(successor))
+        self.live_path.write_bytes(replacement)
+        physical = self.live_path.stat()
+        reused_identity = zeek_follower_module._Source(
+            path=self.live_path,
+            device=checkpoint.device,
+            inode=checkpoint.inode,
+            size=len(replacement),
+            compressed=False,
+            physical_device=int(physical.st_dev),
+            physical_inode=int(physical.st_ino),
+            modified_at=float(physical.st_mtime),
+        )
+        real_safe_source = zeek_follower_module._safe_source
+
+        def report_reused_identity(path):
+            if Path(path) == self.live_path:
+                return reused_identity
+            return real_safe_source(path)
+
+        with mock.patch.object(
+            zeek_follower_module,
+            "_safe_source",
+            side_effect=report_reused_identity,
+        ):
+            with self.assertRaises(ZeekFollowerError) as context:
+                self.follower().poll(self.conn)
+
+        self.assertIn("zero-offset", str(context.exception))
+        self.assertEqual(self.stored_uids(), ["C1"])
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+
     def test_per_poll_record_limit_is_a_hard_bound(self):
         self.live_path.write_bytes(
             b"".join(
@@ -208,6 +267,131 @@ class CompleteRecordTests(ZeekFollowerTestCase):
 
 
 class RotationTests(ZeekFollowerTestCase):
+    def test_rotation_prefix_rejects_reused_zero_offset_successor(self):
+        self.live_path.write_bytes(json_line("C1"))
+        follower = self.follower()
+        follower.poll(self.conn)
+        follower.close()
+        archive = self.directory / "conn.log.1"
+        self.live_path.rename(archive)
+        successor = json_line("B1", timestamp=BASE_EPOCH + 1)
+        self.live_path.write_bytes(successor)
+        successor_stat = self.live_path.stat()
+        stale_successor = zeek_follower_module._Source(
+            path=self.live_path,
+            device=int(successor_stat.st_dev),
+            inode=int(successor_stat.st_ino),
+            size=1,
+            compressed=False,
+            physical_device=int(successor_stat.st_dev),
+            physical_inode=int(successor_stat.st_ino),
+            modified_at=float(successor_stat.st_mtime),
+        )
+        real_safe_source = zeek_follower_module._safe_source
+
+        def report_stale_successor(path):
+            if Path(path) == self.live_path:
+                return stale_successor
+            return real_safe_source(path)
+
+        follower = self.follower()
+        real_rotate_checkpoint = zeek_follower_module.rotate_checkpoint
+
+        def crash_after_rotation(*args, **kwargs):
+            real_rotate_checkpoint(*args, **kwargs)
+            raise ZeekFollowerError("simulated crash after rotation commit")
+
+        with mock.patch.object(
+            zeek_follower_module,
+            "_safe_source",
+            side_effect=report_stale_successor,
+        ):
+            follower.poll(self.conn)
+            with mock.patch.object(
+                zeek_follower_module,
+                "rotate_checkpoint",
+                side_effect=crash_after_rotation,
+            ):
+                with self.assertRaisesRegex(ZeekFollowerError, "simulated crash"):
+                    follower.poll(self.conn)
+        follower.close()
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+        self.assertEqual(checkpoint.offset, 0)
+        self.assertGreater(checkpoint.prefix_bytes, 1)
+        self.assertEqual(checkpoint.file_size, len(successor))
+        self.assertIsNotNone(checkpoint.prefix_sha256)
+
+        self.live_path.unlink()
+        replacement = json_line("R1", timestamp=BASE_EPOCH + 1)
+        self.assertEqual(len(replacement), len(successor))
+        self.live_path.write_bytes(replacement)
+        physical = self.live_path.stat()
+        reused_identity = zeek_follower_module._Source(
+            path=self.live_path,
+            device=checkpoint.device,
+            inode=checkpoint.inode,
+            size=len(replacement),
+            compressed=False,
+            physical_device=int(physical.st_dev),
+            physical_inode=int(physical.st_ino),
+            modified_at=float(physical.st_mtime),
+        )
+        def report_reused_identity(path):
+            if Path(path) == self.live_path:
+                return reused_identity
+            return real_safe_source(path)
+
+        with mock.patch.object(
+            zeek_follower_module,
+            "_safe_source",
+            side_effect=report_reused_identity,
+        ):
+            with self.assertRaises(ZeekFollowerError):
+                self.follower().poll(self.conn)
+
+        self.assertEqual(self.stored_uids(), ["C1"])
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+
+    def test_zero_offset_prefix_accepts_large_uncompressed_successor(self):
+        self.live_path.write_bytes(json_line("C1"))
+        initial = self.follower()
+        initial.poll(self.conn)
+        initial.close()
+        archive = self.directory / "conn.log.1"
+        self.live_path.rename(archive)
+        successor = json_line("B1", timestamp=BASE_EPOCH + 1)
+        with self.live_path.open("wb") as handle:
+            handle.write(successor)
+            handle.truncate(zeek_follower_module.MAX_ARCHIVE_VERIFY_BYTES + 1)
+
+        restarted = self.follower(max_records_per_poll=1)
+        real_rotate_checkpoint = zeek_follower_module.rotate_checkpoint
+
+        def crash_after_rotation(*args, **kwargs):
+            real_rotate_checkpoint(*args, **kwargs)
+            raise ZeekFollowerError("simulated crash after rotation commit")
+
+        restarted.poll(self.conn)
+        with mock.patch.object(
+            zeek_follower_module,
+            "rotate_checkpoint",
+            side_effect=crash_after_rotation,
+        ):
+            with self.assertRaisesRegex(ZeekFollowerError, "simulated crash"):
+                restarted.poll(self.conn)
+        restarted.close()
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+        self.assertEqual(checkpoint.offset, 0)
+        self.assertEqual(
+            checkpoint.file_size,
+            zeek_follower_module.MAX_ARCHIVE_VERIFY_BYTES + 1,
+        )
+
+        resumed = self.follower(max_records_per_poll=1).poll(self.conn)
+
+        self.assertEqual(resumed.indexed, 1)
+        self.assertEqual(self.stored_uids(), ["C1", "B1"])
+
     def test_restart_recovers_mid_file_checkpoint_from_dated_gzip_archive(self):
         current = self.directory / "current"
         current.mkdir()
@@ -265,6 +449,50 @@ class RotationTests(ZeekFollowerTestCase):
         self.assertEqual(first_poll.indexed, 1)
         self.assertTrue(second_poll.rotated)
         self.assertEqual(self.stored_uids(), ["C1", "C2", "C3"])
+
+    def test_restart_traverses_consecutive_dated_gzip_archives(self):
+        current = self.directory / "current"
+        current.mkdir()
+        self.live_path = current / "conn.log"
+        first = json_line("C1")
+        second = json_line("C2", timestamp=BASE_EPOCH + 1)
+        self.live_path.write_bytes(first + second)
+        initial = self.follower(
+            archive_root=self.directory,
+            max_records_per_poll=1,
+        )
+        initial.poll(self.conn)
+        initial.close()
+
+        archive_directory = self.directory / "2026-08-26"
+        archive_directory.mkdir()
+        with gzip.open(
+            archive_directory / "conn.16-00-00_17-00-00.log.gz",
+            "wb",
+        ) as compressed:
+            compressed.write(first + second)
+        with gzip.open(
+            archive_directory / "conn.17-00-00_18-00-00.log.gz",
+            "wb",
+        ) as compressed:
+            compressed.write(json_line("C3", timestamp=BASE_EPOCH + 2))
+        self.live_path.unlink()
+        self.live_path.write_bytes(json_line("C4", timestamp=BASE_EPOCH + 3))
+        adjacent_mtime = datetime(2026, 8, 26, 18, 30).timestamp()
+        os.utime(self.live_path, (adjacent_mtime, adjacent_mtime))
+
+        restarted = self.follower(
+            archive_root=self.directory,
+            max_records_per_poll=10,
+        )
+        first_poll = restarted.poll(self.conn)
+        second_poll = restarted.poll(self.conn)
+        third_poll = restarted.poll(self.conn)
+
+        self.assertEqual(first_poll.indexed, 1)
+        self.assertTrue(second_poll.rotated)
+        self.assertTrue(third_poll.rotated)
+        self.assertEqual(self.stored_uids(), ["C1", "C2", "C3", "C4"])
 
     def test_archive_recovery_rejects_ambiguous_checkpoint_anchor(self):
         current = self.directory / "current"
@@ -404,11 +632,12 @@ class RotationTests(ZeekFollowerTestCase):
         restarted.poll(self.conn)
         handoff = restarted.poll(self.conn)
 
-        self.assertTrue(handoff.rotated)
-        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE).offset, 0)
+        self.assertFalse(handoff.rotated)
+        self.assertNotEqual(load_checkpoint(self.conn, SOURCE_INSTANCE).offset, 0)
         with self.live_path.open("ab") as handle:
             handle.write(json_line("C2", timestamp=BASE_EPOCH + 1))
-        restarted.poll(self.conn)
+        resumed = restarted.poll(self.conn)
+        self.assertTrue(resumed.rotated)
         self.assertEqual(self.stored_uids(), ["C1", "C2"])
 
     def test_missing_checkpointed_inode_fails_closed(self):

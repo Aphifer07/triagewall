@@ -104,6 +104,8 @@ SCHEMA_STATEMENTS = (
            file_size INTEGER NOT NULL CHECK (file_size >= offset),
            record_bytes INTEGER,
            record_sha256 TEXT,
+           prefix_bytes INTEGER,
+           prefix_sha256 TEXT,
            updated_at REAL NOT NULL,
            PRIMARY KEY (source_instance, log_name)
        ) WITHOUT ROWID""",
@@ -167,6 +169,8 @@ class ZeekLogCheckpoint:
     file_size: int
     record_bytes: int | None = None
     record_sha256: str | None = None
+    prefix_bytes: int | None = None
+    prefix_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _validate_safe_name(
@@ -212,6 +216,30 @@ class ZeekLogCheckpoint:
             ):
                 raise ZeekConnValidationError(
                     "checkpoint record_sha256 must be a sha256 digest"
+                )
+        if (self.prefix_bytes is None) != (self.prefix_sha256 is None):
+            raise ZeekConnValidationError(
+                "checkpoint prefix anchor requires both length and digest"
+            )
+        if self.record_bytes is not None and self.prefix_bytes is not None:
+            raise ZeekConnValidationError(
+                "checkpoint cannot contain record and prefix anchors together"
+            )
+        if self.prefix_bytes is not None:
+            if (
+                self.offset != 0
+                or type(self.prefix_bytes) is not int
+                or not 1 <= self.prefix_bytes <= self.file_size
+            ):
+                raise ZeekConnValidationError(
+                    "checkpoint prefix_bytes requires an offset-zero non-empty file"
+                )
+            if (
+                not isinstance(self.prefix_sha256, str)
+                or SHA256_RE.fullmatch(self.prefix_sha256) is None
+            ):
+                raise ZeekConnValidationError(
+                    "checkpoint prefix_sha256 must be a sha256 digest"
                 )
 
 
@@ -399,6 +427,14 @@ def ensure_zeek_index(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE zeek_log_checkpoints ADD COLUMN record_sha256 TEXT"
             )
+        if "prefix_bytes" not in checkpoint_columns:
+            conn.execute(
+                "ALTER TABLE zeek_log_checkpoints ADD COLUMN prefix_bytes INTEGER"
+            )
+        if "prefix_sha256" not in checkpoint_columns:
+            conn.execute(
+                "ALTER TABLE zeek_log_checkpoints ADD COLUMN prefix_sha256 TEXT"
+            )
         for statement in SCHEMA_STATEMENTS:
             conn.execute(statement)
         conn.commit()
@@ -433,7 +469,8 @@ def load_checkpoint(
     )
     log_name = _validate_safe_name(log_name, "log_name", MAX_LOG_NAME_CHARS)
     row = conn.execute(
-        """SELECT device, inode, offset, file_size, record_bytes, record_sha256
+        """SELECT device, inode, offset, file_size,
+                  record_bytes, record_sha256, prefix_bytes, prefix_sha256
            FROM zeek_log_checkpoints
            WHERE source_instance = ? AND log_name = ?""",
         (source_instance, log_name),
@@ -449,6 +486,8 @@ def load_checkpoint(
         file_size=int(row[3]),
         record_bytes=None if row[4] is None else int(row[4]),
         record_sha256=None if row[5] is None else str(row[5]),
+        prefix_bytes=None if row[6] is None else int(row[6]),
+        prefix_sha256=None if row[7] is None else str(row[7]),
     )
 
 
@@ -635,8 +674,9 @@ def _store_checkpoint(
     conn.execute(
         """INSERT INTO zeek_log_checkpoints (
                source_instance, log_name, device, inode,
-               offset, file_size, record_bytes, record_sha256, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               offset, file_size, record_bytes, record_sha256,
+               prefix_bytes, prefix_sha256, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(source_instance, log_name) DO UPDATE SET
                device = excluded.device,
                inode = excluded.inode,
@@ -644,6 +684,8 @@ def _store_checkpoint(
                file_size = excluded.file_size,
                record_bytes = excluded.record_bytes,
                record_sha256 = excluded.record_sha256,
+               prefix_bytes = excluded.prefix_bytes,
+               prefix_sha256 = excluded.prefix_sha256,
                updated_at = excluded.updated_at""",
         (
             checkpoint.source_instance,
@@ -654,6 +696,8 @@ def _store_checkpoint(
             checkpoint.file_size,
             checkpoint.record_bytes,
             checkpoint.record_sha256,
+            checkpoint.prefix_bytes,
+            checkpoint.prefix_sha256,
             updated_at,
         ),
     )
@@ -839,6 +883,13 @@ def rotate_checkpoint(
     if next_checkpoint.offset != 0:
         raise ZeekCheckpointConflict(
             "a rotated Zeek successor must begin at byte zero"
+        )
+    if (
+        next_checkpoint.prefix_bytes is None
+        or next_checkpoint.prefix_sha256 is None
+    ):
+        raise ZeekCheckpointConflict(
+            "a rotated Zeek successor requires a durable prefix anchor"
         )
     if (
         next_checkpoint.device == expected_checkpoint.device
