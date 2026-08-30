@@ -290,16 +290,32 @@ def _open_compressed_stream(raw_stream, path: Path):
     )
 
 
-def _archive_matches_checkpoint(
+def _stream_matches_checkpoint(stream, checkpoint: ZeekLogCheckpoint) -> bool:
+    if checkpoint.record_bytes is None or checkpoint.record_sha256 is None:
+        return False
+    start = checkpoint.offset - checkpoint.record_bytes
+    stream.seek(start)
+    anchored = stream.read(checkpoint.record_bytes)
+    if len(anchored) != checkpoint.record_bytes:
+        return False
+    digest = "sha256:" + hashlib.sha256(anchored).hexdigest()
+    if digest != checkpoint.record_sha256:
+        return False
+    if checkpoint.file_size > checkpoint.offset:
+        stream.seek(checkpoint.file_size - 1)
+        if len(stream.read(1)) != 1:
+            return False
+    return True
+
+
+def _source_matches_checkpoint(
     source: _Source,
     checkpoint: ZeekLogCheckpoint,
 ) -> bool:
-    if checkpoint.record_bytes is None or checkpoint.record_sha256 is None:
-        return False
     verification_extent = max(checkpoint.offset, checkpoint.file_size)
     if verification_extent > MAX_ARCHIVE_VERIFY_BYTES:
         raise ZeekFollowerError(
-            "Zeek archive checkpoint exceeds the bounded recovery verification limit"
+            "Zeek checkpoint exceeds the bounded recovery verification limit"
         )
     raw_stream = None
     stream = None
@@ -315,23 +331,13 @@ def _archive_matches_checkpoint(
             if source.compressed
             else raw_stream
         )
-        start = checkpoint.offset - checkpoint.record_bytes
-        stream.seek(start)
-        anchored = stream.read(checkpoint.record_bytes)
-        if len(anchored) != checkpoint.record_bytes:
-            return False
-        if "sha256:" + hashlib.sha256(anchored).hexdigest() != checkpoint.record_sha256:
-            return False
-        if checkpoint.file_size > checkpoint.offset:
-            stream.seek(checkpoint.file_size - 1)
-            if len(stream.read(1)) != 1:
-                return False
-        return True
+        return _stream_matches_checkpoint(stream, checkpoint)
     except ZeekFollowerError:
         raise
     except (OSError, EOFError, gzip.BadGzipFile, lzma.LZMAError) as exc:
+        source_kind = "compressed Zeek archive" if source.compressed else "Zeek log"
         raise ZeekFollowerError(
-            f"could not verify compressed Zeek archive {source.path}: {exc}"
+            f"could not verify {source_kind} {source.path}: {exc}"
         ) from exc
     finally:
         if stream is not None and stream is not raw_stream:
@@ -494,6 +500,15 @@ class ZeekFollower:
         live = _safe_source(self.live_path)
         opened_as_live = source.physical_identity == (live.device, live.inode)
         self._open_source(source, opened_as_live=opened_as_live)
+        if checkpoint is not None and checkpoint.offset > 0:
+            if self._stream is None or not _stream_matches_checkpoint(
+                self._stream,
+                checkpoint,
+            ):
+                self.close()
+                raise ZeekFollowerError(
+                    "the reopened Zeek log does not match the durable record anchor"
+                )
         return source
 
     def _resolve_source(
@@ -501,23 +516,27 @@ class ZeekFollower:
         checkpoint: ZeekLogCheckpoint | None,
     ) -> tuple[_Source, list[_Source]]:
         live = _safe_source(self.live_path)
-        if checkpoint is None or (
-            checkpoint.device == live.device and checkpoint.inode == live.inode
-        ):
+        if checkpoint is None:
             return live, [live]
 
         chain = _scan_rotation_chain(self.live_path, self.archive_root)
         matches = [
             item
             for item in chain
-            if item.physical_identity == (checkpoint.device, checkpoint.inode)
+            if (item.device, item.inode) == (checkpoint.device, checkpoint.inode)
         ]
-        if len(matches) == 1:
-            match = matches[0]
+        verified_matches = [
+            item
+            for item in matches
+            if checkpoint.offset == 0
+            or _source_matches_checkpoint(item, checkpoint)
+        ]
+        if len(verified_matches) == 1:
+            match = verified_matches[0]
             if match.compressed:
                 match = replace(match, size=checkpoint.file_size)
             return match, chain
-        if len(matches) > 1:
+        if len(verified_matches) > 1:
             raise ZeekFollowerError(
                 "the checkpointed inode is ambiguous in the Zeek rotation chain"
             )
@@ -543,7 +562,7 @@ class ZeekFollower:
         anchor_matches = [
             item
             for item in candidates
-            if _archive_matches_checkpoint(item, checkpoint)
+            if _source_matches_checkpoint(item, checkpoint)
         ]
         if len(anchor_matches) != 1:
             reason = "ambiguous" if len(anchor_matches) > 1 else "missing"

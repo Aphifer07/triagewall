@@ -8,12 +8,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "triagewall"))
 
+import zeek_follower as zeek_follower_module
 from zeek_follower import (
     ZeekFollower,
     ZeekFollowerError,
@@ -125,6 +127,51 @@ class CompleteRecordTests(ZeekFollowerTestCase):
 
         self.assertEqual(result.scanned, 1)
         self.assertEqual(self.stored_uids(), ["C1", "C2"])
+
+    def test_restart_rejects_reused_identity_when_record_anchor_changed(self):
+        original = json_line("C1") + json_line(
+            "C2", timestamp=BASE_EPOCH + 1
+        )
+        self.live_path.write_bytes(original)
+        initial = self.follower(max_records_per_poll=1)
+        initial.poll(self.conn)
+        initial.close()
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+
+        replacement = json_line("R1") + json_line(
+            "R2", timestamp=BASE_EPOCH + 1
+        )
+        self.assertEqual(len(replacement), len(original))
+        self.live_path.unlink()
+        self.live_path.write_bytes(replacement)
+        physical = self.live_path.stat()
+        reused_identity = zeek_follower_module._Source(
+            path=self.live_path,
+            device=checkpoint.device,
+            inode=checkpoint.inode,
+            size=len(replacement),
+            compressed=False,
+            physical_device=int(physical.st_dev),
+            physical_inode=int(physical.st_ino),
+        )
+        real_safe_source = zeek_follower_module._safe_source
+
+        def report_reused_identity(path):
+            if Path(path) == self.live_path:
+                return reused_identity
+            return real_safe_source(path)
+
+        with mock.patch.object(
+            zeek_follower_module,
+            "_safe_source",
+            side_effect=report_reused_identity,
+        ):
+            with self.assertRaises(ZeekFollowerError) as context:
+                self.follower().poll(self.conn)
+
+        self.assertIn("record anchor", str(context.exception))
+        self.assertEqual(self.stored_uids(), ["C1"])
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
 
     def test_per_poll_record_limit_is_a_hard_bound(self):
         self.live_path.write_bytes(
