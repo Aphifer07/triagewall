@@ -144,10 +144,22 @@ matching files, 64 identity candidates, and 512 MiB of decompressed
 verification work. Consecutive dated archives must retain ZeekControl's
 standard `conn.HH:MM:SS-HH:MM:SS.log` interval names; an absent interval or an
 unverifiable intermediate filename stops handoff before the later archive.
+Same-directory restart recovery supports numbered `conn.log.N` rotations;
+arbitrary suffixes are not treated as ordered archives because lexical order
+cannot prove that an intermediate log is present. An uninterrupted follower
+can still drain an arbitrarily renamed file through its retained descriptor.
 The final dated-to-live handoff also requires the live file's modification time
 to fall inside the immediately following interval of the same duration. If that
 adjacency cannot be established, ingest stops rather than treating a missing
 later archive as an empty interval.
+
+Logical records larger than 64 KiB are streamed into digest-only rejection
+metadata, with no raw body retained. That streaming work has a 1-MiB per-record
+ceiling. Once a record crosses 64 KiB, reaching EOF without a terminator or
+crossing the ceiling stops ingest fail-closed without advancing the checkpoint.
+This prevents an unchanged oversized partial record from being drained on every
+poll while preserving quarantine and forward progress for completed oversized
+records within the ceiling.
 
 Each rotation into a successor stores a bounded digest of its initial logical
 bytes before committing its zero-offset checkpoint. An empty or incomplete

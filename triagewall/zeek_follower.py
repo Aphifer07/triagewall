@@ -41,9 +41,10 @@ MAX_ARCHIVE_RECOVERY_CANDIDATES = 64
 MAX_ARCHIVE_VERIFY_BYTES = 512 * 1024 * 1024
 MAX_RECORDS_PER_POLL = 100_000
 READ_CHUNK_BYTES = 64 * 1024
+MAX_OVERSIZED_RECORD_BYTES = 1024 * 1024
 MAX_SUCCESSOR_PREFIX_BYTES = 64 * 1024
 COMPRESSED_SUFFIXES = (".gz", ".bz2", ".xz", ".zst")
-_NUMBERED_ROTATION_RE = re.compile(r"^\.(\d+)$")
+_NUMBERED_ROTATION_RE = re.compile(r"^\.([1-9]\d*)$")
 _DATED_ARCHIVE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ARCHIVED_CONN_RE = re.compile(
     r"^conn(?:\..+)?\.log(?:\.(?:gz|bz2|xz|zst))?$"
@@ -442,11 +443,27 @@ def _read_record(stream) -> _RecordRead:
     total = len(first)
     complete = first.endswith((b"\n", b"\r"))
     while not complete:
-        chunk = stream.readline(READ_CHUNK_BYTES)
+        remaining = MAX_OVERSIZED_RECORD_BYTES - total
+        if remaining <= 0:
+            raise ZeekFollowerError(
+                "Zeek conn.log record exceeded the "
+                f"{MAX_OVERSIZED_RECORD_BYTES}-byte drain limit before a "
+                "terminator"
+            )
+        chunk = stream.readline(min(READ_CHUNK_BYTES, remaining + 1))
         if not chunk:
-            return _RecordRead(raw=None, complete=False)
+            raise ZeekFollowerError(
+                "oversized Zeek conn.log record reached EOF without a "
+                "terminator"
+            )
         digest.update(chunk)
         total += len(chunk)
+        if total > MAX_OVERSIZED_RECORD_BYTES:
+            raise ZeekFollowerError(
+                "Zeek conn.log record exceeded the "
+                f"{MAX_OVERSIZED_RECORD_BYTES}-byte drain limit before a "
+                "terminator"
+            )
         complete = chunk.endswith((b"\n", b"\r"))
     return _RecordRead(
         raw=None,
@@ -735,6 +752,12 @@ class ZeekFollower:
                         _DATED_ARCHIVE_RE.fullmatch(source.path.parent.name)
                         is not None
                     )
+                    if current_number is None and not current_is_dated:
+                        raise ZeekFollowerError(
+                            "the checkpointed Zeek archive has an unverifiable "
+                            "rotation filename; the follower will not infer a "
+                            "successor from lexical order"
+                        )
                     successor_is_dated = (
                         _DATED_ARCHIVE_RE.fullmatch(successor.path.parent.name)
                         is not None

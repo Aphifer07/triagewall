@@ -265,6 +265,58 @@ class CompleteRecordTests(ZeekFollowerTestCase):
         self.assertEqual(error, "record_too_large")
         self.assertEqual(len(digest), len("sha256:") + 64)
 
+    def test_oversized_unterminated_record_stops_at_the_drain_limit(self):
+        drain_limit = zeek_follower_module.MAX_OVERSIZED_RECORD_BYTES
+        self.live_path.write_bytes(b"x" * (drain_limit + 64 * 1024))
+        follower = self.follower()
+
+        with self.assertRaises(ZeekFollowerError) as context:
+            follower.poll(self.conn)
+
+        self.assertIn("drain limit", str(context.exception))
+        self.assertLessEqual(follower._stream.tell(), drain_limit + 1)
+        self.assertIsNone(load_checkpoint(self.conn, SOURCE_INSTANCE))
+
+    def test_static_oversized_partial_record_stops_on_the_first_poll(self):
+        self.live_path.write_bytes(
+            b"x" * (zeek_follower_module.MAX_CONN_RECORD_BYTES + 1)
+        )
+        follower = self.follower()
+
+        with self.assertRaises(ZeekFollowerError) as context:
+            follower.poll(self.conn)
+
+        self.assertIn("without a terminator", str(context.exception))
+        self.assertIsNone(load_checkpoint(self.conn, SOURCE_INSTANCE))
+
+    def test_completed_record_beyond_the_drain_limit_fails_closed(self):
+        drain_limit = zeek_follower_module.MAX_OVERSIZED_RECORD_BYTES
+        self.live_path.write_bytes(b"x" * drain_limit + b"\n")
+        follower = self.follower()
+
+        with self.assertRaises(ZeekFollowerError) as context:
+            follower.poll(self.conn)
+
+        self.assertIn("drain limit", str(context.exception))
+        self.assertLessEqual(follower._stream.tell(), drain_limit + 1)
+        self.assertIsNone(load_checkpoint(self.conn, SOURCE_INSTANCE))
+
+    def test_completed_oversized_record_at_the_drain_limit_is_quarantined(self):
+        drain_limit = zeek_follower_module.MAX_OVERSIZED_RECORD_BYTES
+        self.live_path.write_bytes(b"x" * (drain_limit - 1) + b"\n")
+        follower = self.follower()
+
+        result = follower.poll(self.conn)
+
+        self.assertEqual((result.scanned, result.failures), (1, 1))
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+        self.assertEqual(checkpoint.offset, drain_limit)
+        self.assertEqual(checkpoint.record_bytes, drain_limit)
+        error_code = self.conn.execute(
+            "SELECT error_code FROM zeek_ingest_failures"
+        ).fetchone()[0]
+        self.assertEqual(error_code, "record_too_large")
+
 
 class RotationTests(ZeekFollowerTestCase):
     def test_rotation_prefix_rejects_reused_zero_offset_successor(self):
@@ -718,6 +770,54 @@ class RotationTests(ZeekFollowerTestCase):
 
         self.assertIn("rotation chain has a gap", str(context.exception))
         self.assertEqual(self.stored_uids(), ["C1"])
+
+    def test_generic_rotation_successor_fails_closed(self):
+        self.live_path.write_bytes(json_line("C1"))
+        initial = self.follower()
+        initial.poll(self.conn)
+        initial.close()
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+        current = self.directory / "conn.log.2026-08-30"
+        self.live_path.rename(current)
+        later = self.directory / "conn.log.2026-09-01"
+        later.write_bytes(json_line("C3", timestamp=BASE_EPOCH + 2))
+        self.live_path.write_bytes(json_line("C4", timestamp=BASE_EPOCH + 3))
+        restarted = self.follower()
+
+        restarted.poll(self.conn)
+        with self.assertRaises(ZeekFollowerError) as context:
+            restarted.poll(self.conn)
+
+        self.assertIn("unverifiable rotation filename", str(context.exception))
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        self.assertEqual(self.stored_uids(), ["C1"])
+
+    def test_broad_prefix_generic_archives_are_not_inferred_successors(self):
+        for archive_name in (
+            "conn.logfoo",
+            "conn.log.01",
+            "conn.log.1.extra",
+            "conn.log.notes",
+        ):
+            with self.subTest(archive_name=archive_name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    directory = Path(temporary)
+                    live = directory / "conn.log"
+                    archive = directory / archive_name
+                    archive.write_bytes(json_line("C1"))
+                    live.write_bytes(json_line("C2", timestamp=BASE_EPOCH + 1))
+                    source = zeek_follower_module._safe_source(archive)
+                    chain = zeek_follower_module._scan_rotation_chain(live)
+                    follower = ZeekFollower(live, SOURCE_INSTANCE)
+                    self.addCleanup(follower.close)
+
+                    with self.assertRaises(ZeekFollowerError) as context:
+                        follower._successor(source, chain)
+
+                    self.assertIn(
+                        "unverifiable rotation filename",
+                        str(context.exception),
+                    )
 
     def test_retained_descriptor_survives_zeek_style_archive_move(self):
         self.live_path.write_bytes(json_line("C1"))
