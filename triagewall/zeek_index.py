@@ -820,6 +820,7 @@ def rotate_checkpoint(
     next_checkpoint: ZeekLogCheckpoint,
     *,
     expected_checkpoint: ZeekLogCheckpoint,
+    allow_reused_identity: bool = False,
     clock: Callable[[], float] = time.time,
 ) -> None:
     """Persist a proven, fully drained handoff to a successor at byte zero."""
@@ -842,6 +843,7 @@ def rotate_checkpoint(
     if (
         next_checkpoint.device == expected_checkpoint.device
         and next_checkpoint.inode == expected_checkpoint.inode
+        and not allow_reused_identity
     ):
         raise ZeekCheckpointConflict(
             "Zeek rotation requires a different file identity"

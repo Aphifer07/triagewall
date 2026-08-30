@@ -510,6 +510,48 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
 
         self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
 
+    def test_rotation_handoff_allows_an_explicitly_reused_file_identity(self):
+        raw = json_line(conn_record())
+        _result, checkpoint = self.add_line(raw)
+        successor = ZeekLogCheckpoint(
+            source_instance=SOURCE_INSTANCE,
+            log_name="conn",
+            device=checkpoint.device,
+            inode=checkpoint.inode,
+            offset=0,
+            file_size=0,
+        )
+
+        rotate_checkpoint(
+            self.conn,
+            successor,
+            expected_checkpoint=checkpoint,
+            allow_reused_identity=True,
+        )
+
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), successor)
+
+    def test_rotation_handoff_rejects_unproven_reused_file_identity(self):
+        raw = json_line(conn_record())
+        _result, checkpoint = self.add_line(raw)
+        successor = ZeekLogCheckpoint(
+            source_instance=SOURCE_INSTANCE,
+            log_name="conn",
+            device=checkpoint.device,
+            inode=checkpoint.inode,
+            offset=0,
+            file_size=0,
+        )
+
+        with self.assertRaises(ZeekCheckpointConflict):
+            rotate_checkpoint(
+                self.conn,
+                successor,
+                expected_checkpoint=checkpoint,
+            )
+
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+
 
 class ConnectionLookupTests(ZeekIndexTestCase):
     def test_exact_tuple_lookup_work_does_not_scale_with_protocol_decoys(self):

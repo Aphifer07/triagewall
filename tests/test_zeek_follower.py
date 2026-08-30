@@ -220,6 +220,7 @@ class RotationTests(ZeekFollowerTestCase):
         )
         initial.poll(self.conn)
         initial.close()
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
 
         archive_directory = self.directory / "2026-08-26"
         archive_directory.mkdir()
@@ -228,13 +229,34 @@ class RotationTests(ZeekFollowerTestCase):
             compressed.write(first + second)
         self.live_path.unlink()
         self.live_path.write_bytes(json_line("C3", timestamp=BASE_EPOCH + 2))
+        physical = self.live_path.stat()
+        reused_identity = zeek_follower_module._Source(
+            path=self.live_path,
+            device=checkpoint.device,
+            inode=checkpoint.inode,
+            size=int(physical.st_size),
+            compressed=False,
+            physical_device=int(physical.st_dev),
+            physical_inode=int(physical.st_ino),
+        )
+        real_safe_source = zeek_follower_module._safe_source
+
+        def report_reused_identity(path):
+            if Path(path) == self.live_path:
+                return reused_identity
+            return real_safe_source(path)
 
         restarted = self.follower(
             archive_root=self.directory,
             max_records_per_poll=10,
         )
-        first_poll = restarted.poll(self.conn)
-        second_poll = restarted.poll(self.conn)
+        with mock.patch.object(
+            zeek_follower_module,
+            "_safe_source",
+            side_effect=report_reused_identity,
+        ):
+            first_poll = restarted.poll(self.conn)
+            second_poll = restarted.poll(self.conn)
 
         self.assertEqual(first_poll.indexed, 1)
         self.assertTrue(second_poll.rotated)

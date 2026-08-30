@@ -787,7 +787,7 @@ class ZeekFollower:
             live = _optional_live_source(self.live_path)
             if live is None:
                 return ZeekPollResult(scanned, indexed, failures, rotated)
-            if source.device == live.device and source.inode == live.inode:
+            if source.physical_identity == live.physical_identity:
                 self._reset_eof()
                 self._observed_successor = None
                 return ZeekPollResult(scanned, indexed, failures, rotated)
@@ -832,6 +832,11 @@ class ZeekFollower:
                 conn,
                 next_checkpoint,
                 expected_checkpoint=checkpoint,
+                allow_reused_identity=(
+                    (successor.device, successor.inode)
+                    == (checkpoint.device, checkpoint.inode)
+                    and successor.physical_identity != source.physical_identity
+                ),
             )
             rotated = True
             self.close()
