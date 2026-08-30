@@ -1,5 +1,6 @@
 """Rotation-safe Zeek conn.log follower tests."""
 
+import gzip
 import json
 import os
 import sqlite3
@@ -159,6 +160,101 @@ class CompleteRecordTests(ZeekFollowerTestCase):
 
 
 class RotationTests(ZeekFollowerTestCase):
+    def test_restart_recovers_mid_file_checkpoint_from_dated_gzip_archive(self):
+        current = self.directory / "current"
+        current.mkdir()
+        self.live_path = current / "conn.log"
+        first = json_line("C1")
+        second = json_line("C2", timestamp=BASE_EPOCH + 1)
+        self.live_path.write_bytes(first + second)
+        initial = self.follower(
+            archive_root=self.directory,
+            max_records_per_poll=1,
+        )
+        initial.poll(self.conn)
+        initial.close()
+
+        archive_directory = self.directory / "2026-08-26"
+        archive_directory.mkdir()
+        archive = archive_directory / "conn.16-00-00_17-00-00.log.gz"
+        with gzip.open(archive, "wb") as compressed:
+            compressed.write(first + second)
+        self.live_path.unlink()
+        self.live_path.write_bytes(json_line("C3", timestamp=BASE_EPOCH + 2))
+
+        restarted = self.follower(
+            archive_root=self.directory,
+            max_records_per_poll=10,
+        )
+        first_poll = restarted.poll(self.conn)
+        second_poll = restarted.poll(self.conn)
+
+        self.assertEqual(first_poll.indexed, 1)
+        self.assertTrue(second_poll.rotated)
+        self.assertEqual(self.stored_uids(), ["C1", "C2", "C3"])
+
+    def test_archive_recovery_rejects_ambiguous_checkpoint_anchor(self):
+        current = self.directory / "current"
+        current.mkdir()
+        self.live_path = current / "conn.log"
+        raw = json_line("C1")
+        self.live_path.write_bytes(raw)
+        initial = self.follower(archive_root=self.directory)
+        initial.poll(self.conn)
+        initial.close()
+
+        archive_directory = self.directory / "2026-08-26"
+        archive_directory.mkdir()
+        for start, end in (("15", "16"), ("16", "17")):
+            with gzip.open(
+                archive_directory / f"conn.{start}-00-00_{end}-00-00.log.gz",
+                "wb",
+            ) as compressed:
+                compressed.write(raw)
+        self.live_path.unlink()
+        self.live_path.write_bytes(json_line("C2", timestamp=BASE_EPOCH + 1))
+
+        with self.assertRaises(ZeekFollowerError) as context:
+            self.follower(archive_root=self.directory).poll(self.conn)
+
+        self.assertIn("ambiguous", str(context.exception))
+        self.assertEqual(self.stored_uids(), ["C1"])
+
+    def test_dated_archive_chain_gap_stops_before_later_archive(self):
+        current = self.directory / "current"
+        current.mkdir()
+        self.live_path = current / "conn.log"
+        first = json_line("C1")
+        self.live_path.write_bytes(first)
+        initial = self.follower(archive_root=self.directory)
+        initial.poll(self.conn)
+        initial.close()
+
+        archive_directory = self.directory / "2026-08-26"
+        archive_directory.mkdir()
+        with gzip.open(
+            archive_directory / "conn.16-00-00_17-00-00.log.gz",
+            "wb",
+        ) as compressed:
+            compressed.write(first)
+        with gzip.open(
+            archive_directory / "conn.18-00-00_19-00-00.log.gz",
+            "wb",
+        ) as compressed:
+            compressed.write(json_line("C3", timestamp=BASE_EPOCH + 2))
+        self.live_path.unlink()
+        self.live_path.write_bytes(json_line("C4", timestamp=BASE_EPOCH + 3))
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+        restarted = self.follower(archive_root=self.directory)
+
+        restarted.poll(self.conn)
+        with self.assertRaises(ZeekFollowerError) as context:
+            restarted.poll(self.conn)
+
+        self.assertIn("dated archive chain has a gap", str(context.exception))
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        self.assertEqual(self.stored_uids(), ["C1"])
+
     def test_rename_rotation_drains_old_inode_before_verified_successor(self):
         self.live_path.write_bytes(json_line("C1"))
         follower = self.follower()

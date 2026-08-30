@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import bz2
+import gzip
 import hashlib
+import lzma
 import os
 import re
 import sqlite3
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -32,10 +36,22 @@ except ImportError:  # Direct script-style imports used by container entrypoints
 
 MAX_ROTATION_SCAN_ENTRIES = 512
 MAX_ROTATION_DIRECTORY_ENTRIES = 100_000
+MAX_ARCHIVE_DIRECTORIES = 400
+MAX_ARCHIVE_RECOVERY_CANDIDATES = 64
+MAX_ARCHIVE_VERIFY_BYTES = 512 * 1024 * 1024
 MAX_RECORDS_PER_POLL = 100_000
 READ_CHUNK_BYTES = 64 * 1024
 COMPRESSED_SUFFIXES = (".gz", ".bz2", ".xz", ".zst")
 _NUMBERED_ROTATION_RE = re.compile(r"^\.(\d+)$")
+_DATED_ARCHIVE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ARCHIVED_CONN_RE = re.compile(
+    r"^conn(?:\..+)?\.log(?:\.(?:gz|bz2|xz|zst))?$"
+)
+_ZEEKCONTROL_ARCHIVE_RE = re.compile(
+    r"^conn\.(?:(\d{2}:\d{2}:\d{2})-(\d{2}:\d{2}:\d{2})|"
+    r"(\d{2}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2}))"
+    r"\.log(?:\.(?:gz|bz2|xz|zst))?$"
+)
 
 
 class ZeekFollowerError(RuntimeError):
@@ -57,6 +73,15 @@ class _Source:
     inode: int
     size: int
     compressed: bool
+    physical_device: int | None = None
+    physical_inode: int | None = None
+
+    @property
+    def physical_identity(self) -> tuple[int, int]:
+        return (
+            self.device if self.physical_device is None else self.physical_device,
+            self.inode if self.physical_inode is None else self.physical_inode,
+        )
 
 
 @dataclass(frozen=True)
@@ -95,6 +120,32 @@ def _numbered_rotation(name: str, live_name: str) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
+def _zeekcontrol_archive_interval(path: Path) -> tuple[datetime, datetime] | None:
+    if _DATED_ARCHIVE_RE.fullmatch(path.parent.name) is None:
+        return None
+    match = _ZEEKCONTROL_ARCHIVE_RE.fullmatch(path.name)
+    if match is None:
+        return None
+    start_text = (match.group(1) or match.group(3)).replace("-", ":")
+    end_text = (match.group(2) or match.group(4)).replace("-", ":")
+    try:
+        start = datetime.strptime(
+            f"{path.parent.name} {start_text}",
+            "%Y-%m-%d %H:%M:%S",
+        )
+        end = datetime.strptime(
+            f"{path.parent.name} {end_text}",
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except ValueError as exc:
+        raise ZeekFollowerError(
+            f"invalid ZeekControl archive interval: {path}"
+        ) from exc
+    if end <= start:
+        end += timedelta(days=1)
+    return start, end
+
+
 def _safe_source(path: Path) -> _Source:
     try:
         metadata = path.lstat()
@@ -122,7 +173,76 @@ def _optional_live_source(path: Path) -> _Source | None:
         raise
 
 
-def _scan_rotation_chain(live_path: Path) -> list[_Source]:
+def _scan_dated_archives(archive_root: Path) -> list[_Source]:
+    archives: list[tuple[str, str, _Source]] = []
+    examined = 0
+    dated_directories = 0
+    try:
+        root_metadata = archive_root.lstat()
+        if stat.S_ISLNK(root_metadata.st_mode):
+            raise ZeekFollowerError(
+                f"Zeek archive root must not be a symlink: {archive_root}"
+            )
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise ZeekFollowerError(
+                f"Zeek archive root is not a directory: {archive_root}"
+            )
+        with os.scandir(archive_root) as root_entries:
+            for root_entry in root_entries:
+                examined += 1
+                if examined > MAX_ROTATION_DIRECTORY_ENTRIES:
+                    raise ZeekFollowerError(
+                        "Zeek archive root exceeds its bounded scan limit"
+                    )
+                if _DATED_ARCHIVE_RE.fullmatch(root_entry.name) is None:
+                    continue
+                directory = Path(root_entry.path)
+                directory_metadata = directory.lstat()
+                if stat.S_ISLNK(directory_metadata.st_mode):
+                    raise ZeekFollowerError(
+                        f"Zeek dated archive must not be a symlink: {directory}"
+                    )
+                if not stat.S_ISDIR(directory_metadata.st_mode):
+                    raise ZeekFollowerError(
+                        f"Zeek dated archive is not a directory: {directory}"
+                    )
+                dated_directories += 1
+                if dated_directories > MAX_ARCHIVE_DIRECTORIES:
+                    raise ZeekFollowerError(
+                        "Zeek dated archive count exceeds its bounded scan limit"
+                    )
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        examined += 1
+                        if examined > MAX_ROTATION_DIRECTORY_ENTRIES:
+                            raise ZeekFollowerError(
+                                "Zeek archives exceed their bounded scan limit"
+                            )
+                        if _ARCHIVED_CONN_RE.fullmatch(entry.name) is None:
+                            continue
+                        if len(archives) >= MAX_ROTATION_SCAN_ENTRIES:
+                            raise ZeekFollowerError(
+                                "Zeek archive chain exceeds its bounded scan limit"
+                            )
+                        archives.append(
+                            (
+                                root_entry.name,
+                                entry.name,
+                                _safe_source(Path(entry.path)),
+                            )
+                        )
+    except ZeekFollowerError:
+        raise
+    except OSError as exc:
+        raise ZeekFollowerError(f"could not enumerate Zeek archives: {exc}") from exc
+    archives.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in archives]
+
+
+def _scan_rotation_chain(
+    live_path: Path,
+    archive_root: Path | None = None,
+) -> list[_Source]:
     chain: list[_Source] = []
     examined = 0
     matched = 0
@@ -150,10 +270,74 @@ def _scan_rotation_chain(live_path: Path) -> list[_Source]:
             f"could not enumerate Zeek rotation chain: {exc}"
         ) from exc
     chain.sort(key=lambda item: _rotation_sort_key(item.path.name, live_path.name))
+    if archive_root is not None:
+        chain = _scan_dated_archives(archive_root) + chain
     identities = [(item.device, item.inode) for item in chain]
     if len(identities) != len(set(identities)):
         raise ZeekFollowerError("Zeek rotation chain contains duplicate file identities")
     return chain
+
+
+def _open_compressed_stream(raw_stream, path: Path):
+    if path.name.endswith(".gz"):
+        return gzip.GzipFile(fileobj=raw_stream, mode="rb")
+    if path.name.endswith(".bz2"):
+        return bz2.BZ2File(raw_stream, mode="rb")
+    if path.name.endswith(".xz"):
+        return lzma.LZMAFile(raw_stream, mode="rb")
+    raise ZeekFollowerError(
+        f"unsupported compressed Zeek archive format: {path}"
+    )
+
+
+def _archive_matches_checkpoint(
+    source: _Source,
+    checkpoint: ZeekLogCheckpoint,
+) -> bool:
+    if checkpoint.record_bytes is None or checkpoint.record_sha256 is None:
+        return False
+    verification_extent = max(checkpoint.offset, checkpoint.file_size)
+    if verification_extent > MAX_ARCHIVE_VERIFY_BYTES:
+        raise ZeekFollowerError(
+            "Zeek archive checkpoint exceeds the bounded recovery verification limit"
+        )
+    raw_stream = None
+    stream = None
+    try:
+        raw_stream = source.path.open("rb")
+        opened = os.fstat(raw_stream.fileno())
+        if (int(opened.st_dev), int(opened.st_ino)) != source.physical_identity:
+            raise ZeekFollowerError(
+                "Zeek archive identity changed during recovery verification"
+            )
+        stream = (
+            _open_compressed_stream(raw_stream, source.path)
+            if source.compressed
+            else raw_stream
+        )
+        start = checkpoint.offset - checkpoint.record_bytes
+        stream.seek(start)
+        anchored = stream.read(checkpoint.record_bytes)
+        if len(anchored) != checkpoint.record_bytes:
+            return False
+        if "sha256:" + hashlib.sha256(anchored).hexdigest() != checkpoint.record_sha256:
+            return False
+        if checkpoint.file_size > checkpoint.offset:
+            stream.seek(checkpoint.file_size - 1)
+            if len(stream.read(1)) != 1:
+                return False
+        return True
+    except ZeekFollowerError:
+        raise
+    except (OSError, EOFError, gzip.BadGzipFile, lzma.LZMAError) as exc:
+        raise ZeekFollowerError(
+            f"could not verify compressed Zeek archive {source.path}: {exc}"
+        ) from exc
+    finally:
+        if stream is not None and stream is not raw_stream:
+            stream.close()
+        if raw_stream is not None:
+            raw_stream.close()
 
 
 def _read_record(stream) -> _RecordRead:
@@ -195,6 +379,7 @@ class ZeekFollower:
         *,
         max_records_per_poll: int = 1_000,
         eof_stable_observations: int = 2,
+        archive_root: str | Path | None = None,
     ) -> None:
         if (
             type(max_records_per_poll) is not int
@@ -209,9 +394,11 @@ class ZeekFollower:
         self.source_instance = source_instance
         self.max_records_per_poll = max_records_per_poll
         self.eof_stable_observations = eof_stable_observations
+        self.archive_root = None if archive_root is None else Path(archive_root)
         self._eof_key: tuple[int, int, int, int] | None = None
         self._eof_count = 0
         self._stream = None
+        self._raw_stream = None
         self._stream_source: _Source | None = None
         self._opened_as_live = False
         self._observed_successor: tuple[int, int] | None = None
@@ -221,7 +408,10 @@ class ZeekFollower:
 
         if self._stream is not None:
             self._stream.close()
+        if self._raw_stream is not None and self._raw_stream is not self._stream:
+            self._raw_stream.close()
         self._stream = None
+        self._raw_stream = None
         self._stream_source = None
         self._opened_as_live = False
         self._observed_successor = None
@@ -235,21 +425,30 @@ class ZeekFollower:
     ) -> None:
         self.close()
         try:
-            stream = source.path.open("rb")
-            opened = os.fstat(stream.fileno())
+            raw_stream = source.path.open("rb")
+            opened = os.fstat(raw_stream.fileno())
         except OSError as exc:
             raise ZeekFollowerError(
                 f"could not open Zeek log {source.path}: {exc}"
             ) from exc
         if (
-            int(opened.st_dev) != source.device
-            or int(opened.st_ino) != source.inode
+            (int(opened.st_dev), int(opened.st_ino)) != source.physical_identity
         ):
-            stream.close()
+            raw_stream.close()
             raise ZeekFollowerError(
                 "Zeek log identity changed between inspection and open"
             )
+        try:
+            stream = (
+                _open_compressed_stream(raw_stream, source.path)
+                if source.compressed
+                else raw_stream
+            )
+        except Exception:
+            raw_stream.close()
+            raise
         self._stream = stream
+        self._raw_stream = raw_stream
         self._stream_source = source
         self._opened_as_live = opened_as_live
 
@@ -258,28 +457,42 @@ class ZeekFollower:
         checkpoint: ZeekLogCheckpoint | None,
     ) -> _Source:
         if self._stream is not None and self._stream_source is not None:
-            opened = os.fstat(self._stream.fileno())
-            identity = (int(opened.st_dev), int(opened.st_ino))
+            raw_stream = self._raw_stream
+            if raw_stream is None:
+                raise ZeekFollowerError("Zeek raw descriptor is unexpectedly closed")
+            opened = os.fstat(raw_stream.fileno())
+            physical_identity = (int(opened.st_dev), int(opened.st_ino))
             expected = (
                 None
                 if checkpoint is None
                 else (checkpoint.device, checkpoint.inode)
             )
-            if expected is None or identity == expected:
+            logical_identity = (
+                self._stream_source.device,
+                self._stream_source.inode,
+            )
+            if (
+                physical_identity == self._stream_source.physical_identity
+                and (expected is None or logical_identity == expected)
+            ):
                 return _Source(
                     path=self._stream_source.path,
-                    device=identity[0],
-                    inode=identity[1],
-                    size=int(opened.st_size),
+                    device=logical_identity[0],
+                    inode=logical_identity[1],
+                    size=(
+                        checkpoint.file_size
+                        if self._stream_source.compressed and checkpoint is not None
+                        else int(opened.st_size)
+                    ),
                     compressed=self._stream_source.compressed,
+                    physical_device=physical_identity[0],
+                    physical_inode=physical_identity[1],
                 )
             self.close()
 
         source, _chain = self._resolve_source(checkpoint)
         live = _safe_source(self.live_path)
-        opened_as_live = (
-            source.device == live.device and source.inode == live.inode
-        )
+        opened_as_live = source.physical_identity == (live.device, live.inode)
         self._open_source(source, opened_as_live=opened_as_live)
         return source
 
@@ -293,18 +506,62 @@ class ZeekFollower:
         ):
             return live, [live]
 
-        chain = _scan_rotation_chain(self.live_path)
+        chain = _scan_rotation_chain(self.live_path, self.archive_root)
         matches = [
             item
             for item in chain
-            if item.device == checkpoint.device and item.inode == checkpoint.inode
+            if item.physical_identity == (checkpoint.device, checkpoint.inode)
         ]
-        if len(matches) != 1:
+        if len(matches) == 1:
+            match = matches[0]
+            if match.compressed:
+                match = replace(match, size=checkpoint.file_size)
+            return match, chain
+        if len(matches) > 1:
+            raise ZeekFollowerError(
+                "the checkpointed inode is ambiguous in the Zeek rotation chain"
+            )
+        if checkpoint.record_bytes is None or checkpoint.record_sha256 is None:
             raise ZeekFollowerError(
                 "the checkpointed inode is missing from the Zeek rotation chain; "
+                "no durable record anchor is available for archive recovery"
+            )
+        candidates = [
+            item
+            for item in chain
+            if item.physical_identity != (live.device, live.inode)
+        ]
+        if len(candidates) > MAX_ARCHIVE_RECOVERY_CANDIDATES:
+            raise ZeekFollowerError(
+                "Zeek archive recovery exceeds its bounded candidate limit"
+            )
+        estimated_work = max(checkpoint.offset, checkpoint.file_size) * len(candidates)
+        if estimated_work > MAX_ARCHIVE_VERIFY_BYTES:
+            raise ZeekFollowerError(
+                "Zeek archive recovery exceeds its bounded verification budget"
+            )
+        anchor_matches = [
+            item
+            for item in candidates
+            if _archive_matches_checkpoint(item, checkpoint)
+        ]
+        if len(anchor_matches) != 1:
+            reason = "ambiguous" if len(anchor_matches) > 1 else "missing"
+            raise ZeekFollowerError(
+                f"the checkpointed inode is missing and its record anchor is {reason} "
+                "in the Zeek archives; "
                 "the follower will not skip to the live file"
             )
-        return matches[0], chain
+        archived = anchor_matches[0]
+        recovered = replace(
+            archived,
+            device=checkpoint.device,
+            inode=checkpoint.inode,
+            size=checkpoint.file_size,
+            physical_device=archived.device,
+            physical_inode=archived.inode,
+        )
+        return recovered, chain
 
     def _observe_stable_eof(
         self,
@@ -331,8 +588,7 @@ class ZeekFollower:
     ) -> _Source | None:
         for index, candidate in enumerate(chain):
             if (
-                candidate.device == source.device
-                and candidate.inode == source.inode
+                candidate.physical_identity == source.physical_identity
             ):
                 if index + 1 < len(chain):
                     successor = chain[index + 1]
@@ -356,6 +612,29 @@ class ZeekFollower:
                                 "the numbered Zeek rotation chain has a gap; "
                                 "the follower will not skip an archive"
                             )
+                    current_is_dated = (
+                        _DATED_ARCHIVE_RE.fullmatch(source.path.parent.name)
+                        is not None
+                    )
+                    successor_is_dated = (
+                        _DATED_ARCHIVE_RE.fullmatch(successor.path.parent.name)
+                        is not None
+                    )
+                    if current_is_dated and successor_is_dated:
+                        current_interval = _zeekcontrol_archive_interval(source.path)
+                        successor_interval = _zeekcontrol_archive_interval(
+                            successor.path
+                        )
+                        if (
+                            current_interval is None
+                            or successor_interval is None
+                            or current_interval[1] != successor_interval[0]
+                        ):
+                            raise ZeekFollowerError(
+                                "the ZeekControl dated archive chain has a gap or "
+                                "an unverifiable filename; the follower will not "
+                                "skip an archive"
+                            )
                     return successor
                 return None
         return None
@@ -371,13 +650,10 @@ class ZeekFollower:
         while scanned < self.max_records_per_poll:
             checkpoint = load_checkpoint(conn, self.source_instance)
             source = self._active_source(checkpoint)
-            if source.compressed:
-                raise ZeekFollowerError(
-                    f"checkpointed Zeek log is compressed and cannot be read: {source.path}"
-                )
             offset = 0 if checkpoint is None else checkpoint.offset
-            if source.size < offset or (
+            if (not source.compressed and source.size < offset) or (
                 checkpoint is not None
+                and not source.compressed
                 and source.size < checkpoint.file_size
             ):
                 raise ZeekFollowerError(
@@ -411,16 +687,28 @@ class ZeekFollower:
                             "@load policy/tuning/json-logs"
                         )
 
-                    observed = os.fstat(stream.fileno())
+                    raw_stream = self._raw_stream
+                    if raw_stream is None:
+                        raise ZeekFollowerError(
+                            "Zeek raw descriptor is unexpectedly closed"
+                        )
+                    observed = os.fstat(raw_stream.fileno())
+                    observed_size = (
+                        stream.tell()
+                        if source.compressed
+                        else int(observed.st_size)
+                    )
                     next_checkpoint = ZeekLogCheckpoint(
                         source_instance=self.source_instance,
                         log_name="conn",
                         device=source.device,
                         inode=source.inode,
                         offset=stream.tell(),
-                        file_size=max(int(observed.st_size), stream.tell()),
+                        file_size=max(source.size, observed_size, stream.tell()),
                     )
                     if record.digest is not None:
+                        record_bytes = record.byte_count
+                        record_sha256 = record.digest
                         outcome = index_conn_failure(
                             conn,
                             next_checkpoint,
@@ -434,13 +722,21 @@ class ZeekFollower:
                             ),
                         )
                     else:
+                        record_bytes = len(record.raw)
+                        record_sha256 = (
+                            "sha256:" + hashlib.sha256(record.raw).hexdigest()
+                        )
                         outcome = index_conn_line(
                             conn,
                             record.raw,
                             next_checkpoint,
                             expected_checkpoint=checkpoint,
                         )
-                    checkpoint = next_checkpoint
+                    checkpoint = replace(
+                        next_checkpoint,
+                        record_bytes=record_bytes,
+                        record_sha256=record_sha256,
+                    )
                     scanned += 1
                     indexed += int(outcome.indexed)
                     failures += int(outcome.failure_code is not None)
@@ -449,14 +745,24 @@ class ZeekFollower:
                 if scanned >= self.max_records_per_poll:
                     return ZeekPollResult(scanned, indexed, failures, rotated)
 
-                final_stat = os.fstat(stream.fileno())
-                final_size = int(final_stat.st_size)
                 final_offset = stream.tell()
+                if source.compressed:
+                    final_size = final_offset
+                else:
+                    raw_stream = self._raw_stream
+                    if raw_stream is None:
+                        raise ZeekFollowerError(
+                            "Zeek raw descriptor is unexpectedly closed"
+                        )
+                    final_size = int(os.fstat(raw_stream.fileno()).st_size)
             except ZeekFollowerError:
                 raise
             except OSError as exc:
+                source_kind = (
+                    "compressed Zeek archive" if source.compressed else "Zeek log"
+                )
                 raise ZeekFollowerError(
-                    f"could not read Zeek log {source.path}: {exc}"
+                    f"could not read {source_kind} {source.path}: {exc}"
                 ) from exc
 
             live = _optional_live_source(self.live_path)
@@ -491,21 +797,17 @@ class ZeekFollower:
             if self._opened_as_live:
                 successor = live
             else:
-                chain = _scan_rotation_chain(self.live_path)
+                chain = _scan_rotation_chain(self.live_path, self.archive_root)
                 successor = self._successor(source, chain)
             if successor is None:
                 return ZeekPollResult(scanned, indexed, failures, rotated)
-            if successor.compressed:
-                raise ZeekFollowerError(
-                    f"the next Zeek rotation is compressed: {successor.path}"
-                )
             next_checkpoint = ZeekLogCheckpoint(
                 source_instance=self.source_instance,
                 log_name="conn",
                 device=successor.device,
                 inode=successor.inode,
                 offset=0,
-                file_size=successor.size,
+                file_size=0 if successor.compressed else successor.size,
             )
             rotate_checkpoint(
                 conn,

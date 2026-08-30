@@ -119,7 +119,7 @@ class ZeekIndexTestCase(unittest.TestCase):
             expected_checkpoint=expected,
             clock=clock,
         )
-        return result, checkpoint
+        return result, load_checkpoint(self.conn, SOURCE_INSTANCE)
 
 
 class ConnNormalizationTests(ZeekIndexTestCase):
@@ -165,6 +165,34 @@ class ConnNormalizationTests(ZeekIndexTestCase):
 
 
 class AtomicIndexCheckpointTests(ZeekIndexTestCase):
+    def test_schema_upgrade_adds_archive_anchor_columns_and_retention_index(self):
+        legacy = sqlite3.connect(":memory:")
+        self.addCleanup(legacy.close)
+        legacy.execute(
+            """CREATE TABLE zeek_log_checkpoints (
+                   source_instance TEXT NOT NULL,
+                   log_name TEXT NOT NULL,
+                   device INTEGER NOT NULL,
+                   inode INTEGER NOT NULL,
+                   offset INTEGER NOT NULL,
+                   file_size INTEGER NOT NULL,
+                   updated_at REAL NOT NULL,
+                   PRIMARY KEY (source_instance, log_name)
+               ) WITHOUT ROWID"""
+        )
+
+        ensure_zeek_index(legacy)
+
+        columns = {
+            row[1] for row in legacy.execute("PRAGMA table_info(zeek_log_checkpoints)")
+        }
+        indexes = {
+            row[1] for row in legacy.execute("PRAGMA index_list(zeek_connections)")
+        }
+        self.assertIn("record_bytes", columns)
+        self.assertIn("record_sha256", columns)
+        self.assertIn("idx_zeek_conn_indexed", indexes)
+
     def test_schema_is_separate_from_the_core_verdict_database(self):
         tables = {
             row[0]
@@ -181,6 +209,12 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
 
         self.assertEqual(result, IndexedLineResult(indexed=True))
         self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        stored_checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+        self.assertEqual(stored_checkpoint.record_bytes, checkpoint.offset)
+        self.assertEqual(
+            stored_checkpoint.record_sha256,
+            "sha256:" + hashlib.sha256(json_line(conn_record())).hexdigest(),
+        )
         row = self.conn.execute(
             "SELECT uid, proto, orig_h, resp_h FROM zeek_connections"
         ).fetchone()
@@ -275,6 +309,24 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
                 "SELECT uid FROM zeek_connections WHERE uid = 'C3'"
             ).fetchone()
         )
+
+    def test_record_anchor_is_part_of_checkpoint_compare_and_swap(self):
+        _first, checkpoint = self.add_line(json_line(conn_record("C1")))
+        replacement_digest = "sha256:" + ("0" * 64)
+        self.conn.execute(
+            """UPDATE zeek_log_checkpoints
+               SET record_sha256 = ?
+               WHERE source_instance = ? AND log_name = 'conn'""",
+            (replacement_digest, SOURCE_INSTANCE),
+        )
+        self.conn.commit()
+
+        with self.assertRaises(ZeekCheckpointConflict):
+            self.add_line(
+                json_line(conn_record("C2")),
+                expected_marker=checkpoint,
+            )
+
 
     def test_checkpoint_cannot_skip_bytes_inside_a_file(self):
         raw = json_line(conn_record("C1"))
@@ -406,7 +458,13 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
         )
 
         self.assertEqual(result.failure_code, "record_too_large")
-        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        stored = load_checkpoint(self.conn, SOURCE_INSTANCE)
+        self.assertEqual(stored.offset, checkpoint.offset)
+        self.assertEqual(stored.record_bytes, len(raw))
+        self.assertEqual(
+            stored.record_sha256,
+            "sha256:" + hashlib.sha256(raw).hexdigest(),
+        )
 
     def test_external_failure_rejects_invalid_digest_without_checkpoint(self):
         checkpoint = ZeekLogCheckpoint(
@@ -454,6 +512,67 @@ class AtomicIndexCheckpointTests(ZeekIndexTestCase):
 
 
 class ConnectionLookupTests(ZeekIndexTestCase):
+    def test_exact_tuple_lookup_work_does_not_scale_with_protocol_decoys(self):
+        self.add_line(json_line(conn_record(duration=60.0)))
+        decoys = []
+        for number in range(5_000):
+            decoys.append(
+                (
+                    SOURCE_INSTANCE,
+                    f"D{number}",
+                    BASE_EPOCH,
+                    BASE_EPOCH + 60,
+                    f"10.{number // 256}.{number % 256}.1",
+                    12345,
+                    "203.0.113.10",
+                    443,
+                    "TCP",
+                    BASE_EPOCH,
+                )
+            )
+        self.conn.executemany(
+            """INSERT INTO zeek_connections (
+                   source_instance, uid, ts, end_ts,
+                   orig_h, orig_p, resp_h, resp_p, proto, indexed_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            decoys,
+        )
+        steps = 0
+
+        def count_step():
+            nonlocal steps
+            steps += 1
+            return 0
+
+        self.conn.set_progress_handler(count_step, 1)
+        try:
+            result = lookup_connection(self.conn, request(), SOURCE_INSTANCE)
+        finally:
+            self.conn.set_progress_handler(None, 0)
+
+        self.assertEqual(result.status, ZeekLookupStatus.MATCHED)
+        self.assertLess(steps, 300)
+
+    def test_identical_forward_and_reverse_tuple_is_not_duplicated(self):
+        loop_record = conn_record(
+            **{
+                "id.orig_h": "192.0.2.10",
+                "id.orig_p": 51000,
+                "id.resp_h": "192.0.2.10",
+                "id.resp_p": 51000,
+            }
+        )
+        self.add_line(json_line(loop_record))
+
+        result = lookup_connection(
+            self.conn,
+            request(dest_ip="192.0.2.10", dest_port=51000),
+            SOURCE_INSTANCE,
+        )
+
+        self.assertEqual(result.status, ZeekLookupStatus.MATCHED)
+        self.assertEqual(result.candidate_count, 1)
+
     def test_forward_tuple_matches_inside_long_connection_interval(self):
         self.add_line(json_line(conn_record(duration=60.0)))
 
@@ -552,7 +671,8 @@ class ZeekIndexRetentionTests(ZeekIndexTestCase):
             clock=lambda: BASE_EPOCH - 1_000,
         )
         self.add_line(
-            json_line(conn_record("expired", ts=BASE_EPOCH - 500, duration=1.0))
+            json_line(conn_record("expired", ts=BASE_EPOCH - 500, duration=1.0)),
+            clock=lambda: BASE_EPOCH - 500,
         )
         self.add_line(
             json_line(conn_record("retained", ts=BASE_EPOCH + 500, duration=1.0))
@@ -582,7 +702,8 @@ class ZeekIndexRetentionTests(ZeekIndexTestCase):
             clock=lambda: BASE_EPOCH - 1_000,
         )
         self.add_line(
-            json_line(conn_record("expired", ts=BASE_EPOCH - 500, duration=1.0))
+            json_line(conn_record("expired", ts=BASE_EPOCH - 500, duration=1.0)),
+            clock=lambda: BASE_EPOCH - 500,
         )
 
         result = prune_index(self.conn, BASE_EPOCH, batch_size=1, max_rows=1)
@@ -595,6 +716,20 @@ class ZeekIndexRetentionTests(ZeekIndexTestCase):
             ).fetchone()[0]
         )
         self.assertEqual(remaining, 1)
+
+    def test_prune_uses_trusted_ingest_time_not_sensor_event_time(self):
+        self.add_line(
+            json_line(conn_record("future", ts=BASE_EPOCH + 1_000_000)),
+            clock=lambda: BASE_EPOCH - 500,
+        )
+
+        result = prune_index(self.conn, BASE_EPOCH, batch_size=1, max_rows=10)
+
+        self.assertEqual(result.connections, 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM zeek_connections").fetchone()[0],
+            0,
+        )
 
     def test_prune_rejects_unbounded_or_invalid_limits(self):
         for kwargs in (

@@ -19,9 +19,12 @@ try:
         ZeekFollowerError,
     )
     from .zeek_index import (
+        MAX_PRUNE_BATCH_SIZE,
+        MAX_PRUNE_ROWS,
         ZeekCheckpointConflict,
         ZeekConnValidationError,
         connect_zeek_index,
+        prune_index,
     )
 except ImportError:  # Direct execution in the ingest container.
     from zeek_follower import (
@@ -30,9 +33,12 @@ except ImportError:  # Direct execution in the ingest container.
         ZeekFollowerError,
     )
     from zeek_index import (
+        MAX_PRUNE_BATCH_SIZE,
+        MAX_PRUNE_ROWS,
         ZeekCheckpointConflict,
         ZeekConnValidationError,
         connect_zeek_index,
+        prune_index,
     )
 
 
@@ -48,6 +54,11 @@ class ZeekIngestSettings:
     poll_interval_seconds: float
     max_records_per_poll: int
     eof_stable_observations: int
+    archive_root: Path = Path("/var/log/zeek")
+    retention_seconds: float = 7 * 24 * 60 * 60
+    prune_interval_seconds: float = 60.0
+    prune_batch_size: int = 1_000
+    prune_max_rows: int = 10_000
 
 
 def settings_from_environment() -> ZeekIngestSettings:
@@ -64,6 +75,22 @@ def settings_from_environment() -> ZeekIngestSettings:
     )
     if stable_observations < 2:
         raise RuntimeError("ZEEK_EOF_STABLE_OBSERVATIONS must be at least 2")
+    retention_days = float(os.environ.get("ZEEK_RETENTION_DAYS", "7"))
+    if not 1 <= retention_days <= 3_650:
+        raise RuntimeError("ZEEK_RETENTION_DAYS must be from 1 to 3650")
+    prune_interval = float(os.environ.get("ZEEK_PRUNE_INTERVAL", "60"))
+    if not 1 <= prune_interval <= 86_400:
+        raise RuntimeError("ZEEK_PRUNE_INTERVAL must be from 1 to 86400 seconds")
+    prune_batch_size = int(os.environ.get("ZEEK_PRUNE_BATCH_SIZE", "1000"))
+    if not 1 <= prune_batch_size <= MAX_PRUNE_BATCH_SIZE:
+        raise RuntimeError(
+            f"ZEEK_PRUNE_BATCH_SIZE must be from 1 to {MAX_PRUNE_BATCH_SIZE}"
+        )
+    prune_max_rows = int(os.environ.get("ZEEK_PRUNE_MAX_ROWS", "10000"))
+    if not 2 <= prune_max_rows <= MAX_PRUNE_ROWS:
+        raise RuntimeError(
+            f"ZEEK_PRUNE_MAX_ROWS must be from 2 to {MAX_PRUNE_ROWS}"
+        )
     return ZeekIngestSettings(
         conn_path=Path(
             os.environ.get("ZEEK_CONN_PATH", "/var/log/zeek/current/conn.log")
@@ -78,6 +105,11 @@ def settings_from_environment() -> ZeekIngestSettings:
         poll_interval_seconds=poll_interval,
         max_records_per_poll=max_records,
         eof_stable_observations=stable_observations,
+        archive_root=Path(os.environ.get("ZEEK_ARCHIVE_ROOT", "/var/log/zeek")),
+        retention_seconds=retention_days * 24 * 60 * 60,
+        prune_interval_seconds=prune_interval,
+        prune_batch_size=prune_batch_size,
+        prune_max_rows=prune_max_rows,
     )
 
 
@@ -94,11 +126,16 @@ def tail_zeek(settings: ZeekIngestSettings | None = None) -> int:
     _stop = False
     try:
         settings = settings or settings_from_environment()
+        if not 2 <= settings.prune_max_rows <= MAX_PRUNE_ROWS:
+            raise ValueError(
+                f"prune_max_rows must be from 2 to {MAX_PRUNE_ROWS}"
+            )
         follower = ZeekFollower(
             settings.conn_path,
             settings.source_instance,
             max_records_per_poll=settings.max_records_per_poll,
             eof_stable_observations=settings.eof_stable_observations,
+            archive_root=settings.archive_root,
         )
         conn = connect_zeek_index(settings.index_path)
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
@@ -109,9 +146,41 @@ def tail_zeek(settings: ZeekIngestSettings | None = None) -> int:
     log.info("  source:   %s", settings.source_instance)
     log.info("  conn.log: %s", settings.conn_path)
     log.info("  index:    %s", settings.index_path)
+    log.info("  archive:  %s", settings.archive_root)
+    log.info(
+        "  retention: %.2f days, prune every %.1fs (batch=%s max=%s)",
+        settings.retention_seconds / (24 * 60 * 60),
+        settings.prune_interval_seconds,
+        settings.prune_batch_size,
+        settings.prune_max_rows,
+    )
+    next_prune_at = 0.0
     try:
         while not _stop:
             try:
+                monotonic_now = time.monotonic()
+                if monotonic_now >= next_prune_at:
+                    cutoff = time.time() - settings.retention_seconds
+                    pruned = prune_index(
+                        conn,
+                        cutoff,
+                        batch_size=settings.prune_batch_size,
+                        max_rows=settings.prune_max_rows,
+                    )
+                    pruned_total = pruned.connections + pruned.failures
+                    backlog_possible = pruned_total >= settings.prune_max_rows
+                    log.info(
+                        "Zeek retention pruned connections=%s failures=%s "
+                        "backlog_possible=%s",
+                        pruned.connections,
+                        pruned.failures,
+                        backlog_possible,
+                    )
+                    next_prune_at = monotonic_now + (
+                        settings.poll_interval_seconds
+                        if backlog_possible
+                        else settings.prune_interval_seconds
+                    )
                 result = follower.poll(conn)
             except (
                 ZeekCheckpointConflict,

@@ -16,7 +16,7 @@ import math
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -93,6 +93,8 @@ SCHEMA_STATEMENTS = (
        )""",
     """CREATE INDEX IF NOT EXISTS idx_zeek_conn_end
        ON zeek_connections (end_ts, source_instance, uid)""",
+    """CREATE INDEX IF NOT EXISTS idx_zeek_conn_indexed
+       ON zeek_connections (indexed_at, source_instance, uid)""",
     """CREATE TABLE IF NOT EXISTS zeek_log_checkpoints (
            source_instance TEXT NOT NULL,
            log_name TEXT NOT NULL,
@@ -100,6 +102,8 @@ SCHEMA_STATEMENTS = (
            inode INTEGER NOT NULL,
            offset INTEGER NOT NULL CHECK (offset >= 0),
            file_size INTEGER NOT NULL CHECK (file_size >= offset),
+           record_bytes INTEGER,
+           record_sha256 TEXT,
            updated_at REAL NOT NULL,
            PRIMARY KEY (source_instance, log_name)
        ) WITHOUT ROWID""",
@@ -161,6 +165,8 @@ class ZeekLogCheckpoint:
     inode: int
     offset: int
     file_size: int
+    record_bytes: int | None = None
+    record_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _validate_safe_name(
@@ -188,6 +194,25 @@ class ZeekLogCheckpoint:
             raise ZeekConnValidationError(
                 "checkpoint file_size must be a SQLite integer at least as large as offset"
             )
+        if (self.record_bytes is None) != (self.record_sha256 is None):
+            raise ZeekConnValidationError(
+                "checkpoint record anchor requires both length and digest"
+            )
+        if self.record_bytes is not None:
+            if (
+                type(self.record_bytes) is not int
+                or not 1 <= self.record_bytes <= self.offset
+            ):
+                raise ZeekConnValidationError(
+                    "checkpoint record_bytes must be positive and no larger than offset"
+                )
+            if (
+                not isinstance(self.record_sha256, str)
+                or SHA256_RE.fullmatch(self.record_sha256) is None
+            ):
+                raise ZeekConnValidationError(
+                    "checkpoint record_sha256 must be a sha256 digest"
+                )
 
 
 @dataclass(frozen=True)
@@ -358,6 +383,22 @@ def ensure_zeek_index(conn: sqlite3.Connection) -> None:
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # The checkpoint table predates its archive-recovery anchor columns.
+        # Create it first, then migrate existing v0.5 indexes before replaying
+        # the complete idempotent schema.
+        conn.execute(SCHEMA_STATEMENTS[4])
+        checkpoint_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(zeek_log_checkpoints)")
+        }
+        if "record_bytes" not in checkpoint_columns:
+            conn.execute(
+                "ALTER TABLE zeek_log_checkpoints ADD COLUMN record_bytes INTEGER"
+            )
+        if "record_sha256" not in checkpoint_columns:
+            conn.execute(
+                "ALTER TABLE zeek_log_checkpoints ADD COLUMN record_sha256 TEXT"
+            )
         for statement in SCHEMA_STATEMENTS:
             conn.execute(statement)
         conn.commit()
@@ -392,7 +433,7 @@ def load_checkpoint(
     )
     log_name = _validate_safe_name(log_name, "log_name", MAX_LOG_NAME_CHARS)
     row = conn.execute(
-        """SELECT device, inode, offset, file_size
+        """SELECT device, inode, offset, file_size, record_bytes, record_sha256
            FROM zeek_log_checkpoints
            WHERE source_instance = ? AND log_name = ?""",
         (source_instance, log_name),
@@ -406,6 +447,8 @@ def load_checkpoint(
         inode=int(row[1]),
         offset=int(row[2]),
         file_size=int(row[3]),
+        record_bytes=None if row[4] is None else int(row[4]),
+        record_sha256=None if row[5] is None else str(row[5]),
     )
 
 
@@ -592,13 +635,15 @@ def _store_checkpoint(
     conn.execute(
         """INSERT INTO zeek_log_checkpoints (
                source_instance, log_name, device, inode,
-               offset, file_size, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?)
+               offset, file_size, record_bytes, record_sha256, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(source_instance, log_name) DO UPDATE SET
                device = excluded.device,
                inode = excluded.inode,
                offset = excluded.offset,
                file_size = excluded.file_size,
+               record_bytes = excluded.record_bytes,
+               record_sha256 = excluded.record_sha256,
                updated_at = excluded.updated_at""",
         (
             checkpoint.source_instance,
@@ -607,6 +652,8 @@ def _store_checkpoint(
             checkpoint.inode,
             checkpoint.offset,
             checkpoint.file_size,
+            checkpoint.record_bytes,
+            checkpoint.record_sha256,
             updated_at,
         ),
     )
@@ -677,7 +724,12 @@ def index_conn_line(
                 failure_message or failure_code,
                 observed_at,
             )
-        _store_checkpoint(conn, next_checkpoint, observed_at)
+        stored_checkpoint = replace(
+            next_checkpoint,
+            record_bytes=len(raw),
+            record_sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+        )
+        _store_checkpoint(conn, stored_checkpoint, observed_at)
         conn.commit()
         return IndexedLineResult(
             indexed=inserted,
@@ -750,7 +802,12 @@ def index_conn_failure(
             error,
             observed_at,
         )
-        _store_checkpoint(conn, next_checkpoint, observed_at)
+        stored_checkpoint = replace(
+            next_checkpoint,
+            record_bytes=record_bytes,
+            record_sha256=record_sha256,
+        )
+        _store_checkpoint(conn, stored_checkpoint, observed_at)
         conn.commit()
         return IndexedLineResult(indexed=False, failure_code=error_code)
     except Exception:
@@ -895,38 +952,57 @@ def lookup_connection(
         MAX_SOURCE_INSTANCE_CHARS,
     )
     alert_epoch = _epoch_timestamp(request.alert_timestamp)
-    rows = conn.execute(
-        """SELECT uid, ts, end_ts, orig_h, orig_p, resp_h, resp_p, proto,
-                  service, duration, orig_bytes, resp_bytes, conn_state,
-                  missed_bytes, orig_pkts, resp_pkts
-           FROM zeek_connections INDEXED BY idx_zeek_conn_tuple_time
-           WHERE source_instance = ?
-             AND proto = ?
-             AND (
-                 (orig_h = ? AND orig_p = ? AND resp_h = ? AND resp_p = ?)
-                 OR
-                 (orig_h = ? AND orig_p = ? AND resp_h = ? AND resp_p = ?)
-             )
-             AND ts <= ?
-             AND end_ts >= ?
-           ORDER BY ts DESC, uid
-           LIMIT ?""",
+    orientations = [
         (
-            source_instance,
-            request.proto,
             request.src_ip,
             request.src_port,
             request.dest_ip,
             request.dest_port,
-            request.dest_ip,
-            request.dest_port,
-            request.src_ip,
-            request.src_port,
-            alert_epoch + request.window_after_seconds,
-            alert_epoch - request.window_before_seconds,
-            request.max_records + 1,
         ),
-    ).fetchall()
+        (
+            request.dest_ip,
+            request.dest_port,
+            request.src_ip,
+            request.src_port,
+        ),
+    ]
+    if orientations[0] == orientations[1]:
+        orientations.pop()
+    by_uid = {}
+    for orig_h, orig_p, resp_h, resp_p in orientations:
+        orientation_rows = conn.execute(
+            """SELECT uid, ts, end_ts, orig_h, orig_p, resp_h, resp_p, proto,
+                      service, duration, orig_bytes, resp_bytes, conn_state,
+                      missed_bytes, orig_pkts, resp_pkts
+               FROM zeek_connections INDEXED BY idx_zeek_conn_tuple_time
+               WHERE source_instance = ?
+                 AND proto = ?
+                 AND orig_h = ?
+                 AND orig_p = ?
+                 AND resp_h = ?
+                 AND resp_p = ?
+                 AND ts <= ?
+                 AND end_ts >= ?
+               ORDER BY ts DESC, uid
+               LIMIT ?""",
+            (
+                source_instance,
+                request.proto,
+                orig_h,
+                orig_p,
+                resp_h,
+                resp_p,
+                alert_epoch + request.window_after_seconds,
+                alert_epoch - request.window_before_seconds,
+                request.max_records + 1,
+            ),
+        ).fetchall()
+        for row in orientation_rows:
+            by_uid.setdefault(str(row[0]), row)
+    rows = sorted(
+        by_uid.values(),
+        key=lambda row: (-float(row[1]), str(row[0])),
+    )[: request.max_records + 1]
 
     if not rows:
         return ZeekLookupResult(
@@ -978,45 +1054,64 @@ def prune_index(
     cutoff_epoch = _epoch_timestamp(cutoff)
 
     totals = {"connections": 0, "failures": 0}
-    targets = (
-        ("connections", "zeek_connections"),
-        ("failures", "zeek_ingest_failures"),
-    )
-    total_deleted = 0
-    for key, table in targets:
+    targets = ("connections", "failures")
+
+    def delete_batch(key: str, limit: int) -> int:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if key == "connections":
+                conn.execute(
+                    """DELETE FROM zeek_connections
+                       WHERE (source_instance, uid) IN (
+                           SELECT source_instance, uid
+                           FROM zeek_connections
+                           WHERE indexed_at < ?
+                           ORDER BY indexed_at, source_instance, uid
+                           LIMIT ?
+                       )""",
+                    (cutoff_epoch, limit),
+                )
+            else:
+                conn.execute(
+                    """DELETE FROM zeek_ingest_failures
+                       WHERE id IN (
+                           SELECT id
+                           FROM zeek_ingest_failures
+                           WHERE recorded_at < ?
+                           ORDER BY recorded_at, id
+                           LIMIT ?
+                       )""",
+                    (cutoff_epoch, limit),
+                )
+            deleted = int(conn.execute("SELECT changes()").fetchone()[0])
+            conn.commit()
+            return deleted
+        except Exception:
+            conn.rollback()
+            raise
+
+    # Reserve half of each production run for each table so a connection flood
+    # cannot indefinitely starve rejected-record metadata. Reuse any capacity
+    # left by a sparse table after both reserved shares have run.
+    quotas = {
+        "connections": (max_rows + 1) // 2,
+        "failures": max_rows // 2,
+    }
+    for key in targets:
+        remaining_quota = quotas[key]
+        while remaining_quota > 0:
+            current_batch = min(batch_size, remaining_quota)
+            deleted = delete_batch(key, current_batch)
+            totals[key] += deleted
+            remaining_quota -= deleted
+            if deleted < current_batch:
+                break
+
+    total_deleted = totals["connections"] + totals["failures"]
+    for key in targets:
         while total_deleted < max_rows:
             current_batch = min(batch_size, max_rows - total_deleted)
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                if table == "zeek_connections":
-                    conn.execute(
-                        """DELETE FROM zeek_connections
-                           WHERE (source_instance, uid) IN (
-                               SELECT source_instance, uid
-                               FROM zeek_connections
-                               WHERE end_ts < ?
-                               ORDER BY end_ts, source_instance, uid
-                               LIMIT ?
-                           )""",
-                        (cutoff_epoch, current_batch),
-                    )
-                else:
-                    conn.execute(
-                        """DELETE FROM zeek_ingest_failures
-                           WHERE id IN (
-                               SELECT id
-                               FROM zeek_ingest_failures
-                               WHERE recorded_at < ?
-                               ORDER BY recorded_at, id
-                               LIMIT ?
-                           )""",
-                        (cutoff_epoch, current_batch),
-                    )
-                deleted = int(conn.execute("SELECT changes()").fetchone()[0])
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+            deleted = delete_batch(key, current_batch)
             totals[key] += deleted
             total_deleted += deleted
             if deleted < current_batch:

@@ -123,6 +123,39 @@ checkpoint can recover through Wazuh's compressed daily archives. See the
 [Wazuh integration guide](wazuh-integration.md) for private environment
 settings, startup verification, recovery, and rollback.
 
+## Optional Zeek enrichment
+
+The opt-in `zeek` profile builds a private SQLite context index from JSON
+`conn.log` records and exposes no network port. Mount the complete Zeek logs
+root with `HOST_ZEEK_LOG_DIR`, keep `ZEEK_CONN_PATH` pointed at the live log,
+and keep `ZEEK_ARCHIVE_ROOT` pointed at the directory containing ZeekControl's
+`YYYY-MM-DD` archive directories. Start it with:
+
+```bash
+docker compose --profile zeek up -d
+```
+
+Restart recovery supports uncompressed archives plus gzip, bzip2, and xz. It
+authenticates the old logical stream with a durable record digest before
+resuming a compressed representation; missing, ambiguous, corrupt, symlinked,
+unsupported zstd, or over-budget archives stop ingest rather than skipping
+evidence. The default recovery scan is bounded to 400 dated directories, 512
+matching files, 64 identity candidates, and 512 MiB of decompressed
+verification work. Consecutive dated archives must retain ZeekControl's
+standard `conn.HH:MM:SS-HH:MM:SS.log` interval names; an absent interval or an
+unverifiable intermediate filename stops handoff before the later archive.
+
+The standalone index prunes both accepted connections and rejected-record
+metadata automatically. Defaults retain seven days and run a bounded cleanup
+every 60 seconds (`ZEEK_RETENTION_DAYS`, `ZEEK_PRUNE_INTERVAL`,
+`ZEEK_PRUNE_BATCH_SIZE`, and `ZEEK_PRUNE_MAX_ROWS`). Cleanup uses trusted ingest
+time, preserves the log checkpoint, reports deleted counts and possible
+backlog, and retries at the poll cadence when one run reaches its row budget.
+Prune failures stop the writer so uncontrolled growth is visible. Online
+cleanup reuses SQLite pages but does not shrink an already enlarged database;
+plan offline compaction separately with all writers stopped if space must be
+returned to the filesystem.
+
 ## Performance and model selection
 
 Measured production-shaped values are workload- and hardware-dependent:

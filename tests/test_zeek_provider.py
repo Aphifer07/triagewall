@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ from zeek_index import (
     index_conn_line,
 )
 from zeek_provider import SQLiteZeekContextProvider
+import zeek_provider
 
 
 BASE_EPOCH = 1_777_222_400.0
@@ -112,6 +114,46 @@ class SQLiteZeekContextProviderTests(unittest.TestCase):
                 SOURCE_INSTANCE,
                 busy_timeout_ms=10_001,
             )
+
+    def test_provider_rejects_unbounded_query_timeout(self):
+        for value in (0, 10_001):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    SQLiteZeekContextProvider(
+                        "zeek-context.db",
+                        SOURCE_INSTANCE,
+                        query_timeout_ms=value,
+                    )
+
+    def test_query_deadline_interrupts_pathological_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "zeek-context.db"
+            conn = connect_zeek_index(path)
+            conn.close()
+
+            def pathological_lookup(conn, _request, _source_instance):
+                conn.execute(
+                    """WITH RECURSIVE count(value) AS (
+                           VALUES(0) UNION ALL
+                           SELECT value + 1 FROM count WHERE value < 1000000
+                       ) SELECT sum(value) FROM count"""
+                ).fetchone()
+
+            with (
+                mock.patch.object(
+                    zeek_provider,
+                    "lookup_connection",
+                    side_effect=pathological_lookup,
+                ),
+                mock.patch.object(zeek_provider, "LOOKUP_PROGRESS_OPCODES", 1),
+            ):
+                result = SQLiteZeekContextProvider(
+                    path,
+                    SOURCE_INSTANCE,
+                    query_timeout_ms=1,
+                ).lookup(request())
+
+            self.assertEqual(result.status, ZeekLookupStatus.UNAVAILABLE)
 
 
 if __name__ == "__main__":
