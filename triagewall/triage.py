@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import hashlib
+import math
 import secrets
 import sqlite3
 import time
@@ -46,6 +47,9 @@ DB_PATH = Path(
 )
 REQUEST_TIMEOUT = 120  # seconds
 INTERNAL_SUBNETS = os.environ.get("INTERNAL_SUBNETS", "10.0.0.0/24, 10.0.1.0/24, and 10.0.2.0/24")
+MAX_ZEEK_CATCHUP_TIMEOUT_SECONDS = 10.0
+MIN_ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS = 0.05
+MAX_ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS = 2.0
 
 # Security canary token (regenerated per process start)
 # If this string appears in any LLM output, it indicates prompt injection.
@@ -435,6 +439,42 @@ def _validated_zeek_result(result) -> ZeekLookupResult:
     )
 
 
+def validate_zeek_catchup_settings(
+    timeout_seconds: float,
+    retry_interval_seconds: float,
+) -> tuple[float, float]:
+    """Return a bounded automatic-enrichment catch-up policy."""
+
+    for label, value in (
+        ("timeout", timeout_seconds),
+        ("retry interval", retry_interval_seconds),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Zeek catch-up {label} must be numeric")
+    timeout = float(timeout_seconds)
+    interval = float(retry_interval_seconds)
+    if (
+        not math.isfinite(timeout)
+        or not 0 <= timeout <= MAX_ZEEK_CATCHUP_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            "Zeek catch-up timeout must be from 0 to "
+            f"{MAX_ZEEK_CATCHUP_TIMEOUT_SECONDS:g} seconds"
+        )
+    if (
+        not math.isfinite(interval)
+        or not MIN_ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS
+        <= interval
+        <= MAX_ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS
+    ):
+        raise ValueError(
+            "Zeek catch-up retry interval must be from "
+            f"{MIN_ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS:g} to "
+            f"{MAX_ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS:g} seconds"
+        )
+    return timeout, interval
+
+
 @dataclass(frozen=True)
 class SuricataClassification:
     """Core verdict plus optional Zeek provenance for persistence."""
@@ -446,22 +486,55 @@ class SuricataClassification:
 def _lookup_zeek_context(
     event: SensorEvent,
     provider: ZeekContextProvider,
+    *,
+    catchup_timeout_seconds: float = 0.0,
+    catchup_retry_interval_seconds: float = 0.5,
 ) -> ZeekEnrichmentOutcome:
+    catchup_timeout_seconds, catchup_retry_interval_seconds = (
+        validate_zeek_catchup_settings(
+            catchup_timeout_seconds,
+            catchup_retry_interval_seconds,
+        )
+    )
     eligibility = evaluate_zeek_eligibility(event)
     if not eligibility.eligible:
         return ZeekEnrichmentOutcome(
             eligibility=eligibility,
             lookup=ZeekLookupResult(status=ZeekLookupStatus.DISABLED),
         )
-    try:
-        provider_result = provider.lookup(eligibility.request)
-    except Exception:
-        result = ZeekLookupResult(status=ZeekLookupStatus.UNAVAILABLE)
-    else:
+    deadline = time.monotonic() + catchup_timeout_seconds
+    remaining_sleep_budget = catchup_timeout_seconds
+    first_attempt = True
+    while True:
+        if not first_attempt and time.monotonic() >= deadline:
+            break
+        first_attempt = False
         try:
-            result = _validated_zeek_result(provider_result)
+            provider_result = provider.lookup(eligibility.request)
         except Exception:
-            result = ZeekLookupResult(status=ZeekLookupStatus.INVALID_RESPONSE)
+            result = ZeekLookupResult(status=ZeekLookupStatus.UNAVAILABLE)
+        else:
+            try:
+                result = _validated_zeek_result(provider_result)
+            except Exception:
+                result = ZeekLookupResult(
+                    status=ZeekLookupStatus.INVALID_RESPONSE
+                )
+        if (
+            result.status is not ZeekLookupStatus.NO_MATCH
+            or remaining_sleep_budget <= 0
+        ):
+            break
+        remaining_wall_time = deadline - time.monotonic()
+        if remaining_wall_time <= 0:
+            break
+        pause = min(
+            catchup_retry_interval_seconds,
+            remaining_sleep_budget,
+            remaining_wall_time,
+        )
+        time.sleep(pause)
+        remaining_sleep_budget = max(0.0, remaining_sleep_budget - pause)
     return ZeekEnrichmentOutcome(eligibility=eligibility, lookup=result)
 
 
@@ -493,6 +566,8 @@ def classify_suricata(
     *,
     normalized_event: SensorEvent | None = None,
     zeek_context_provider: ZeekContextProvider | None = None,
+    zeek_catchup_timeout_seconds: float = 0.0,
+    zeek_catchup_retry_interval_seconds: float = 0.5,
 ) -> SuricataClassification:
     """Classify one Suricata alert and retain optional enrichment provenance.
 
@@ -523,6 +598,10 @@ def classify_suricata(
             enrichment = _lookup_zeek_context(
                 normalized_event,
                 zeek_context_provider,
+                catchup_timeout_seconds=zeek_catchup_timeout_seconds,
+                catchup_retry_interval_seconds=(
+                    zeek_catchup_retry_interval_seconds
+                ),
             )
     if (
         enrichment is not None
@@ -544,6 +623,8 @@ def call_ollama(
     *,
     normalized_event: SensorEvent | None = None,
     zeek_context_provider: ZeekContextProvider | None = None,
+    zeek_catchup_timeout_seconds: float = 0.0,
+    zeek_catchup_retry_interval_seconds: float = 0.5,
 ) -> dict:
     """Compatibility entrypoint preserving the v0.4 verdict-only API."""
     return classify_suricata(
@@ -551,6 +632,10 @@ def call_ollama(
         asset_context=asset_context,
         normalized_event=normalized_event,
         zeek_context_provider=zeek_context_provider,
+        zeek_catchup_timeout_seconds=zeek_catchup_timeout_seconds,
+        zeek_catchup_retry_interval_seconds=(
+            zeek_catchup_retry_interval_seconds
+        ),
     ).verdict
 
 

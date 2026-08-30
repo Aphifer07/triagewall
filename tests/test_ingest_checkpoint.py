@@ -175,6 +175,16 @@ class IngestCheckpointTests(unittest.TestCase):
             classify_suricata.call_args.kwargs["zeek_context_provider"],
             provider,
         )
+        self.assertEqual(
+            classify_suricata.call_args.kwargs["zeek_catchup_timeout_seconds"],
+            ingest.ZEEK_CATCHUP_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            classify_suricata.call_args.kwargs[
+                "zeek_catchup_retry_interval_seconds"
+            ],
+            ingest.ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS,
+        )
         normalized_event = classify_suricata.call_args.kwargs["normalized_event"]
         self.assertEqual(normalized_event.flow_id, 42)
         self.assertEqual(

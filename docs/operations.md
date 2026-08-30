@@ -167,6 +167,14 @@ cleanup reuses SQLite pages but does not shrink an already enlarged database;
 plan offline compaction separately with all writers stopped if space must be
 returned to the filesystem.
 
+Automatic Core enrichment gives an eligible `no_match` up to three seconds to
+catch the independently polled index, retrying every half second by default
+(`ZEEK_CATCHUP_TIMEOUT_SECONDS` and
+`ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS`). A match that arrives inside that budget
+is included in the single model call. Ambiguous, unavailable, invalid, and
+disabled outcomes remain immediate fallbacks, and operator-initiated refreshes
+remain one-shot.
+
 ## Performance and model selection
 
 Measured production-shaped values are workload- and hardware-dependent:

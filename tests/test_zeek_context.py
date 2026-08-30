@@ -345,12 +345,14 @@ class SuricataClassificationStageTests(unittest.TestCase):
             triage,
             "call_ollama_suricata_model",
             return_value=model_verdict,
-        ) as model:
+        ) as model, patch.object(triage.time, "sleep") as sleep:
             verdict = triage.call_ollama(
                 event.raw_event,
                 asset_context=self.assets,
                 normalized_event=event,
                 zeek_context_provider=provider,
+                zeek_catchup_timeout_seconds=3.0,
+                zeek_catchup_retry_interval_seconds=0.5,
             )
 
         self.assertEqual(verdict, model_verdict)
@@ -363,6 +365,165 @@ class SuricataClassificationStageTests(unittest.TestCase):
         passed_context = model.call_args.kwargs["zeek_context"]
         self.assertEqual(passed_context.status.value, "matched")
         self.assertEqual(passed_context.context_json, matched.context_json)
+        sleep.assert_not_called()
+
+    def test_no_match_retries_until_matching_context_is_available(self):
+        event = suricata_event()
+        matched = ZeekLookupResult(
+            status=ZeekLookupStatus.MATCHED,
+            context_json=json.dumps({"connections": [{"uid": "C-late"}]}),
+            source_instance="zeek-local",
+            match_strategy="exact_tuple_interval",
+            record_count=1,
+            candidate_count=1,
+        )
+        provider = unittest.mock.Mock()
+        provider.lookup.side_effect = [
+            ZeekLookupResult(status=ZeekLookupStatus.NO_MATCH),
+            matched,
+        ]
+        model_verdict = {
+            "verdict": "real",
+            "confidence": 0.8,
+            "reasoning": "model",
+        }
+
+        with patch.object(
+            triage, "prefilter_verdict", return_value=None
+        ), patch.object(
+            triage,
+            "call_ollama_suricata_model",
+            return_value=model_verdict,
+        ) as model, patch.object(triage.time, "sleep") as sleep:
+            classification = triage.classify_suricata(
+                event.raw_event,
+                asset_context=self.assets,
+                normalized_event=event,
+                zeek_context_provider=provider,
+                zeek_catchup_timeout_seconds=3.0,
+                zeek_catchup_retry_interval_seconds=0.5,
+            )
+
+        self.assertEqual(classification.verdict, model_verdict)
+        final_lookup = classification.zeek_enrichment.lookup
+        self.assertEqual(final_lookup.status.value, "matched")
+        self.assertEqual(final_lookup.context_json, matched.context_json)
+        self.assertEqual(provider.lookup.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+        model.assert_called_once_with(
+            event.raw_event,
+            asset_context=self.assets,
+            zeek_context=final_lookup,
+        )
+
+    def test_genuine_no_match_stops_at_the_catchup_budget(self):
+        event = suricata_event()
+        provider = unittest.mock.Mock()
+        simulated_time = [0.0]
+        lookup_starts = []
+
+        def no_match(_request):
+            lookup_starts.append(simulated_time[0])
+            simulated_time[0] += 0.1
+            return ZeekLookupResult(status=ZeekLookupStatus.NO_MATCH)
+
+        def advance_clock(seconds):
+            simulated_time[0] += seconds
+
+        provider.lookup.side_effect = no_match
+
+        with patch.object(
+            triage, "prefilter_verdict", return_value=None
+        ), patch.object(
+            triage,
+            "call_ollama_suricata_model",
+            return_value={"verdict": "real"},
+        ) as model, patch.object(
+            triage.time,
+            "monotonic",
+            side_effect=lambda: simulated_time[0],
+        ), patch.object(
+            triage.time,
+            "sleep",
+            side_effect=advance_clock,
+        ) as sleep:
+            classification = triage.classify_suricata(
+                event.raw_event,
+                asset_context=self.assets,
+                normalized_event=event,
+                zeek_context_provider=provider,
+                zeek_catchup_timeout_seconds=1.0,
+                zeek_catchup_retry_interval_seconds=0.5,
+            )
+
+        self.assertEqual(
+            classification.zeek_enrichment.lookup.status.value,
+            "no_match",
+        )
+        self.assertEqual(provider.lookup.call_count, 2)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue(all(start < 1.0 for start in lookup_starts))
+        self.assertLessEqual(simulated_time[0], 1.0)
+        model.assert_called_once_with(
+            event.raw_event,
+            asset_context=self.assets,
+        )
+
+    def test_terminal_lookup_outcomes_are_not_retried(self):
+        event = suricata_event()
+        outcomes = (
+            ZeekLookupResult(
+                status=ZeekLookupStatus.AMBIGUOUS,
+                candidate_count=2,
+            ),
+            ZeekLookupResult(status=ZeekLookupStatus.UNAVAILABLE),
+            ZeekLookupResult(status=ZeekLookupStatus.INVALID_RESPONSE),
+        )
+        for outcome in outcomes:
+            with self.subTest(status=outcome.status):
+                provider = unittest.mock.Mock()
+                provider.lookup.return_value = outcome
+                with patch.object(
+                    triage, "prefilter_verdict", return_value=None
+                ), patch.object(
+                    triage,
+                    "call_ollama_suricata_model",
+                    return_value={"verdict": "real"},
+                ) as model, patch.object(triage.time, "sleep") as sleep:
+                    classification = triage.classify_suricata(
+                        event.raw_event,
+                        asset_context=self.assets,
+                        normalized_event=event,
+                        zeek_context_provider=provider,
+                        zeek_catchup_timeout_seconds=3.0,
+                        zeek_catchup_retry_interval_seconds=0.5,
+                    )
+
+                self.assertEqual(
+                    classification.zeek_enrichment.lookup.status.value,
+                    outcome.status.value,
+                )
+                provider.lookup.assert_called_once()
+                sleep.assert_not_called()
+                model.assert_called_once_with(
+                    event.raw_event,
+                    asset_context=self.assets,
+                )
+
+    def test_catchup_settings_are_strictly_bounded(self):
+        invalid = (
+            (-1, 0.5),
+            (10.1, 0.5),
+            (3, 0),
+            (3, 2.1),
+            (float("nan"), 0.5),
+            (3, float("inf")),
+            (True, 0.5),
+        )
+        for timeout, interval in invalid:
+            with self.subTest(timeout=timeout, interval=interval):
+                with self.assertRaises(ValueError):
+                    triage.validate_zeek_catchup_settings(timeout, interval)
 
     def test_classification_retains_non_match_provenance(self):
         event = suricata_event()
@@ -457,14 +618,18 @@ class SuricataClassificationStageTests(unittest.TestCase):
             triage,
             "call_ollama_suricata_model",
             return_value={"verdict": "real"},
-        ) as model:
+        ) as model, patch.object(triage.time, "sleep") as sleep:
             triage.call_ollama(
                 event.raw_event,
                 asset_context=self.assets,
                 normalized_event=event,
                 zeek_context_provider=provider,
+                zeek_catchup_timeout_seconds=3.0,
+                zeek_catchup_retry_interval_seconds=0.5,
             )
 
+        provider.lookup.assert_called_once()
+        sleep.assert_not_called()
         model.assert_called_once_with(event.raw_event, asset_context=self.assets)
 
     def test_invalid_provider_object_cannot_smuggle_model_context(self):

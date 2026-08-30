@@ -76,6 +76,7 @@ from triage import (
     get_asset_context,
     insert_triage_row,
     set_configuration_bundle_owner,
+    validate_zeek_catchup_settings,
 )
 from sensor_event import (
     SuricataValidationError,
@@ -107,6 +108,16 @@ ZEEK_INDEX_PATH = Path(
     )
 )
 ZEEK_SOURCE_ID = os.environ.get("ZEEK_SOURCE_ID", "zeek-local")
+try:
+    (
+        ZEEK_CATCHUP_TIMEOUT_SECONDS,
+        ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS,
+    ) = validate_zeek_catchup_settings(
+        float(os.environ.get("ZEEK_CATCHUP_TIMEOUT_SECONDS", "3")),
+        float(os.environ.get("ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS", "0.5")),
+    )
+except ValueError as exc:
+    raise RuntimeError(f"invalid Zeek catch-up configuration: {exc}") from exc
 ZEEK_CONTEXT_PROVIDER = (
     SQLiteZeekContextProvider(ZEEK_INDEX_PATH, ZEEK_SOURCE_ID)
     if ZEEK_ENRICHMENT_ENABLED
@@ -765,6 +776,10 @@ def process_line(conn, line):
             classification = classify_suricata(
                 classification_event,
                 **call_kwargs,
+                zeek_catchup_timeout_seconds=ZEEK_CATCHUP_TIMEOUT_SECONDS,
+                zeek_catchup_retry_interval_seconds=(
+                    ZEEK_CATCHUP_RETRY_INTERVAL_SECONDS
+                ),
             )
             verdict = classification.verdict
             zeek_enrichment = classification.zeek_enrichment
