@@ -986,11 +986,31 @@ class ZeekFollower:
                 self.close()
                 rotated = True
                 continue
-            if self._opened_as_live:
-                successor = live
+            chain = _scan_rotation_chain(self.live_path, self.archive_root)
+            chain_source = next(
+                (
+                    candidate
+                    for candidate in chain
+                    if candidate.physical_identity == source.physical_identity
+                ),
+                None,
+            )
+            if chain_source is not None:
+                current_chain_source = _safe_source(chain_source.path)
+                if (
+                    current_chain_source.physical_identity
+                    != chain_source.physical_identity
+                ):
+                    raise ZeekFollowerError(
+                        "the Zeek rotation chain changed during successor "
+                        "selection; the follower will not skip an archive"
+                    )
+                successor = self._successor(chain_source, chain)
             else:
-                chain = _scan_rotation_chain(self.live_path, self.archive_root)
-                successor = self._successor(source, chain)
+                raise ZeekFollowerError(
+                    "the retained Zeek log is missing from the "
+                    "rotation chain; the follower will not skip an archive"
+                )
             if successor is None:
                 return ZeekPollResult(scanned, indexed, failures, rotated)
             if successor.size == 0:

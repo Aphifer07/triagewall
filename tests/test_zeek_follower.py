@@ -688,6 +688,111 @@ class RotationTests(ZeekFollowerTestCase):
             live_stat.st_ino,
         ))
 
+    def test_retained_descriptor_traverses_two_numbered_rotations(self):
+        self.live_path.write_bytes(json_line("C1"))
+        follower = self.follower()
+        follower.poll(self.conn)
+
+        first_archive = self.directory / "conn.log.1"
+        oldest_archive = self.directory / "conn.log.2"
+        try:
+            self.live_path.rename(first_archive)
+        except OSError as exc:
+            self.skipTest(f"platform cannot rename an open log: {exc}")
+        self.live_path.write_bytes(json_line("C2", timestamp=BASE_EPOCH + 1))
+        first_archive.rename(oldest_archive)
+        self.live_path.rename(first_archive)
+        self.live_path.write_bytes(json_line("C3", timestamp=BASE_EPOCH + 2))
+
+        first_eof = follower.poll(self.conn)
+        first_handoff = follower.poll(self.conn)
+        second_handoff = follower.poll(self.conn)
+
+        self.assertFalse(first_eof.rotated)
+        self.assertTrue(first_handoff.rotated)
+        self.assertTrue(second_handoff.rotated)
+        self.assertEqual(self.stored_uids(), ["C1", "C2", "C3"])
+        live_stat = self.live_path.stat()
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+        self.assertEqual(
+            (checkpoint.device, checkpoint.inode),
+            (live_stat.st_dev, live_stat.st_ino),
+        )
+
+    def test_missing_retained_source_with_intermediate_archive_fails_closed(self):
+        self.live_path.write_bytes(json_line("C1"))
+        follower = self.follower()
+        follower.poll(self.conn)
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+
+        first_archive = self.directory / "conn.log.1"
+        oldest_archive = self.directory / "conn.log.2"
+        try:
+            self.live_path.rename(first_archive)
+        except OSError as exc:
+            self.skipTest(f"platform cannot rename an open log: {exc}")
+        self.live_path.write_bytes(json_line("C2", timestamp=BASE_EPOCH + 1))
+        first_archive.rename(oldest_archive)
+        self.live_path.rename(first_archive)
+        self.live_path.write_bytes(json_line("C3", timestamp=BASE_EPOCH + 2))
+        try:
+            oldest_archive.unlink()
+        except OSError as exc:
+            self.skipTest(f"platform cannot unlink an open log: {exc}")
+
+        follower.poll(self.conn)
+        with self.assertRaises(ZeekFollowerError) as context:
+            follower.poll(self.conn)
+
+        self.assertIn("will not skip an archive", str(context.exception))
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        self.assertEqual(self.stored_uids(), ["C1"])
+
+    def test_rotation_during_chain_scan_fails_closed(self):
+        self.live_path.write_bytes(json_line("C1"))
+        follower = self.follower()
+        follower.poll(self.conn)
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+
+        first_archive = self.directory / "conn.log.1"
+        second_archive = self.directory / "conn.log.2"
+        third_archive = self.directory / "conn.log.3"
+        try:
+            self.live_path.rename(first_archive)
+        except OSError as exc:
+            self.skipTest(f"platform cannot rename an open log: {exc}")
+        self.live_path.write_bytes(json_line("C2", timestamp=BASE_EPOCH + 1))
+        first_archive.rename(second_archive)
+        self.live_path.rename(first_archive)
+        self.live_path.write_bytes(json_line("C3", timestamp=BASE_EPOCH + 2))
+        follower.poll(self.conn)
+
+        def mixed_rotation_chain(_live_path, _archive_root):
+            stale_source = zeek_follower_module._safe_source(second_archive)
+            second_archive.rename(third_archive)
+            first_archive.rename(second_archive)
+            self.live_path.rename(first_archive)
+            self.live_path.write_bytes(
+                json_line("C4", timestamp=BASE_EPOCH + 3)
+            )
+            return [
+                stale_source,
+                zeek_follower_module._safe_source(first_archive),
+                zeek_follower_module._safe_source(self.live_path),
+            ]
+
+        with mock.patch.object(
+            zeek_follower_module,
+            "_scan_rotation_chain",
+            side_effect=mixed_rotation_chain,
+        ):
+            with self.assertRaises(ZeekFollowerError) as context:
+                follower.poll(self.conn)
+
+        self.assertIn("changed during successor selection", str(context.exception))
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        self.assertEqual(self.stored_uids(), ["C1"])
+
     def test_restart_can_complete_handoff_from_a_drained_archive(self):
         self.live_path.write_bytes(json_line("C1"))
         initial = self.follower()
@@ -865,10 +970,11 @@ class RotationTests(ZeekFollowerTestCase):
                         str(context.exception),
                     )
 
-    def test_retained_descriptor_survives_zeek_style_archive_move(self):
+    def test_unscannable_retained_zeek_archive_fails_closed(self):
         self.live_path.write_bytes(json_line("C1"))
         follower = self.follower()
         follower.poll(self.conn)
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
         archive_directory = self.directory / "2026-08-26"
         archive_directory.mkdir()
         archive = archive_directory / "conn.11-00-00.log"
@@ -879,10 +985,12 @@ class RotationTests(ZeekFollowerTestCase):
         self.live_path.write_bytes(json_line("C2", timestamp=BASE_EPOCH + 1))
 
         follower.poll(self.conn)
-        handoff = follower.poll(self.conn)
+        with self.assertRaises(ZeekFollowerError) as context:
+            follower.poll(self.conn)
 
-        self.assertTrue(handoff.rotated)
-        self.assertEqual(self.stored_uids(), ["C1", "C2"])
+        self.assertIn("missing from the rotation chain", str(context.exception))
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        self.assertEqual(self.stored_uids(), ["C1"])
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_live_symlink_is_rejected(self):
