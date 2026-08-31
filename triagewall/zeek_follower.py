@@ -330,6 +330,8 @@ def _stream_matches_checkpoint(stream, checkpoint: ZeekLogCheckpoint) -> bool:
 def _source_matches_checkpoint(
     source: _Source,
     checkpoint: ZeekLogCheckpoint,
+    *,
+    enforce_recovery_work_limit: bool = True,
 ) -> bool:
     verification_extent = (
         checkpoint.prefix_bytes
@@ -338,7 +340,10 @@ def _source_matches_checkpoint(
     )
     if verification_extent is None:
         return False
-    if verification_extent > MAX_ARCHIVE_VERIFY_BYTES:
+    if (
+        enforce_recovery_work_limit
+        and verification_extent > MAX_ARCHIVE_VERIFY_BYTES
+    ):
         raise ZeekFollowerError(
             "Zeek checkpoint exceeds the bounded recovery verification limit"
         )
@@ -579,7 +584,7 @@ class ZeekFollower:
                 physical_identity == self._stream_source.physical_identity
                 and (expected is None or logical_identity == expected)
             ):
-                return _Source(
+                source = _Source(
                     path=self._stream_source.path,
                     device=logical_identity[0],
                     inode=logical_identity[1],
@@ -593,6 +598,28 @@ class ZeekFollower:
                     physical_inode=physical_identity[1],
                     modified_at=float(opened.st_mtime),
                 )
+                if (
+                    checkpoint is not None
+                    and not source.compressed
+                    and source.size >= checkpoint.offset
+                    and source.size >= checkpoint.file_size
+                ):
+                    path_source = _optional_live_source(source.path)
+                    if (
+                        path_source is not None
+                        and path_source.physical_identity == physical_identity
+                        and not _source_matches_checkpoint(
+                            path_source,
+                            checkpoint,
+                            enforce_recovery_work_limit=False,
+                        )
+                    ):
+                        self.close()
+                        raise ZeekFollowerError(
+                            "the active Zeek log does not match the durable "
+                            "record anchor"
+                        )
+                return source
             self.close()
 
         source, _chain = self._resolve_source(checkpoint)

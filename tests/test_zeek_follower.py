@@ -174,6 +174,23 @@ class CompleteRecordTests(ZeekFollowerTestCase):
         self.assertEqual(self.stored_uids(), ["C1"])
         self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
 
+    def test_active_large_plain_log_anchor_check_has_no_recovery_work_cap(self):
+        first = json_line("C1")
+        self.live_path.write_bytes(first)
+        with self.live_path.open("r+b") as handle:
+            handle.truncate(zeek_follower_module.MAX_ARCHIVE_VERIFY_BYTES + 1)
+        follower = self.follower(max_records_per_poll=1)
+        follower.poll(self.conn)
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+
+        source = follower._active_source(checkpoint)
+
+        self.assertEqual(source.size, checkpoint.file_size)
+        self.assertGreater(
+            source.size,
+            zeek_follower_module.MAX_ARCHIVE_VERIFY_BYTES,
+        )
+
     def test_restart_rejects_unanchored_zero_offset_reused_identity(self):
         self.live_path.write_bytes(json_line("C1"))
         initial = self.follower()
@@ -739,6 +756,35 @@ class RotationTests(ZeekFollowerTestCase):
             follower.poll(self.conn)
 
         self.assertIn("shrank", str(context.exception))
+
+    def test_same_inode_rewrite_regrown_past_observed_size_fails_anchor(self):
+        original = json_line("C1") + json_line(
+            "C2", timestamp=BASE_EPOCH + 1
+        )
+        replacement = (
+            json_line("X1", timestamp=BASE_EPOCH + 10)
+            + json_line("X2", timestamp=BASE_EPOCH + 11)
+            + json_line("X3", timestamp=BASE_EPOCH + 12)
+        )
+        self.live_path.write_bytes(original)
+        original_inode = self.live_path.stat().st_ino
+        follower = self.follower(max_records_per_poll=1)
+        follower.poll(self.conn)
+        checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
+
+        with self.live_path.open("wb", buffering=0) as handle:
+            handle.write(replacement)
+        rewritten = self.live_path.stat()
+        if rewritten.st_ino != original_inode:
+            self.skipTest("platform replaced inode during in-place rewrite")
+        self.assertGreaterEqual(rewritten.st_size, checkpoint.file_size)
+
+        with self.assertRaises(ZeekFollowerError) as context:
+            follower.poll(self.conn)
+
+        self.assertIn("durable record anchor", str(context.exception))
+        self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        self.assertEqual(self.stored_uids(), ["C1"])
 
     def test_compressed_direct_successor_fails_closed(self):
         self.live_path.write_bytes(json_line("C1"))
