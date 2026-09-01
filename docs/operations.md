@@ -125,11 +125,19 @@ settings, startup verification, recovery, and rollback.
 
 ## Optional Zeek enrichment
 
-The opt-in `zeek` profile builds a private SQLite context index from JSON
-`conn.log` records and exposes no network port. Mount the complete Zeek logs
-root with `HOST_ZEEK_LOG_DIR`, keep `ZEEK_CONN_PATH` pointed at the live log,
+The opt-in `zeek` profile builds a private SQLite context index from JSON Zeek
+logs and exposes no network port. Automatic model enrichment remains limited
+to an exact `conn.log` match. An explicit operator investigation may then
+correlate that connection with allowlisted projections from `dns.log`,
+`http.log`, `ssl.log`, `x509.log`, `files.log`, and `notice.log`. HTTP, TLS,
+file, and notice evidence use exact Zeek UID/file identifiers. DNS may also use
+a recent answer for the same connection origin and responder IP, bounded to a
+five-minute lookback. The investigation does not silently rewrite the recorded
+verdict. Mount the complete Zeek logs root with
+`HOST_ZEEK_LOG_DIR`, keep the `ZEEK_*_PATH` values pointed at the live logs,
 and keep `ZEEK_ARCHIVE_ROOT` pointed at the directory containing ZeekControl's
-`YYYY-MM-DD` archive directories. Start it with:
+`YYYY-MM-DD` archive directories. Application logs are optional until first
+observed. Start it with:
 
 ```bash
 docker compose --profile zeek up -d
@@ -142,9 +150,9 @@ unsupported zstd, or over-budget archives stop ingest rather than skipping
 evidence. The default recovery scan is bounded to 400 dated directories, 512
 matching files, 64 identity candidates, and 512 MiB of decompressed
 verification work. Consecutive dated archives must retain ZeekControl's
-standard `conn.HH:MM:SS-HH:MM:SS.log` interval names; an absent interval or an
+standard `<type>.HH:MM:SS-HH:MM:SS.log` interval names; an absent interval or an
 unverifiable intermediate filename stops handoff before the later archive.
-Same-directory restart recovery supports numbered `conn.log.N` rotations;
+Same-directory restart recovery supports numbered `<type>.log.N` rotations;
 arbitrary suffixes are not treated as ordered archives because lexical order
 cannot prove that an intermediate log is present. An uninterrupted follower
 can still drain an arbitrarily renamed file through its retained descriptor.
@@ -168,9 +176,9 @@ successor is left pending until at least one complete record (or the full
 checkpoint without this prefix evidence fails closed instead of trusting a
 potentially reused file identity.
 
-The standalone index prunes both accepted connections and rejected-record
-metadata automatically. Defaults retain seven days and run a bounded cleanup
-every 60 seconds (`ZEEK_RETENTION_DAYS`, `ZEEK_PRUNE_INTERVAL`,
+The standalone index prunes accepted connections, UID-correlated application
+evidence, and rejected-record metadata automatically. Defaults retain seven
+days and run a bounded cleanup every 60 seconds (`ZEEK_RETENTION_DAYS`, `ZEEK_PRUNE_INTERVAL`,
 `ZEEK_PRUNE_BATCH_SIZE`, and `ZEEK_PRUNE_MAX_ROWS`). Cleanup uses trusted ingest
 time, preserves the log checkpoint, reports deleted counts and possible
 backlog, and retries at the poll cadence when one run reaches its row budget.

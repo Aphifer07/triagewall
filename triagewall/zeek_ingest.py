@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private local service that continuously indexes Zeek ``conn.log``."""
+"""Private service indexing Zeek connections and UID-linked evidence."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ try:
         ZeekCheckpointConflict,
         ZeekConnValidationError,
         connect_zeek_index,
+        load_checkpoint,
         prune_index,
     )
 except ImportError:  # Direct execution in the ingest container.
@@ -38,6 +39,7 @@ except ImportError:  # Direct execution in the ingest container.
         ZeekCheckpointConflict,
         ZeekConnValidationError,
         connect_zeek_index,
+        load_checkpoint,
         prune_index,
     )
 
@@ -59,6 +61,7 @@ class ZeekIngestSettings:
     prune_interval_seconds: float = 60.0
     prune_batch_size: int = 1_000
     prune_max_rows: int = 10_000
+    evidence_paths: tuple[tuple[str, Path], ...] = ()
 
 
 def settings_from_environment() -> ZeekIngestSettings:
@@ -87,9 +90,9 @@ def settings_from_environment() -> ZeekIngestSettings:
             f"ZEEK_PRUNE_BATCH_SIZE must be from 1 to {MAX_PRUNE_BATCH_SIZE}"
         )
     prune_max_rows = int(os.environ.get("ZEEK_PRUNE_MAX_ROWS", "10000"))
-    if not 2 <= prune_max_rows <= MAX_PRUNE_ROWS:
+    if not 3 <= prune_max_rows <= MAX_PRUNE_ROWS:
         raise RuntimeError(
-            f"ZEEK_PRUNE_MAX_ROWS must be from 2 to {MAX_PRUNE_ROWS}"
+            f"ZEEK_PRUNE_MAX_ROWS must be from 3 to {MAX_PRUNE_ROWS}"
         )
     return ZeekIngestSettings(
         conn_path=Path(
@@ -110,6 +113,18 @@ def settings_from_environment() -> ZeekIngestSettings:
         prune_interval_seconds=prune_interval,
         prune_batch_size=prune_batch_size,
         prune_max_rows=prune_max_rows,
+        evidence_paths=tuple(
+            (
+                log_name,
+                Path(
+                    os.environ.get(
+                        f"ZEEK_{log_name.upper()}_PATH",
+                        f"/var/log/zeek/current/{log_name}.log",
+                    )
+                ),
+            )
+            for log_name in ("dns", "http", "ssl", "x509", "files", "notice")
+        ),
     )
 
 
@@ -126,9 +141,9 @@ def tail_zeek(settings: ZeekIngestSettings | None = None) -> int:
     _stop = False
     try:
         settings = settings or settings_from_environment()
-        if not 2 <= settings.prune_max_rows <= MAX_PRUNE_ROWS:
+        if not 3 <= settings.prune_max_rows <= MAX_PRUNE_ROWS:
             raise ValueError(
-                f"prune_max_rows must be from 2 to {MAX_PRUNE_ROWS}"
+                f"prune_max_rows must be from 3 to {MAX_PRUNE_ROWS}"
             )
         follower = ZeekFollower(
             settings.conn_path,
@@ -137,14 +152,33 @@ def tail_zeek(settings: ZeekIngestSettings | None = None) -> int:
             eof_stable_observations=settings.eof_stable_observations,
             archive_root=settings.archive_root,
         )
+        followers = [("conn", settings.conn_path, follower, True)]
+        followers.extend(
+            (
+                log_name,
+                path,
+                ZeekFollower(
+                    path,
+                    settings.source_instance,
+                    max_records_per_poll=settings.max_records_per_poll,
+                    eof_stable_observations=settings.eof_stable_observations,
+                    archive_root=settings.archive_root,
+                    log_name=log_name,
+                ),
+                False,
+            )
+            for log_name, path in settings.evidence_paths
+        )
         conn = connect_zeek_index(settings.index_path)
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         log.critical("Zeek ingest startup failed: %s", exc)
         return 1
 
-    log.info("Starting Zeek conn.log ingest")
+    log.info("Starting Zeek log ingest")
     log.info("  source:   %s", settings.source_instance)
     log.info("  conn.log: %s", settings.conn_path)
+    for log_name, path in settings.evidence_paths:
+        log.info("  %-8s %s (optional until first observed)", f"{log_name}.log:", path)
     log.info("  index:    %s", settings.index_path)
     log.info("  archive:  %s", settings.archive_root)
     log.info(
@@ -155,6 +189,7 @@ def tail_zeek(settings: ZeekIngestSettings | None = None) -> int:
         settings.prune_max_rows,
     )
     next_prune_at = 0.0
+    next_follower = 0
     try:
         while not _stop:
             try:
@@ -167,12 +202,15 @@ def tail_zeek(settings: ZeekIngestSettings | None = None) -> int:
                         batch_size=settings.prune_batch_size,
                         max_rows=settings.prune_max_rows,
                     )
-                    pruned_total = pruned.connections + pruned.failures
+                    pruned_total = (
+                        pruned.connections + pruned.evidence + pruned.failures
+                    )
                     backlog_possible = pruned_total >= settings.prune_max_rows
                     log.info(
-                        "Zeek retention pruned connections=%s failures=%s "
+                        "Zeek retention pruned connections=%s evidence=%s failures=%s "
                         "backlog_possible=%s",
                         pruned.connections,
+                        pruned.evidence,
                         pruned.failures,
                         backlog_possible,
                     )
@@ -181,7 +219,39 @@ def tail_zeek(settings: ZeekIngestSettings | None = None) -> int:
                         if backlog_possible
                         else settings.prune_interval_seconds
                     )
-                result = follower.poll(conn)
+                remaining = settings.max_records_per_poll
+                ordered = followers[next_follower:] + followers[:next_follower]
+                for log_name, path, current_follower, required in ordered:
+                    if remaining <= 0:
+                        break
+                    if not required:
+                        checkpoint = load_checkpoint(
+                            conn,
+                            settings.source_instance,
+                            log_name,
+                        )
+                        try:
+                            path.lstat()
+                            present = True
+                        except FileNotFoundError:
+                            present = False
+                        if not present and checkpoint is None:
+                            continue
+                    result = current_follower.poll(
+                        conn,
+                        record_limit=remaining,
+                    )
+                    remaining -= result.scanned
+                    if result.scanned or result.rotated:
+                        log.info(
+                            "Zeek %s.log batch scanned=%s indexed=%s failures=%s rotated=%s",
+                            log_name,
+                            result.scanned,
+                            result.indexed,
+                            result.failures,
+                            result.rotated,
+                        )
+                next_follower = (next_follower + 1) % len(followers)
             except (
                 ZeekCheckpointConflict,
                 ZeekConnValidationError,
@@ -194,17 +264,10 @@ def tail_zeek(settings: ZeekIngestSettings | None = None) -> int:
                     exc,
                 )
                 return 1
-            if result.scanned or result.rotated:
-                log.info(
-                    "Zeek batch scanned=%s indexed=%s failures=%s rotated=%s",
-                    result.scanned,
-                    result.indexed,
-                    result.failures,
-                    result.rotated,
-                )
             time.sleep(settings.poll_interval_seconds)
     finally:
-        follower.close()
+        for _log_name, _path, current_follower, _required in followers:
+            current_follower.close()
         conn.close()
     log.info("Zeek ingest stopped cleanly")
     return 0

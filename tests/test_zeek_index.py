@@ -25,6 +25,7 @@ from zeek_index import (
     ensure_zeek_index,
     index_conn_failure,
     index_conn_line,
+    index_evidence_line,
     load_checkpoint,
     lookup_connection,
     normalize_conn_record,
@@ -120,6 +121,34 @@ class ZeekIndexTestCase(unittest.TestCase):
             clock=clock,
         )
         return result, load_checkpoint(self.conn, SOURCE_INSTANCE)
+
+    def add_evidence_line(
+        self,
+        log_name,
+        record,
+        *,
+        inode=21,
+        device=7,
+        clock=lambda: BASE_EPOCH + 100,
+    ):
+        raw = json_line(record)
+        current = load_checkpoint(self.conn, SOURCE_INSTANCE, log_name)
+        start = current.offset if current is not None else 0
+        checkpoint = ZeekLogCheckpoint(
+            source_instance=SOURCE_INSTANCE,
+            log_name=log_name,
+            device=device,
+            inode=inode,
+            offset=start + len(raw),
+            file_size=start + len(raw),
+        )
+        return index_evidence_line(
+            self.conn,
+            raw,
+            checkpoint,
+            expected_checkpoint=current,
+            clock=clock,
+        )
 
 
 class ConnNormalizationTests(ZeekIndexTestCase):
@@ -741,6 +770,222 @@ class ConnectionLookupTests(ZeekIndexTestCase):
         self.assertIsNone(result.context_json)
 
 
+class ZeekApplicationEvidenceTests(ZeekIndexTestCase):
+    def setUp(self):
+        super().setUp()
+        self.add_line(json_line(conn_record()))
+
+    def test_basic_lookup_does_not_silently_expand_model_evidence(self):
+        self.add_evidence_line(
+            "http",
+            {
+                "ts": BASE_EPOCH + 1,
+                "uid": "C1",
+                "method": "GET",
+                "host": "example.test",
+                "uri": "/download",
+                "user_agent": "curl/8.0",
+                "status_code": 200,
+            },
+        )
+
+        result = lookup_connection(self.conn, request(), SOURCE_INSTANCE)
+        context = json.loads(result.context_json)
+
+        self.assertNotIn("http", context)
+        self.assertEqual(context["connections"][0]["uid"], "C1")
+
+    def test_deep_lookup_correlates_allowlisted_uid_and_certificate_evidence(self):
+        self.add_evidence_line(
+            "dns",
+            {
+                "ts": BASE_EPOCH + 1,
+                "uid": "C1",
+                "query": "example.test",
+                "qtype_name": "A",
+                "rcode_name": "NOERROR",
+                "answers": ["198.51.100.20"],
+                "untrusted_extra": "discard me",
+            },
+        )
+        self.add_evidence_line(
+            "http",
+            {
+                "ts": BASE_EPOCH + 2,
+                "uid": "C1",
+                "method": "GET",
+                "host": "example.test",
+                "uri": "/download",
+                "user_agent": "curl/8.0",
+                "status_code": 200,
+            },
+            inode=22,
+        )
+        self.add_evidence_line(
+            "ssl",
+            {
+                "ts": BASE_EPOCH + 3,
+                "uid": "C1",
+                "server_name": "example.test",
+                "version": "TLSv13",
+                "cipher": "TLS_AES_128_GCM_SHA256",
+                "established": True,
+                "cert_chain_fuids": ["F-cert-1"],
+            },
+            inode=23,
+        )
+        self.add_evidence_line(
+            "x509",
+            {
+                "ts": BASE_EPOCH + 3,
+                "id": "F-cert-1",
+                "certificate.subject": "CN=example.test",
+                "certificate.issuer": "CN=Test CA",
+                "certificate.not_valid_after": BASE_EPOCH + 86_400,
+            },
+            inode=24,
+        )
+
+        result = lookup_connection(
+            self.conn,
+            request(),
+            SOURCE_INSTANCE,
+            include_application=True,
+        )
+        context = json.loads(result.context_json)
+
+        self.assertEqual(context["dns"][0]["query"], "example.test")
+        self.assertNotIn("untrusted_extra", context["dns"][0])
+        self.assertEqual(context["http"][0]["method"], "GET")
+        self.assertEqual(context["tls"][0]["server_name"], "example.test")
+        self.assertEqual(
+            context["certificates"][0]["certificate.subject"],
+            "CN=example.test",
+        )
+        self.assertEqual(result.match_strategy, "exact_tuple_interval_linked_evidence")
+
+    def test_deep_lookup_links_recent_dns_answer_from_the_same_origin(self):
+        self.add_evidence_line(
+            "dns",
+            {
+                "ts": BASE_EPOCH - 60,
+                "uid": "C-dns-separate",
+                "id.orig_h": "192.0.2.10",
+                "query": "download.example",
+                "answers": ["198.51.100.20"],
+            },
+        )
+
+        result = lookup_connection(
+            self.conn,
+            request(),
+            SOURCE_INSTANCE,
+            include_application=True,
+        )
+        context = json.loads(result.context_json)
+
+        self.assertEqual(context["dns"][0]["query"], "download.example")
+        self.assertEqual(
+            context["dns"][0]["correlation"],
+            "recent_dns_answer_for_responder",
+        )
+
+    def test_dns_answer_correlation_requires_same_origin_and_recent_time(self):
+        for index, (origin, timestamp) in enumerate(
+            (
+                ("192.0.2.99", BASE_EPOCH - 60),
+                ("192.0.2.10", BASE_EPOCH - 301),
+            )
+        ):
+            self.add_evidence_line(
+                "dns",
+                {
+                    "ts": timestamp,
+                    "uid": f"C-dns-{index}",
+                    "id.orig_h": origin,
+                    "query": f"wrong-{index}.example",
+                    "answers": ["198.51.100.20"],
+                },
+                inode=40,
+            )
+
+        result = lookup_connection(
+            self.conn,
+            request(),
+            SOURCE_INSTANCE,
+            include_application=True,
+        )
+
+        self.assertNotIn("dns", json.loads(result.context_json))
+
+    def test_valid_unlinked_notice_is_checkpointed_without_becoming_context(self):
+        outcome = self.add_evidence_line(
+            "notice",
+            {
+                "ts": BASE_EPOCH + 1,
+                "note": "Scan::Port_Scan",
+                "msg": "aggregate notice without a connection UID",
+            },
+        )
+
+        self.assertFalse(outcome.indexed)
+        self.assertIsNone(outcome.failure_code)
+        self.assertIsNotNone(load_checkpoint(self.conn, SOURCE_INSTANCE, "notice"))
+
+    def test_deep_context_drops_excess_records_and_reports_truncation(self):
+        for index in range(3):
+            self.add_evidence_line(
+                "http",
+                {
+                    "ts": BASE_EPOCH + index,
+                    "uid": "C1",
+                    "method": "GET",
+                    "host": "example.test",
+                    "uri": f"/{index}/" + ("x" * 700),
+                },
+                inode=30,
+            )
+
+        result = lookup_connection(
+            self.conn,
+            request(max_context_bytes=900),
+            SOURCE_INSTANCE,
+            include_application=True,
+        )
+        context = json.loads(result.context_json)
+
+        self.assertEqual(result.status, ZeekLookupStatus.MATCHED)
+        self.assertTrue(result.truncated)
+        self.assertTrue(context["application_evidence_truncated"])
+        self.assertLessEqual(len(result.context_json.encode("utf-8")), 900)
+
+    def test_invalid_evidence_is_quarantined_and_checkpointed(self):
+        outcome = self.add_evidence_line(
+            "http",
+            {
+                "ts": BASE_EPOCH,
+                "uid": "C1",
+                "host": "bad\nvalue",
+            },
+        )
+
+        self.assertFalse(outcome.indexed)
+        self.assertEqual(outcome.failure_code, "invalid_record")
+        self.assertIsNotNone(load_checkpoint(self.conn, SOURCE_INSTANCE, "http"))
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM zeek_evidence").fetchone()[0],
+            0,
+        )
+
+    def test_unsupported_log_name_fails_before_checkpointing(self):
+        with self.assertRaises(ZeekConnValidationError):
+            self.add_evidence_line(
+                "weird",
+                {"ts": BASE_EPOCH, "uid": "C1"},
+            )
+        self.assertIsNone(load_checkpoint(self.conn, SOURCE_INSTANCE, "weird"))
+
+
 class ZeekIndexRetentionTests(ZeekIndexTestCase):
     def test_prune_is_bounded_and_preserves_checkpoint(self):
         self.add_line(
@@ -754,6 +999,15 @@ class ZeekIndexRetentionTests(ZeekIndexTestCase):
         self.add_line(
             json_line(conn_record("retained", ts=BASE_EPOCH + 500, duration=1.0))
         )
+        self.add_evidence_line(
+            "dns",
+            {
+                "ts": BASE_EPOCH - 500,
+                "uid": "expired",
+                "query": "expired.example",
+            },
+            clock=lambda: BASE_EPOCH - 500,
+        )
         checkpoint = load_checkpoint(self.conn, SOURCE_INSTANCE)
 
         result = prune_index(
@@ -764,6 +1018,7 @@ class ZeekIndexRetentionTests(ZeekIndexTestCase):
         )
 
         self.assertEqual(result.connections, 1)
+        self.assertEqual(result.evidence, 1)
         self.assertEqual(result.failures, 1)
         self.assertEqual(
             self.conn.execute(
@@ -772,6 +1027,10 @@ class ZeekIndexRetentionTests(ZeekIndexTestCase):
             [("retained",)],
         )
         self.assertEqual(load_checkpoint(self.conn, SOURCE_INSTANCE), checkpoint)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM zeek_evidence_links").fetchone()[0],
+            0,
+        )
 
     def test_prune_max_rows_is_global_across_index_tables(self):
         self.add_line(
@@ -785,7 +1044,7 @@ class ZeekIndexRetentionTests(ZeekIndexTestCase):
 
         result = prune_index(self.conn, BASE_EPOCH, batch_size=1, max_rows=1)
 
-        self.assertEqual(result.connections + result.failures, 1)
+        self.assertEqual(result.connections + result.evidence + result.failures, 1)
         remaining = (
             self.conn.execute("SELECT COUNT(*) FROM zeek_connections").fetchone()[0]
             + self.conn.execute(

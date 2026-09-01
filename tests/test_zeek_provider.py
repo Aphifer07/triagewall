@@ -17,6 +17,7 @@ from zeek_index import (
     ZeekLogCheckpoint,
     connect_zeek_index,
     index_conn_line,
+    index_evidence_line,
 )
 from zeek_provider import SQLiteZeekContextProvider
 import zeek_provider
@@ -82,6 +83,63 @@ class SQLiteZeekContextProviderTests(unittest.TestCase):
             self.assertEqual(result.status, ZeekLookupStatus.MATCHED)
             self.assertEqual(result.record_count, 1)
             self.assertIn('"uid":"C1"', result.context_json)
+
+    def test_deep_lookup_adds_uid_correlated_application_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "zeek-context.db"
+            raw = conn_line()
+            http_raw = json.dumps(
+                {
+                    "ts": BASE_EPOCH + 1,
+                    "uid": "C1",
+                    "method": "GET",
+                    "host": "example.test",
+                    "uri": "/",
+                    "status_code": 200,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8") + b"\n"
+            conn = connect_zeek_index(path)
+            try:
+                index_conn_line(
+                    conn,
+                    raw,
+                    ZeekLogCheckpoint(
+                        source_instance=SOURCE_INSTANCE,
+                        log_name="conn",
+                        device=7,
+                        inode=11,
+                        offset=len(raw),
+                        file_size=len(raw),
+                    ),
+                    expected_checkpoint=None,
+                )
+                index_evidence_line(
+                    conn,
+                    http_raw,
+                    ZeekLogCheckpoint(
+                        source_instance=SOURCE_INSTANCE,
+                        log_name="http",
+                        device=7,
+                        inode=12,
+                        offset=len(http_raw),
+                        file_size=len(http_raw),
+                    ),
+                    expected_checkpoint=None,
+                )
+            finally:
+                conn.close()
+
+            provider = SQLiteZeekContextProvider(path, SOURCE_INSTANCE)
+            basic = provider.lookup(request())
+            deep = provider.lookup_deep(request())
+
+            self.assertNotIn('"http"', basic.context_json)
+            self.assertIn('"host":"example.test"', deep.context_json)
+            self.assertEqual(
+                deep.match_strategy,
+                "exact_tuple_interval_linked_evidence",
+            )
 
     def test_missing_index_is_unavailable_and_is_not_created(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,4 +1,4 @@
-"""Standalone, bounded SQLite index for Zeek ``conn.log`` context.
+"""Standalone, bounded SQLite index for Zeek connection and application context.
 
 The index is deliberately separate from TriageWall's verdict database.  It
 accepts complete JSON-Lines records, stores a strict allowlisted projection,
@@ -26,6 +26,8 @@ try:
     from .sensor_event import MAX_SQLITE_INTEGER
     from .time_utils import format_utc_timestamp, parse_utc_timestamp
     from .zeek_context import (
+        DEFAULT_WINDOW_AFTER_SECONDS,
+        DEFAULT_WINDOW_BEFORE_SECONDS,
         MAX_CANDIDATES,
         ZEEK_CONTEXT_SCHEMA_VERSION,
         ZeekLookupRequest,
@@ -37,6 +39,8 @@ except ImportError:  # Direct script-style imports used by container entrypoints
     from sensor_event import MAX_SQLITE_INTEGER
     from time_utils import format_utc_timestamp, parse_utc_timestamp
     from zeek_context import (
+        DEFAULT_WINDOW_AFTER_SECONDS,
+        DEFAULT_WINDOW_BEFORE_SECONDS,
         MAX_CANDIDATES,
         ZEEK_CONTEXT_SCHEMA_VERSION,
         ZeekLookupRequest,
@@ -50,6 +54,10 @@ MAX_UID_CHARS = 128
 MAX_SOURCE_INSTANCE_CHARS = 128
 MAX_LOG_NAME_CHARS = 32
 MAX_OPTIONAL_TEXT_CHARS = 128
+MAX_EVIDENCE_TEXT_CHARS = 2_048
+MAX_EVIDENCE_LIST_ITEMS = 16
+MAX_EVIDENCE_RECORDS = 24
+DNS_CORRELATION_LOOKBACK_SECONDS = 5 * 60
 MAX_FAILURE_ERROR_CHARS = 256
 MAX_CONNECTION_DURATION_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_PRUNE_BATCH_SIZE = 1_000
@@ -61,6 +69,9 @@ UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,127}$")
 PRINTABLE_TEXT_RE = re.compile(r"^[\x20-\x7e]+$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SUPPORTED_EVIDENCE_LOGS = frozenset(
+    {"dns", "http", "ssl", "x509", "files", "notice"}
+)
 
 
 SCHEMA_STATEMENTS = (
@@ -123,6 +134,36 @@ SCHEMA_STATEMENTS = (
        )""",
     """CREATE INDEX IF NOT EXISTS idx_zeek_failures_recorded
        ON zeek_ingest_failures (recorded_at, id)""",
+    """CREATE TABLE IF NOT EXISTS zeek_evidence (
+           source_instance TEXT NOT NULL,
+           log_name TEXT NOT NULL,
+           record_sha256 TEXT NOT NULL,
+           ts REAL NOT NULL,
+           context_json TEXT NOT NULL,
+           indexed_at REAL NOT NULL,
+           PRIMARY KEY (source_instance, log_name, record_sha256)
+       ) WITHOUT ROWID""",
+    """CREATE INDEX IF NOT EXISTS idx_zeek_evidence_indexed
+       ON zeek_evidence (indexed_at, source_instance, log_name, record_sha256)""",
+    """CREATE TABLE IF NOT EXISTS zeek_evidence_links (
+           source_instance TEXT NOT NULL,
+           log_name TEXT NOT NULL,
+           record_sha256 TEXT NOT NULL,
+           link_type TEXT NOT NULL CHECK (
+               link_type IN ('uid', 'fuid', 'answer_ip', 'orig_h')
+           ),
+           link_value TEXT NOT NULL,
+           ts REAL NOT NULL,
+           PRIMARY KEY (
+               source_instance, log_name, record_sha256,
+               link_type, link_value
+           )
+       ) WITHOUT ROWID""",
+    """CREATE INDEX IF NOT EXISTS idx_zeek_evidence_link_lookup
+       ON zeek_evidence_links (
+           source_instance, link_type, link_value,
+           ts, log_name, record_sha256
+       )""",
 )
 
 
@@ -157,6 +198,15 @@ class ZeekConnection:
     missed_bytes: int | None = None
     orig_pkts: int | None = None
     resp_pkts: int | None = None
+
+
+@dataclass(frozen=True)
+class ZeekEvidence:
+    source_instance: str
+    log_name: str
+    ts: float
+    context_json: str
+    links: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -253,6 +303,7 @@ class IndexedLineResult:
 @dataclass(frozen=True)
 class ZeekPruneResult:
     connections: int
+    evidence: int
     failures: int
 
 
@@ -403,6 +454,301 @@ def normalize_conn_record(
         ),
         orig_pkts=_optional_counter(record.get("orig_pkts"), "orig_pkts"),
         resp_pkts=_optional_counter(record.get("resp_pkts"), "resp_pkts"),
+    )
+
+
+def _optional_evidence_text(
+    value: Any,
+    label: str,
+    *,
+    maximum: int = MAX_EVIDENCE_TEXT_CHARS,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise ZeekConnValidationError(
+            f"{label} must be non-empty text of at most {maximum} characters"
+        )
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ZeekConnValidationError(f"{label} contains control characters")
+    return value
+
+
+def _optional_evidence_bool(value: Any, label: str) -> bool | None:
+    if value is None:
+        return None
+    if type(value) is not bool:
+        raise ZeekConnValidationError(f"{label} must be a boolean")
+    return value
+
+
+def _optional_evidence_integer(
+    value: Any,
+    label: str,
+    *,
+    maximum: int = MAX_SQLITE_INTEGER,
+) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= maximum:
+        raise ZeekConnValidationError(
+            f"{label} must be an integer from 0 to {maximum}"
+        )
+    return value
+
+
+def _optional_evidence_list(
+    value: Any,
+    label: str,
+    *,
+    identifiers: bool = False,
+) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) > MAX_EVIDENCE_LIST_ITEMS:
+        raise ZeekConnValidationError(
+            f"{label} must be a list of at most {MAX_EVIDENCE_LIST_ITEMS} values"
+        )
+    result = []
+    for index, item in enumerate(value):
+        text = _optional_evidence_text(
+            item,
+            f"{label}[{index}]",
+            maximum=MAX_UID_CHARS if identifiers else MAX_EVIDENCE_TEXT_CHARS,
+        )
+        if text is None:
+            raise ZeekConnValidationError(f"{label}[{index}] cannot be null")
+        if identifiers and UID_RE.fullmatch(text) is None:
+            raise ZeekConnValidationError(
+                f"{label}[{index}] must be a safe Zeek identifier"
+            )
+        if text not in result:
+            result.append(text)
+    return result
+
+
+def _evidence_uid(value: Any, label: str, *, required: bool) -> str | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or UID_RE.fullmatch(value) is None:
+        raise ZeekConnValidationError(
+            f"{label} must be a safe identifier of at most {MAX_UID_CHARS} characters"
+        )
+    return value
+
+
+def _copy_evidence_text(record: Mapping[str, Any], output: dict, *names: str) -> None:
+    for name in names:
+        value = _optional_evidence_text(record.get(name), name)
+        if value is not None:
+            output[name] = value
+
+
+def _copy_evidence_integers(
+    record: Mapping[str, Any],
+    output: dict,
+    *names: str,
+) -> None:
+    for name in names:
+        value = _optional_evidence_integer(record.get(name), name)
+        if value is not None:
+            output[name] = value
+
+
+def _copy_evidence_bools(record: Mapping[str, Any], output: dict, *names: str) -> None:
+    for name in names:
+        value = _optional_evidence_bool(record.get(name), name)
+        if value is not None:
+            output[name] = value
+
+
+def _copy_evidence_lists(record: Mapping[str, Any], output: dict, *names: str) -> None:
+    for name in names:
+        value = _optional_evidence_list(record.get(name), name)
+        if value is not None:
+            output[name] = value
+
+
+def normalize_evidence_record(
+    record: Mapping[str, Any],
+    source_instance: str,
+    log_name: str,
+) -> ZeekEvidence:
+    """Project one supported application log into bounded, UID-linked evidence."""
+
+    if not isinstance(record, Mapping):
+        raise ZeekConnValidationError(f"{log_name}.log record must be a JSON object")
+    source_instance = _validate_safe_name(
+        source_instance,
+        "source_instance",
+        MAX_SOURCE_INSTANCE_CHARS,
+    )
+    if log_name not in SUPPORTED_EVIDENCE_LOGS:
+        raise ZeekConnValidationError(f"unsupported Zeek evidence log: {log_name}")
+    ts = _zeek_timestamp(record.get("ts"))
+    output: dict[str, Any] = {
+        "ts": format_utc_timestamp(datetime.fromtimestamp(ts, timezone.utc))
+    }
+    links: list[tuple[str, str]] = []
+
+    if log_name in {"dns", "http", "ssl"}:
+        uid = _evidence_uid(record.get("uid"), "uid", required=True)
+        output["uid"] = uid
+        links.append(("uid", uid))
+    elif log_name == "files":
+        fuid = _evidence_uid(record.get("fuid"), "fuid", required=True)
+        output["fuid"] = fuid
+        links.append(("fuid", fuid))
+        conn_uids = _optional_evidence_list(
+            record.get("conn_uids"),
+            "conn_uids",
+            identifiers=True,
+        ) or []
+        if conn_uids:
+            output["conn_uids"] = conn_uids
+            links.extend(("uid", uid) for uid in conn_uids)
+    elif log_name == "x509":
+        fuid = _evidence_uid(record.get("id"), "id", required=True)
+        output["id"] = fuid
+        links.append(("fuid", fuid))
+    else:
+        uid = _evidence_uid(record.get("uid"), "uid", required=False)
+        fuid = _evidence_uid(record.get("fuid"), "fuid", required=False)
+        if uid is not None:
+            output["uid"] = uid
+            links.append(("uid", uid))
+        if fuid is not None:
+            output["fuid"] = fuid
+            links.append(("fuid", fuid))
+
+    if log_name == "dns":
+        _copy_evidence_text(record, output, "query", "qtype_name", "rcode_name")
+        origin = record.get("id.orig_h")
+        if origin is not None:
+            canonical_origin = _required_ip(origin, "id.orig_h")
+            output["id.orig_h"] = canonical_origin
+            links.append(("orig_h", canonical_origin))
+        answers = _optional_evidence_list(record.get("answers"), "answers")
+        if answers is not None:
+            output["answers"] = answers
+            for answer in answers:
+                try:
+                    canonical_answer = str(ipaddress.ip_address(answer))
+                except ValueError:
+                    continue
+                links.append(("answer_ip", canonical_answer))
+        _copy_evidence_bools(record, output, "rejected")
+    elif log_name == "http":
+        _copy_evidence_text(
+            record,
+            output,
+            "method",
+            "host",
+            "uri",
+            "referrer",
+            "user_agent",
+            "status_msg",
+        )
+        _copy_evidence_integers(
+            record,
+            output,
+            "status_code",
+            "request_body_len",
+            "response_body_len",
+        )
+        _copy_evidence_lists(record, output, "resp_mime_types")
+    elif log_name == "ssl":
+        _copy_evidence_text(
+            record,
+            output,
+            "version",
+            "cipher",
+            "curve",
+            "server_name",
+            "next_protocol",
+        )
+        _copy_evidence_bools(record, output, "established", "resumed")
+        for name in ("cert_chain_fuids", "client_cert_chain_fuids"):
+            values = _optional_evidence_list(
+                record.get(name),
+                name,
+                identifiers=True,
+            )
+            if values is not None:
+                output[name] = values
+                links.extend(("fuid", value) for value in values)
+    elif log_name == "x509":
+        _copy_evidence_text(
+            record,
+            output,
+            "certificate.serial",
+            "certificate.subject",
+            "certificate.issuer",
+            "certificate.key_alg",
+            "certificate.sig_alg",
+            "certificate.key_type",
+            "certificate.curve",
+        )
+        _copy_evidence_integers(
+            record,
+            output,
+            "certificate.version",
+            "certificate.key_length",
+        )
+        _copy_evidence_lists(
+            record,
+            output,
+            "san.dns",
+            "san.ip",
+            "san.email",
+            "san.uri",
+        )
+        for name in ("certificate.not_valid_before", "certificate.not_valid_after"):
+            value = record.get(name)
+            if value is not None:
+                epoch = _zeek_timestamp(value)
+                output[name] = format_utc_timestamp(
+                    datetime.fromtimestamp(epoch, timezone.utc)
+                )
+    elif log_name == "files":
+        _copy_evidence_text(
+            record,
+            output,
+            "source",
+            "mime_type",
+            "filename",
+            "md5",
+            "sha1",
+            "sha256",
+        )
+        _copy_evidence_integers(
+            record,
+            output,
+            "seen_bytes",
+            "total_bytes",
+            "missing_bytes",
+            "overflow_bytes",
+        )
+        _copy_evidence_bools(record, output, "is_orig", "timedout")
+    else:
+        _copy_evidence_text(record, output, "note", "msg", "sub", "src", "dst")
+        _copy_evidence_integers(record, output, "p")
+        _copy_evidence_lists(record, output, "actions")
+
+    context_json = json.dumps(
+        output,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    if len(context_json.encode("utf-8")) > MAX_CONN_RECORD_BYTES:
+        raise ZeekConnValidationError("normalized Zeek evidence exceeds its byte limit")
+    return ZeekEvidence(
+        source_instance=source_instance,
+        log_name=log_name,
+        ts=ts,
+        context_json=context_json,
+        links=tuple(dict.fromkeys(links)),
     )
 
 
@@ -576,6 +922,34 @@ def _parse_complete_conn_line(
     return raw, normalize_conn_record(decoded, source_instance)
 
 
+def _parse_complete_evidence_line(
+    raw_line: bytes | str,
+    source_instance: str,
+    log_name: str,
+) -> tuple[bytes, ZeekEvidence | None]:
+    raw, text = _decode_complete_line(raw_line)
+    if not text.strip():
+        return raw, None
+
+    def reject_duplicate_keys(pairs):
+        decoded = {}
+        for key, value in pairs:
+            if key in decoded:
+                raise ZeekConnValidationError(
+                    f"{log_name}.log record contains duplicate key {key!r}"
+                )
+            decoded[key] = value
+        return decoded
+
+    try:
+        decoded = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise ZeekConnValidationError(
+            f"{log_name}.log record is not valid JSON"
+        ) from exc
+    return raw, normalize_evidence_record(decoded, source_instance, log_name)
+
+
 def _insert_connection(
     conn: sqlite3.Connection,
     record: ZeekConnection,
@@ -637,6 +1011,55 @@ def _insert_connection(
         record.resp_pkts,
     )
     return "duplicate" if stored == expected else "uid_conflict"
+
+
+def _insert_evidence(
+    conn: sqlite3.Connection,
+    record: ZeekEvidence,
+    record_sha256: str,
+    indexed_at: float,
+) -> str:
+    cursor = conn.execute(
+        """INSERT OR IGNORE INTO zeek_evidence (
+               source_instance, log_name, record_sha256,
+               ts, context_json, indexed_at
+           ) VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            record.source_instance,
+            record.log_name,
+            record_sha256,
+            record.ts,
+            record.context_json,
+            indexed_at,
+        ),
+    )
+    if cursor.rowcount != 1:
+        stored = conn.execute(
+            """SELECT ts, context_json
+               FROM zeek_evidence
+               WHERE source_instance = ? AND log_name = ?
+                 AND record_sha256 = ?""",
+            (record.source_instance, record.log_name, record_sha256),
+        ).fetchone()
+        if stored != (record.ts, record.context_json):
+            return "digest_conflict"
+        return "duplicate"
+    for link_type, link_value in record.links:
+        conn.execute(
+            """INSERT INTO zeek_evidence_links (
+                   source_instance, log_name, record_sha256,
+                   link_type, link_value, ts
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                record.source_instance,
+                record.log_name,
+                record_sha256,
+                link_type,
+                link_value,
+                record.ts,
+            ),
+        )
+    return "inserted"
 
 
 def _store_failure_digest(
@@ -785,6 +1208,94 @@ def index_conn_line(
         raise
 
 
+def index_evidence_line(
+    conn: sqlite3.Connection,
+    raw_line: bytes | str,
+    next_checkpoint: ZeekLogCheckpoint,
+    *,
+    expected_checkpoint: ZeekLogCheckpoint | None,
+    clock: Callable[[], float] = time.time,
+) -> IndexedLineResult:
+    """Atomically index one supported application-log record and its cursor."""
+
+    log_name = next_checkpoint.log_name
+    if log_name not in SUPPORTED_EVIDENCE_LOGS:
+        raise ZeekConnValidationError(f"unsupported Zeek evidence log: {log_name}")
+    raw = raw_line.encode("utf-8") if isinstance(raw_line, str) else raw_line
+    record = None
+    failure_code = None
+    failure_message = None
+    try:
+        raw, record = _parse_complete_evidence_line(
+            raw_line,
+            next_checkpoint.source_instance,
+            log_name,
+        )
+    except ZeekIncompleteRecordError:
+        raise
+    except ZeekConnValidationError as exc:
+        if not isinstance(raw, bytes):
+            raise TypeError("raw_line must be bytes or text") from exc
+        failure_code = "invalid_record"
+        failure_message = str(exc)
+
+    observed_at = _epoch_timestamp(clock())
+    record_sha256 = "sha256:" + hashlib.sha256(raw).hexdigest()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = load_checkpoint(
+            conn,
+            next_checkpoint.source_instance,
+            log_name,
+        )
+        _validate_checkpoint_transition(
+            current,
+            expected_checkpoint,
+            next_checkpoint,
+            len(raw),
+        )
+        inserted = False
+        duplicate = False
+        if record is not None and record.links:
+            insert_outcome = _insert_evidence(
+                conn,
+                record,
+                record_sha256,
+                observed_at,
+            )
+            inserted = insert_outcome == "inserted"
+            duplicate = insert_outcome == "duplicate"
+            if insert_outcome == "digest_conflict":
+                failure_code = "digest_conflict"
+                failure_message = (
+                    "Zeek evidence digest exists with different normalized content"
+                )
+        if failure_code is not None:
+            _store_failure_digest(
+                conn,
+                next_checkpoint,
+                record_sha256,
+                failure_code,
+                failure_message or failure_code,
+                observed_at,
+            )
+        stored_checkpoint = replace(
+            next_checkpoint,
+            record_bytes=len(raw),
+            record_sha256=record_sha256,
+        )
+        _store_checkpoint(conn, stored_checkpoint, observed_at)
+        conn.commit()
+        return IndexedLineResult(
+            indexed=inserted,
+            duplicate=duplicate,
+            failure_code=failure_code,
+        )
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def index_conn_failure(
     conn: sqlite3.Connection,
     next_checkpoint: ZeekLogCheckpoint,
@@ -798,9 +1309,9 @@ def index_conn_failure(
 ) -> IndexedLineResult:
     """Atomically checkpoint bounded metadata for a complete rejected line."""
 
-    if next_checkpoint.log_name != "conn":
+    if next_checkpoint.log_name not in ({"conn"} | SUPPORTED_EVIDENCE_LOGS):
         raise ZeekConnValidationError(
-            "conn.log failures require the 'conn' checkpoint name"
+            "Zeek failures require a supported checkpoint name"
         )
     if (
         type(record_bytes) is not int
@@ -869,9 +1380,9 @@ def rotate_checkpoint(
 ) -> None:
     """Persist a proven, fully drained handoff to a successor at byte zero."""
 
-    if next_checkpoint.log_name != "conn":
+    if next_checkpoint.log_name not in ({"conn"} | SUPPORTED_EVIDENCE_LOGS):
         raise ZeekConnValidationError(
-            "conn.log rotation requires the 'conn' checkpoint name"
+            "Zeek rotation requires a supported checkpoint name"
         )
     if (
         next_checkpoint.source_instance != expected_checkpoint.source_instance
@@ -934,7 +1445,7 @@ def _epoch_timestamp(value: str | datetime | int | float) -> float:
     return parse_utc_timestamp(value).timestamp()
 
 
-def _connection_context(row: tuple[Any, ...], request: ZeekLookupRequest) -> str:
+def _connection_context(row: tuple[Any, ...], request: ZeekLookupRequest) -> dict:
     (
         uid,
         ts,
@@ -989,13 +1500,207 @@ def _connection_context(row: tuple[Any, ...], request: ZeekLookupRequest) -> str
             }
         ],
     }
-    return json.dumps(context, sort_keys=True, separators=(",", ":"))
+    return context
+
+
+_EVIDENCE_CONTEXT_KEYS = {
+    "dns": "dns",
+    "http": "http",
+    "ssl": "tls",
+    "x509": "certificates",
+    "files": "files",
+    "notice": "notices",
+}
+
+
+def _linked_application_evidence(
+    conn: sqlite3.Connection,
+    source_instance: str,
+    uid: str,
+    start_ts: float,
+    end_ts: float,
+    origin_host: str,
+    responder_host: str,
+) -> tuple[list[tuple[str, dict]], bool]:
+    direct = conn.execute(
+        """SELECT e.log_name, e.record_sha256, e.context_json, e.ts
+           FROM zeek_evidence_links AS link
+           JOIN zeek_evidence AS e
+             ON e.source_instance = link.source_instance
+            AND e.log_name = link.log_name
+            AND e.record_sha256 = link.record_sha256
+           WHERE link.source_instance = ?
+             AND link.link_type = 'uid'
+             AND link.link_value = ?
+             AND link.ts BETWEEN ? AND ?
+           ORDER BY link.ts, link.log_name, link.record_sha256
+           LIMIT ?""",
+        (
+            source_instance,
+            uid,
+            start_ts - DEFAULT_WINDOW_BEFORE_SECONDS,
+            end_ts + DEFAULT_WINDOW_AFTER_SECONDS,
+            MAX_EVIDENCE_RECORDS + 1,
+        ),
+    ).fetchall()
+    fuid_rows = conn.execute(
+        """SELECT DISTINCT fuid.link_value
+           FROM zeek_evidence_links AS uid
+           JOIN zeek_evidence_links AS fuid
+             ON fuid.source_instance = uid.source_instance
+            AND fuid.log_name = uid.log_name
+            AND fuid.record_sha256 = uid.record_sha256
+           WHERE uid.source_instance = ?
+             AND uid.link_type = 'uid'
+             AND uid.link_value = ?
+             AND uid.ts BETWEEN ? AND ?
+             AND fuid.link_type = 'fuid'
+           ORDER BY fuid.link_value
+           LIMIT ?""",
+        (
+            source_instance,
+            uid,
+            start_ts - DEFAULT_WINDOW_BEFORE_SECONDS,
+            end_ts + DEFAULT_WINDOW_AFTER_SECONDS,
+            MAX_EVIDENCE_LIST_ITEMS + 1,
+        ),
+    ).fetchall()
+    truncated = (
+        len(direct) > MAX_EVIDENCE_RECORDS
+        or len(fuid_rows) > MAX_EVIDENCE_LIST_ITEMS
+    )
+    rows = [(*row, "same_connection_uid") for row in direct[:MAX_EVIDENCE_RECORDS]]
+    remaining = MAX_EVIDENCE_RECORDS - len(rows)
+    fuids = [str(row[0]) for row in fuid_rows[:MAX_EVIDENCE_LIST_ITEMS]]
+    if remaining > 0 and fuids:
+        placeholders = ",".join("?" for _value in fuids)
+        linked = conn.execute(
+            f"""SELECT DISTINCT e.log_name, e.record_sha256,
+                               e.context_json, e.ts
+                   FROM zeek_evidence_links AS link
+                   JOIN zeek_evidence AS e
+                     ON e.source_instance = link.source_instance
+                    AND e.log_name = link.log_name
+                    AND e.record_sha256 = link.record_sha256
+                   WHERE link.source_instance = ?
+                     AND link.link_type = 'fuid'
+                     AND link.link_value IN ({placeholders})
+                     AND link.ts BETWEEN ? AND ?
+                   ORDER BY e.ts, e.log_name, e.record_sha256
+                   LIMIT ?""",
+            (
+                source_instance,
+                *fuids,
+                start_ts - DEFAULT_WINDOW_BEFORE_SECONDS,
+                end_ts + DEFAULT_WINDOW_AFTER_SECONDS,
+                remaining + 1,
+            ),
+        ).fetchall()
+        if len(linked) > remaining:
+            truncated = True
+        rows.extend((*row, "shared_file_id") for row in linked[:remaining])
+        remaining = MAX_EVIDENCE_RECORDS - len(rows)
+
+    if remaining > 0:
+        dns_rows = conn.execute(
+            """SELECT e.log_name, e.record_sha256, e.context_json, e.ts
+               FROM zeek_evidence_links AS answer
+               JOIN zeek_evidence_links AS origin
+                 ON origin.source_instance = answer.source_instance
+                AND origin.log_name = answer.log_name
+                AND origin.record_sha256 = answer.record_sha256
+               JOIN zeek_evidence AS e
+                 ON e.source_instance = answer.source_instance
+                AND e.log_name = answer.log_name
+                AND e.record_sha256 = answer.record_sha256
+               WHERE answer.source_instance = ?
+                 AND answer.link_type = 'answer_ip'
+                 AND answer.link_value = ?
+                 AND answer.ts BETWEEN ? AND ?
+                 AND origin.link_type = 'orig_h'
+                 AND origin.link_value = ?
+               ORDER BY answer.ts DESC, answer.log_name, answer.record_sha256
+               LIMIT ?""",
+            (
+                source_instance,
+                responder_host,
+                start_ts - DNS_CORRELATION_LOOKBACK_SECONDS,
+                end_ts + DEFAULT_WINDOW_AFTER_SECONDS,
+                origin_host,
+                remaining + 1,
+            ),
+        ).fetchall()
+        if len(dns_rows) > remaining:
+            truncated = True
+        rows.extend(
+            (*row, "recent_dns_answer_for_responder")
+            for row in dns_rows[:remaining]
+        )
+    if len(rows) >= MAX_EVIDENCE_RECORDS:
+        truncated = True
+
+    seen = set()
+    evidence = []
+    for log_name, digest, context_json, _ts, correlation in rows:
+        identity = (str(log_name), str(digest))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        parsed = json.loads(context_json)
+        if not isinstance(parsed, dict):
+            raise ZeekConnValidationError(
+                "stored Zeek evidence context must be an object"
+            )
+        parsed["correlation"] = correlation
+        evidence.append((_EVIDENCE_CONTEXT_KEYS[str(log_name)], parsed))
+    return evidence, truncated
+
+
+def _serialize_context(
+    base: dict,
+    evidence: list[tuple[str, dict]],
+    *,
+    max_bytes: int,
+    already_truncated: bool,
+) -> tuple[str | None, bool]:
+    def encode(value: dict) -> str:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    encoded = encode(base)
+    if len(encoded.encode("utf-8")) > max_bytes:
+        return None, False
+    truncated = already_truncated
+    for group, record in evidence:
+        base.setdefault(group, []).append(record)
+        candidate = encode(base)
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            encoded = candidate
+            continue
+        base[group].pop()
+        if not base[group]:
+            del base[group]
+        truncated = True
+    if truncated:
+        base["application_evidence_truncated"] = True
+        candidate = encode(base)
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            encoded = candidate
+        else:
+            del base["application_evidence_truncated"]
+    return encoded, truncated
 
 
 def lookup_connection(
     conn: sqlite3.Connection,
     request: ZeekLookupRequest,
     source_instance: str,
+    *,
+    include_application: bool = False,
 ) -> ZeekLookupResult:
     """Correlate one exact tuple against connection intervals without guessing."""
 
@@ -1072,20 +1777,41 @@ def lookup_connection(
             truncated=len(rows) > request.max_records,
         )
 
-    context_json = _connection_context(rows[0], request)
-    if len(context_json.encode("utf-8")) > request.max_context_bytes:
+    context = _connection_context(rows[0], request)
+    evidence = []
+    evidence_truncated = False
+    match_strategy = "exact_tuple_interval"
+    if include_application:
+        evidence, evidence_truncated = _linked_application_evidence(
+            conn,
+            source_instance,
+            str(rows[0][0]),
+            float(rows[0][1]),
+            float(rows[0][2]),
+            str(rows[0][3]),
+            str(rows[0][5]),
+        )
+        match_strategy = "exact_tuple_interval_linked_evidence"
+    context_json, serialized_truncated = _serialize_context(
+        context,
+        evidence,
+        max_bytes=request.max_context_bytes,
+        already_truncated=evidence_truncated,
+    )
+    if context_json is None:
         return ZeekLookupResult(
             status=ZeekLookupStatus.INVALID_RESPONSE,
             source_instance=source_instance,
-            match_strategy="exact_tuple_interval",
+            match_strategy=match_strategy,
         )
     return ZeekLookupResult(
         status=ZeekLookupStatus.MATCHED,
         context_json=context_json,
         source_instance=source_instance,
-        match_strategy="exact_tuple_interval",
+        match_strategy=match_strategy,
         record_count=1,
         candidate_count=1,
+        truncated=serialized_truncated,
     )
 
 
@@ -1096,7 +1822,7 @@ def prune_index(
     batch_size: int = DEFAULT_PRUNE_BATCH_SIZE,
     max_rows: int = DEFAULT_PRUNE_MAX_ROWS,
 ) -> ZeekPruneResult:
-    """Bound deletion work for expired connections and failure metadata."""
+    """Bound deletion work for expired connections, evidence, and failures."""
 
     if type(batch_size) is not int or not 1 <= batch_size <= MAX_PRUNE_BATCH_SIZE:
         raise ValueError(
@@ -1106,8 +1832,8 @@ def prune_index(
         raise ValueError(f"max_rows must be between 1 and {MAX_PRUNE_ROWS}")
     cutoff_epoch = _epoch_timestamp(cutoff)
 
-    totals = {"connections": 0, "failures": 0}
-    targets = ("connections", "failures")
+    totals = {"connections": 0, "evidence": 0, "failures": 0}
+    targets = ("connections", "evidence", "failures")
 
     def delete_batch(key: str, limit: int) -> int:
         try:
@@ -1122,6 +1848,27 @@ def prune_index(
                            ORDER BY indexed_at, source_instance, uid
                            LIMIT ?
                        )""",
+                    (cutoff_epoch, limit),
+                )
+            elif key == "evidence":
+                selection = """SELECT source_instance, log_name, record_sha256
+                               FROM zeek_evidence
+                               WHERE indexed_at < ?
+                               ORDER BY indexed_at, source_instance,
+                                        log_name, record_sha256
+                               LIMIT ?"""
+                conn.execute(
+                    f"""DELETE FROM zeek_evidence_links
+                        WHERE (source_instance, log_name, record_sha256) IN (
+                            {selection}
+                        )""",
+                    (cutoff_epoch, limit),
+                )
+                conn.execute(
+                    f"""DELETE FROM zeek_evidence
+                        WHERE (source_instance, log_name, record_sha256) IN (
+                            {selection}
+                        )""",
                     (cutoff_epoch, limit),
                 )
             else:
@@ -1143,12 +1890,12 @@ def prune_index(
             conn.rollback()
             raise
 
-    # Reserve half of each production run for each table so a connection flood
-    # cannot indefinitely starve rejected-record metadata. Reuse any capacity
-    # left by a sparse table after both reserved shares have run.
+    # Reserve a share for every retained data class so no one traffic shape can
+    # indefinitely starve another. Reuse sparse-table capacity afterward.
+    base_quota, remainder = divmod(max_rows, len(targets))
     quotas = {
-        "connections": (max_rows + 1) // 2,
-        "failures": max_rows // 2,
+        key: base_quota + int(index < remainder)
+        for index, key in enumerate(targets)
     }
     for key in targets:
         remaining_quota = quotas[key]
@@ -1160,7 +1907,7 @@ def prune_index(
             if deleted < current_batch:
                 break
 
-    total_deleted = totals["connections"] + totals["failures"]
+    total_deleted = sum(totals.values())
     for key in targets:
         while total_deleted < max_rows:
             current_batch = min(batch_size, max_rows - total_deleted)
@@ -1172,5 +1919,6 @@ def prune_index(
 
     return ZeekPruneResult(
         connections=totals["connections"],
+        evidence=totals["evidence"],
         failures=totals["failures"],
     )

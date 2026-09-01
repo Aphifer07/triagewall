@@ -1,4 +1,4 @@
-"""Bounded, fail-closed follower for a local Zeek ``conn.log`` file."""
+"""Bounded, fail-closed followers for local Zeek JSON log files."""
 
 from __future__ import annotations
 
@@ -17,18 +17,22 @@ from pathlib import Path
 try:
     from .zeek_index import (
         MAX_CONN_RECORD_BYTES,
+        SUPPORTED_EVIDENCE_LOGS,
         ZeekLogCheckpoint,
         index_conn_failure,
         index_conn_line,
+        index_evidence_line,
         load_checkpoint,
         rotate_checkpoint,
     )
 except ImportError:  # Direct script-style imports used by container entrypoints.
     from zeek_index import (
         MAX_CONN_RECORD_BYTES,
+        SUPPORTED_EVIDENCE_LOGS,
         ZeekLogCheckpoint,
         index_conn_failure,
         index_conn_line,
+        index_evidence_line,
         load_checkpoint,
         rotate_checkpoint,
     )
@@ -46,11 +50,8 @@ MAX_SUCCESSOR_PREFIX_BYTES = 64 * 1024
 COMPRESSED_SUFFIXES = (".gz", ".bz2", ".xz", ".zst")
 _NUMBERED_ROTATION_RE = re.compile(r"^\.([1-9]\d*)$")
 _DATED_ARCHIVE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_ARCHIVED_CONN_RE = re.compile(
-    r"^conn(?:\..+)?\.log(?:\.(?:gz|bz2|xz|zst))?$"
-)
-_ZEEKCONTROL_ARCHIVE_RE = re.compile(
-    r"^conn\.(?:(\d{2}:\d{2}:\d{2})-(\d{2}:\d{2}:\d{2})|"
+_ZEEKCONTROL_INTERVAL_SUFFIX = (
+    r"\.(?:(\d{2}:\d{2}:\d{2})-(\d{2}:\d{2}:\d{2})|"
     r"(\d{2}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2}))"
     r"\.log(?:\.(?:gz|bz2|xz|zst))?$"
 )
@@ -123,10 +124,29 @@ def _numbered_rotation(name: str, live_name: str) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
-def _zeekcontrol_archive_interval(path: Path) -> tuple[datetime, datetime] | None:
+def _log_stem(live_name: str) -> str:
+    if not live_name.endswith(".log") or len(live_name) <= 4:
+        raise ZeekFollowerError("Zeek live log name must end in .log")
+    return live_name[:-4]
+
+
+def _archived_log_pattern(live_name: str) -> re.Pattern:
+    stem = re.escape(_log_stem(live_name))
+    return re.compile(
+        rf"^{stem}(?:\..+)?\.log(?:\.(?:gz|bz2|xz|zst))?$"
+    )
+
+
+def _zeekcontrol_archive_interval(
+    path: Path,
+    live_name: str = "conn.log",
+) -> tuple[datetime, datetime] | None:
     if _DATED_ARCHIVE_RE.fullmatch(path.parent.name) is None:
         return None
-    match = _ZEEKCONTROL_ARCHIVE_RE.fullmatch(path.name)
+    match = re.fullmatch(
+        "^" + re.escape(_log_stem(live_name)) + _ZEEKCONTROL_INTERVAL_SUFFIX,
+        path.name,
+    )
     if match is None:
         return None
     start_text = (match.group(1) or match.group(3)).replace("-", ":")
@@ -177,8 +197,12 @@ def _optional_live_source(path: Path) -> _Source | None:
         raise
 
 
-def _scan_dated_archives(archive_root: Path) -> list[_Source]:
+def _scan_dated_archives(
+    archive_root: Path,
+    live_name: str = "conn.log",
+) -> list[_Source]:
     archives: list[tuple[str, str, _Source]] = []
+    archive_pattern = _archived_log_pattern(live_name)
     examined = 0
     dated_directories = 0
     try:
@@ -222,7 +246,7 @@ def _scan_dated_archives(archive_root: Path) -> list[_Source]:
                             raise ZeekFollowerError(
                                 "Zeek archives exceed their bounded scan limit"
                             )
-                        if _ARCHIVED_CONN_RE.fullmatch(entry.name) is None:
+                        if archive_pattern.fullmatch(entry.name) is None:
                             continue
                         if len(archives) >= MAX_ROTATION_SCAN_ENTRIES:
                             raise ZeekFollowerError(
@@ -275,7 +299,7 @@ def _scan_rotation_chain(
         ) from exc
     chain.sort(key=lambda item: _rotation_sort_key(item.path.name, live_path.name))
     if archive_root is not None:
-        chain = _scan_dated_archives(archive_root) + chain
+        chain = _scan_dated_archives(archive_root, live_path.name) + chain
     identities = [(item.device, item.inode) for item in chain]
     if len(identities) != len(set(identities)):
         raise ZeekFollowerError("Zeek rotation chain contains duplicate file identities")
@@ -479,7 +503,7 @@ def _read_record(stream) -> _RecordRead:
 
 
 class ZeekFollower:
-    """Read complete conn.log lines and preserve an exact SQLite cursor."""
+    """Read one Zeek JSON log and preserve an exact per-log SQLite cursor."""
 
     def __init__(
         self,
@@ -489,6 +513,7 @@ class ZeekFollower:
         max_records_per_poll: int = 1_000,
         eof_stable_observations: int = 2,
         archive_root: str | Path | None = None,
+        log_name: str = "conn",
     ) -> None:
         if (
             type(max_records_per_poll) is not int
@@ -499,8 +524,15 @@ class ZeekFollower:
             )
         if type(eof_stable_observations) is not int or eof_stable_observations < 2:
             raise ValueError("eof_stable_observations must be at least 2")
+        if log_name not in ({"conn"} | SUPPORTED_EVIDENCE_LOGS):
+            raise ValueError("log_name must be a supported Zeek log")
         self.live_path = Path(live_path)
+        _log_stem(self.live_path.name)
         self.source_instance = source_instance
+        self.log_name = log_name
+        self._line_indexer = (
+            index_conn_line if log_name == "conn" else index_evidence_line
+        )
         self.max_records_per_poll = max_records_per_poll
         self.eof_stable_observations = eof_stable_observations
         self.archive_root = None if archive_root is None else Path(archive_root)
@@ -790,9 +822,13 @@ class ZeekFollower:
                         is not None
                     )
                     if current_is_dated and successor_is_dated:
-                        current_interval = _zeekcontrol_archive_interval(source.path)
+                        current_interval = _zeekcontrol_archive_interval(
+                            source.path,
+                            self.live_path.name,
+                        )
                         successor_interval = _zeekcontrol_archive_interval(
-                            successor.path
+                            successor.path,
+                            self.live_path.name,
                         )
                         if (
                             current_interval is None
@@ -805,7 +841,10 @@ class ZeekFollower:
                                 "skip an archive"
                             )
                     if current_is_dated and not successor_is_dated:
-                        current_interval = _zeekcontrol_archive_interval(source.path)
+                        current_interval = _zeekcontrol_archive_interval(
+                            source.path,
+                            self.live_path.name,
+                        )
                         live_modified = (
                             None
                             if successor.modified_at is None
@@ -831,16 +870,34 @@ class ZeekFollower:
                 return None
         return None
 
-    def poll(self, conn: sqlite3.Connection) -> ZeekPollResult:
+    def poll(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        record_limit: int | None = None,
+    ) -> ZeekPollResult:
         """Process one bounded batch currently available on disk."""
+
+        batch_limit = self.max_records_per_poll if record_limit is None else record_limit
+        if (
+            type(batch_limit) is not int
+            or not 1 <= batch_limit <= self.max_records_per_poll
+        ):
+            raise ValueError(
+                "record_limit must be from 1 to the follower's configured maximum"
+            )
 
         scanned = 0
         indexed = 0
         failures = 0
         rotated = False
 
-        while scanned < self.max_records_per_poll:
-            checkpoint = load_checkpoint(conn, self.source_instance)
+        while scanned < batch_limit:
+            checkpoint = load_checkpoint(
+                conn,
+                self.source_instance,
+                self.log_name,
+            )
             source = self._active_source(checkpoint)
             offset = 0 if checkpoint is None else checkpoint.offset
             if (not source.compressed and source.size < offset) or (
@@ -862,7 +919,7 @@ class ZeekFollower:
                         "Zeek log ends before its durable checkpoint"
                     )
 
-                while scanned < self.max_records_per_poll:
+                while scanned < batch_limit:
                     record = _read_record(stream)
                     if not record.complete:
                         self._reset_eof()
@@ -875,7 +932,7 @@ class ZeekFollower:
                         and record.raw.lstrip().startswith(b"#separator")
                     ):
                         raise ZeekFollowerError(
-                            "Zeek conn.log is TSV; enable JSON logs with "
+                            f"Zeek {self.live_path.name} is TSV; enable JSON logs with "
                             "@load policy/tuning/json-logs"
                         )
 
@@ -892,7 +949,7 @@ class ZeekFollower:
                     )
                     next_checkpoint = ZeekLogCheckpoint(
                         source_instance=self.source_instance,
-                        log_name="conn",
+                        log_name=self.log_name,
                         device=source.device,
                         inode=source.inode,
                         offset=stream.tell(),
@@ -909,7 +966,7 @@ class ZeekFollower:
                             record_sha256=record.digest,
                             error_code="record_too_large",
                             error=(
-                                "Zeek conn.log record exceeded "
+                                f"Zeek {self.live_path.name} record exceeded "
                                 f"{MAX_CONN_RECORD_BYTES} bytes"
                             ),
                         )
@@ -918,7 +975,7 @@ class ZeekFollower:
                         record_sha256 = (
                             "sha256:" + hashlib.sha256(record.raw).hexdigest()
                         )
-                        outcome = index_conn_line(
+                        outcome = self._line_indexer(
                             conn,
                             record.raw,
                             next_checkpoint,
@@ -934,7 +991,7 @@ class ZeekFollower:
                     failures += int(outcome.failure_code is not None)
                     self._reset_eof()
 
-                if scanned >= self.max_records_per_poll:
+                if scanned >= batch_limit:
                     return ZeekPollResult(scanned, indexed, failures, rotated)
 
                 final_offset = stream.tell()
@@ -1021,7 +1078,7 @@ class ZeekFollower:
             successor_size, prefix_bytes, prefix_sha256 = successor_anchor
             next_checkpoint = ZeekLogCheckpoint(
                 source_instance=self.source_instance,
-                log_name="conn",
+                log_name=self.log_name,
                 device=successor.device,
                 inode=successor.inode,
                 offset=0,

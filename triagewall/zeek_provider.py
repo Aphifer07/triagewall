@@ -64,6 +64,21 @@ class SQLiteZeekContextProvider:
         self.query_timeout_ms = query_timeout_ms
 
     def lookup(self, request: ZeekLookupRequest) -> ZeekLookupResult:
+        """Return basic connection evidence for the automatic model boundary."""
+
+        return self._lookup(request, include_application=False)
+
+    def lookup_deep(self, request: ZeekLookupRequest) -> ZeekLookupResult:
+        """Add bounded UID-linked evidence for an explicit operator request."""
+
+        return self._lookup(request, include_application=True)
+
+    def _lookup(
+        self,
+        request: ZeekLookupRequest,
+        *,
+        include_application: bool,
+    ) -> ZeekLookupResult:
         """Return unavailable on index I/O failure without creating a database."""
 
         try:
@@ -80,6 +95,13 @@ class SQLiteZeekContextProvider:
                 lambda: int(time.monotonic() >= deadline),
                 LOOKUP_PROGRESS_OPCODES,
             )
+            if include_application:
+                return lookup_connection(
+                    conn,
+                    request,
+                    self.source_instance,
+                    include_application=True,
+                )
             return lookup_connection(conn, request, self.source_instance)
         except (OSError, ValueError, sqlite3.Error):
             return ZeekLookupResult(status=ZeekLookupStatus.UNAVAILABLE)

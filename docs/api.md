@@ -225,11 +225,17 @@ curl -sS -H 'Host: localhost' -H "X-API-Key: $KEY" \
 ### `GET /api/v1/verdicts/{event_id}/zeek-context`
 
 Repeat the same exact, bounded tuple lookup against the current local Zeek
-index at operator request. Response:
+index at operator request, then correlate the single matched Zeek connection
+with bounded, allowlisted DNS, HTTP, TLS/certificate, file, and notice records.
+Application records use exact Zeek identifiers. DNS may additionally match a
+recent answer for the same origin host and responder IP within five minutes.
+Response:
 `{generated_at, mode, event_id, stored, live}`. `stored` is the immutable
 enrichment used for the verdict; `live` is the new lookup result. This endpoint
-does not widen the automatic ±5-second window and does not claim DNS, HTTP, or
-TLS evidence that the current conn.log-only index does not contain.
+does not widen the automatic ±5-second window. Missing application-log groups
+remain explicitly absent; the endpoint never infers them from connection
+metadata. The stored verdict and its original connection-only model evidence
+remain immutable.
 
 The alert must have recorded eligible Zeek provenance. Rows that were not
 evaluated or were ineligible return **409**. A disabled dashboard provider

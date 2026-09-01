@@ -102,6 +102,12 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONDONTWRITEBYTECODE: "1"
       ZEEK_CONN_PATH: ${ZEEK_CONN_PATH:-/var/log/zeek/current/conn.log}
+      ZEEK_DNS_PATH: ${ZEEK_DNS_PATH:-/var/log/zeek/current/dns.log}
+      ZEEK_HTTP_PATH: ${ZEEK_HTTP_PATH:-/var/log/zeek/current/http.log}
+      ZEEK_SSL_PATH: ${ZEEK_SSL_PATH:-/var/log/zeek/current/ssl.log}
+      ZEEK_X509_PATH: ${ZEEK_X509_PATH:-/var/log/zeek/current/x509.log}
+      ZEEK_FILES_PATH: ${ZEEK_FILES_PATH:-/var/log/zeek/current/files.log}
+      ZEEK_NOTICE_PATH: ${ZEEK_NOTICE_PATH:-/var/log/zeek/current/notice.log}
       ZEEK_ARCHIVE_ROOT: ${ZEEK_ARCHIVE_ROOT:-/var/log/zeek}
       ZEEK_INDEX_PATH: ${ZEEK_INDEX_PATH:-/var/lib/triagewall/zeek-context.db}
       ZEEK_SOURCE_ID: ${ZEEK_SOURCE_ID:-zeek-local}

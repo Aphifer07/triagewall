@@ -244,7 +244,7 @@ def create_v1_router(
         event_id: int,
         _auth: AuthContext = Depends(require_read),
     ):
-        """Repeat one exact, bounded Zeek lookup at operator request."""
+        """Run exact tuple and bounded UID-linked lookup at operator request."""
         if get_mode() == "demo" or redact_ips():
             raise HTTPException(
                 status_code=403,
@@ -280,7 +280,12 @@ def create_v1_router(
                 dest_port=row["dest_port"],
                 proto=row["proto"],
             )
-            raw_result = provider.lookup(lookup_request)
+            deep_lookup = getattr(provider, "lookup_deep", None)
+            raw_result = (
+                deep_lookup(lookup_request)
+                if callable(deep_lookup)
+                else provider.lookup(lookup_request)
+            )
         except Exception:
             result = ZeekLookupResult(status=ZeekLookupStatus.UNAVAILABLE)
         else:

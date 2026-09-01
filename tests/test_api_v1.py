@@ -208,7 +208,7 @@ class ApiV1Tests(unittest.TestCase):
         conn.commit()
         conn.close()
         provider = unittest.mock.Mock()
-        provider.lookup.return_value = ZeekLookupResult(
+        provider.lookup_deep.return_value = ZeekLookupResult(
             status=ZeekLookupStatus.MATCHED,
             context_json=context_json,
             source_instance="zeek-local",
@@ -250,7 +250,7 @@ class ApiV1Tests(unittest.TestCase):
             refreshed.json()["live"]["context"]["connections"][0]["uid"],
             "C-live",
         )
-        provider.lookup.assert_called_once()
+        provider.lookup_deep.assert_called_once()
 
     def test_live_zeek_context_fails_closed_under_redaction(self):
         dashboard.ZEEK_CONTEXT_PROVIDER = unittest.mock.Mock()

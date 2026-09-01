@@ -51,6 +51,10 @@ def json_line(uid, *, timestamp=BASE_EPOCH):
     )
 
 
+def json_line_from_record(record):
+    return json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
 class ZeekFollowerTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -116,6 +120,7 @@ class CompleteRecordTests(ZeekFollowerTestCase):
             load_checkpoint(self.conn, SOURCE_INSTANCE).offset,
             len(first) + len(partial) + 1,
         )
+
 
     def test_restart_resumes_at_the_durable_byte_checkpoint(self):
         first = json_line("C1")
@@ -1005,6 +1010,65 @@ class RotationTests(ZeekFollowerTestCase):
             self.follower().poll(self.conn)
 
         self.assertIn("symlink", str(context.exception))
+
+
+class ApplicationLogFollowerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.live_path = self.directory / "dns.log"
+        self.conn = sqlite3.connect(":memory:")
+        ensure_zeek_index(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_dns_follower_uses_independent_checkpoint_and_evidence_indexer(self):
+        records = [
+            {
+                "ts": BASE_EPOCH + index,
+                "uid": "C1",
+                "query": f"host-{index}.example",
+                "answers": ["198.51.100.20"],
+            }
+            for index in range(2)
+        ]
+        self.live_path.write_bytes(
+            b"".join(json_line_from_record(record) for record in records)
+        )
+        follower = ZeekFollower(
+            self.live_path,
+            SOURCE_INSTANCE,
+            log_name="dns",
+            max_records_per_poll=10,
+        )
+        self.addCleanup(follower.close)
+
+        first = follower.poll(self.conn, record_limit=1)
+        second = follower.poll(self.conn, record_limit=1)
+
+        self.assertEqual(first.scanned, 1)
+        self.assertEqual(second.scanned, 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM zeek_evidence").fetchone()[0],
+            2,
+        )
+        self.assertIsNotNone(load_checkpoint(self.conn, SOURCE_INSTANCE, "dns"))
+        self.assertIsNone(load_checkpoint(self.conn, SOURCE_INSTANCE, "conn"))
+
+    def test_dated_archive_scan_is_scoped_to_the_selected_log(self):
+        archive = self.directory / "2026-08-26"
+        archive.mkdir()
+        dns = archive / "dns.10-00-00_11-00-00.log"
+        conn = archive / "conn.10-00-00_11-00-00.log"
+        dns.write_bytes(b"{}\n")
+        conn.write_bytes(b"{}\n")
+
+        sources = zeek_follower_module._scan_dated_archives(
+            self.directory,
+            "dns.log",
+        )
+
+        self.assertEqual([source.path for source in sources], [dns])
 
 
 if __name__ == "__main__":
