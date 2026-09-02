@@ -221,6 +221,33 @@ class EventBundleV1Tests(unittest.TestCase):
         with self.assertRaisesRegex(event_bundle.EventBundleError, "strict JSON"):
             event_bundle.validate_event_bundle(document)
 
+    def test_embedded_json_depth_limit_is_explicit_and_inclusive(self):
+        accepted = fixture_document()
+        within_limit = '{"x":' * event_bundle.MAX_EMBEDDED_JSON_DEPTH + "true" + (
+            "}" * event_bundle.MAX_EMBEDDED_JSON_DEPTH
+        )
+        blob = accepted["events"][0]["asset_context"]
+        blob["content"] = within_limit
+        blob["sha256"] = event_bundle.sha256_text(within_limit)
+        resign(accepted)
+        self.assertIs(event_bundle.validate_event_bundle(accepted), accepted)
+
+        rejected = fixture_document()
+        over_limit = (
+            '{"x":' * (event_bundle.MAX_EMBEDDED_JSON_DEPTH + 1)
+            + "true"
+            + "}" * (event_bundle.MAX_EMBEDDED_JSON_DEPTH + 1)
+        )
+        blob = rejected["events"][0]["asset_context"]
+        blob["content"] = over_limit
+        blob["sha256"] = event_bundle.sha256_text(over_limit)
+        resign(rejected)
+        with self.assertRaisesRegex(
+            event_bundle.EventBundleError,
+            f"at most {event_bundle.MAX_EMBEDDED_JSON_DEPTH} nested containers",
+        ):
+            event_bundle.validate_event_bundle(rejected)
+
     def test_schema_objects_are_closed_and_require_every_declared_field(self):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
 

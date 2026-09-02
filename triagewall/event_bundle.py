@@ -26,6 +26,7 @@ MAX_MODEL_RESPONSE_BYTES = 64 * 1024
 MAX_OPTIONS_BYTES = 8 * 1024
 MAX_FREE_TEXT_CHARS = 2_000
 MAX_ALLOWED_ZEEK_FACTS = 32
+MAX_EMBEDDED_JSON_DEPTH = 64
 
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$")
@@ -318,6 +319,7 @@ def _load_embedded_json(value: Any, location: str, *, maximum_bytes: int) -> dic
         raise EventBundleError(f"{location} must contain strict JSON") from exc
     if not isinstance(parsed, dict):
         _fail(location, "must contain a JSON object")
+    _enforce_embedded_json_depth(parsed, location)
     try:
         rendered = canonical_json(parsed)
     except (RecursionError, ValueError) as exc:
@@ -325,6 +327,24 @@ def _load_embedded_json(value: Any, location: str, *, maximum_bytes: int) -> dic
     if rendered != text:
         _fail(location, "must contain canonical JSON")
     return parsed
+
+
+def _enforce_embedded_json_depth(value: Any, location: str) -> None:
+    """Reject deeply nested JSON without relying on interpreter recursion limits."""
+
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    while pending:
+        current, parent_depth = pending.pop()
+        if not isinstance(current, (dict, list)):
+            continue
+        depth = parent_depth + 1
+        if depth > MAX_EMBEDDED_JSON_DEPTH:
+            raise EventBundleError(
+                f"{location} must contain strict JSON with at most "
+                f"{MAX_EMBEDDED_JSON_DEPTH} nested containers"
+            )
+        children = current.values() if isinstance(current, dict) else current
+        pending.extend((child, depth) for child in children)
 
 
 def _verify_text_hash(value: str | None, digest: str | None, location: str) -> None:
