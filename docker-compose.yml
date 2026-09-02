@@ -202,7 +202,6 @@ services:
     user: "0:0"
     command:
       - chown
-      - -R
       - "65532:65532"
       - /var/lib/triagewall-lab
     volumes:

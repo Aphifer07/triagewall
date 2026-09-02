@@ -388,6 +388,13 @@ class LabUiTests(unittest.TestCase):
     def test_compose_lab_profile_has_no_core_mount_or_service_dependency(self):
         compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
         lab = compose["services"]["lab"]
+        lab_init = compose["services"]["lab-init"]
+        self.assertEqual(
+            lab_init["command"],
+            ["chown", "65532:65532", "/var/lib/triagewall-lab"],
+        )
+        self.assertEqual(lab_init["cap_drop"], ["ALL"])
+        self.assertEqual(lab_init["cap_add"], ["CHOWN"])
         self.assertEqual(lab["profiles"], ["lab"])
         self.assertEqual(set(lab["depends_on"]), {"lab-init", "lab-worker"})
         self.assertEqual(lab["volumes"], ["triagewall-lab-data:/var/lib/triagewall-lab"])
