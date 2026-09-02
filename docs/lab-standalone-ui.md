@@ -45,9 +45,11 @@ Generate a Lab access key and configuration values:
 python scripts/generate_lab_api_key.py
 ```
 
-Save the printed access key in a password manager. Add the generated hash and
-session secret to the private `.env`, together with an attributable operator
-name:
+The command creates the private, git-ignored
+`triagewall-lab-credentials.txt` file without printing any credential to the
+terminal. Save its access key in a password manager, copy the generated hash
+and session secret to the private `.env`, then remove the credential file. Add
+an attributable operator name alongside those values:
 
 ```dotenv
 TRIAGEWALL_LAB_OPERATOR=local-operator
