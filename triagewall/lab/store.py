@@ -51,9 +51,14 @@ class LabStore:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in self._KINDS:
             path = self.root / name
-            if path.exists() and (path.is_symlink() or not path.is_dir()):
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                # The UI and worker initialize the same dedicated volume and
+                # may create this directory concurrently.
+                pass
+            if path.is_symlink() or not path.is_dir():
                 raise LabStoreError(f"Lab {name} path must be a real directory")
-            path.mkdir(mode=0o700)
 
     def _artifact_path(self, kind: str, digest: str) -> Path:
         if kind not in {"bundles", "candidates", "experiments", "reports"}:
