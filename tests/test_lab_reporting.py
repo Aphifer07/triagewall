@@ -1,9 +1,10 @@
 import json
+from copy import deepcopy
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from scripts.build_lab_experiment_1 import build_documents
+from scripts.build_lab_experiment_2 import build_documents
 from triagewall.event_bundle import canonical_json, load_event_bundle_bytes
 from triagewall.lab_contracts import REQUIRED_GATE_IDS
 from triagewall.lab_reporting import LabReportingError, build_promotion_report
@@ -78,6 +79,73 @@ class LabReportingTests(unittest.TestCase):
             build_promotion_report(
                 bundle=self.bundle, experiment=self.experiment, results=changed
             )
+
+    def test_single_repetition_is_insufficient_stability_evidence(self):
+        report = build_promotion_report(
+            bundle=self.bundle,
+            experiment=self.experiment,
+            results=self.results,
+            created_at="2026-09-01T22:00:00.000000Z",
+        )
+
+        operational = report["metrics"]["operational_cost"]
+        self.assertIsNone(operational["baseline_stability_rate"])
+        self.assertIsNone(operational["candidate_stability_rate"])
+        gate = next(
+            gate for gate in report["gates"]
+            if gate["gate_id"] == "repetition_stability"
+        )
+        self.assertEqual(gate["status"], "fail")
+        self.assertIn("insufficient", gate["observed"].lower())
+
+    def test_injection_gate_reports_baseline_and_candidate_separately(self):
+        results = deepcopy(self.results)
+        results[0]["baseline"]["score"]["injected_instruction_followed"] = True
+        results[0]["candidate"]["score"]["injected_instruction_followed"] = True
+        report = build_promotion_report(
+            bundle=self.bundle,
+            experiment=self.experiment,
+            results=results,
+            created_at="2026-09-01T22:00:00.000000Z",
+        )
+
+        gate = next(
+            gate for gate in report["gates"]
+            if gate["gate_id"] == "injected_instruction_followed"
+        )
+        self.assertEqual(gate["status"], "fail")
+        self.assertIn("Baseline injection successes: 1", gate["observed"])
+        self.assertIn("candidate injection successes: 1", gate["observed"])
+
+    def test_material_improvement_requires_material_specific_references(self):
+        results = deepcopy(self.results)
+        events = {event["event_id"]: event for event in self.bundle["events"]}
+        changed = 0
+        for result in results:
+            if result["evidence_condition"] != "connection_plus_application":
+                continue
+            labels = events[result["event_id"]]["labels"]["condition_labels"]
+            if (
+                labels["connection_plus_application"]["zeek_contribution"] == "material"
+                and labels["connection_only"]["zeek_contribution"] != "material"
+            ):
+                result["candidate"]["score"]["supported_facts"] = [
+                    labels["connection_only"]["allowed_zeek_facts"][0]
+                ]
+                changed += 1
+        self.assertGreater(changed, 0)
+
+        report = build_promotion_report(
+            bundle=self.bundle,
+            experiment=self.experiment,
+            results=results,
+            created_at="2026-09-01T22:00:00.000000Z",
+        )
+
+        self.assertEqual(
+            report["metrics"]["evidence_use"]["material_subset_improvement"],
+            0.0,
+        )
 
 
 if __name__ == "__main__":

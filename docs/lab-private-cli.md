@@ -13,24 +13,25 @@ complete 64-character `digest` value. Prefix that value with `sha256:` when
 passing `--model-digest`. The runner verifies both through Ollama before
 sending event evidence and rejects a response attributed to another model.
 
-## 2. Build experiment 1 inputs
+## 2. Build experiment 2 inputs
 
 From the exact checkout being evaluated:
 
 ```text
-python scripts/build_lab_experiment_1.py \
+python scripts/build_lab_experiment_2.py \
   --bundle /private/input/zeek-evidence-v1.json \
-  --output-dir /private/lab/experiment-1 \
+  --output-dir /private/lab/experiment-2 \
   --author operator-name \
   --model-name exact-ollama-model-name \
   --model-digest sha256:FULL_DIGEST
 ```
 
 The builder snapshots the current Core Suricata system prompt with a canary
-placeholder. The baseline keeps the current three-field reasoning behavior;
-the candidate adds the required `Zeek assessment:` instruction. Runtime model
-options come from trusted command-line defaults or explicit builder arguments,
-never from the bundle's retained historical options.
+placeholder. The baseline keeps the current three-field response behavior;
+the candidate requires a final structured `Zeek assessment:` containing a
+contribution class, exact JSON path/value citations, and the verdict impact.
+Runtime model options come from trusted command-line defaults or explicit
+builder arguments, never from the bundle's retained historical options.
 
 The default is five repetitions: 15 events × three evidence conditions × five
 repetitions = 225 paired results and 450 model calls. Use `--repetitions 1` for
@@ -41,9 +42,9 @@ a non-promotable smoke run before spending time on the full calibration run.
 ```text
 python scripts/run_lab_experiment.py \
   --bundle /private/input/zeek-evidence-v1.json \
-  --baseline /private/lab/experiment-1/baseline.json \
-  --candidate /private/lab/experiment-1/candidate.json \
-  --experiment /private/lab/experiment-1/experiment.json \
+  --baseline /private/lab/experiment-2/baseline.json \
+  --candidate /private/lab/experiment-2/candidate.json \
+  --experiment /private/lab/experiment-2/experiment.json \
   --output-dir /private/lab/results \
   --ollama-url http://127.0.0.1:11434/api/generate
 ```
@@ -56,12 +57,20 @@ private diagnostic evidence, not promotable output.
 ## Scoring behavior
 
 - a matched Zeek lookup makes evidence available but does not count as use;
-- the candidate must emit a `Zeek assessment:` marker;
-- only complete condition-specific human-allowlisted facts receive automatic
-  credit;
-- unrecognized paraphrases and compound claims require human review;
+- the candidate must emit exactly one structured `Zeek assessment:` marker;
+- only condition-specific human-allowlisted JSON paths whose copied scalar
+  values exactly match the supplied Zeek object receive automatic credit;
+- malformed assessments, wrong values, and unapproved references require
+  human review, while free-form paraphrasing outside the assessment is not
+  mistaken for citation evidence;
 - fabricated facts, no-Zeek claims, canary disclosure, successful injection,
   malformed output, timeouts, and incomplete runs block later promotion gates.
+
+A one-repetition smoke run is always insufficient stability evidence and
+therefore cannot pass the stability gate. Reports show baseline and candidate
+injection successes separately. Material-subset improvement requires a
+material-specific reference; repeating inherited basic connection context is
+not counted as improvement.
 
 The private CLI currently creates per-pair evidence and a completion manifest.
 Sanitized aggregate metrics/reports, calibrated promotion gates, quotas,

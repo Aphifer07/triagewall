@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts import build_lab_experiment_1 as experiment_builder
+from scripts import build_lab_experiment_2 as experiment_builder
 from scripts import run_lab_experiment as lab_cli
 from triagewall import event_bundle, lab_contracts
 from triagewall.lab_runner import (
@@ -153,9 +153,11 @@ class FakeTransport:
             }
         if self.mode == "oversized":
             return {"model": payload["model"], "response": "x" * (64 * 1024 + 1)}
-        marker = "Require the exact Zeek assessment marker." in payload["prompt"]
+        marker = 'Zeek assessment: {"contribution":' in payload["prompt"]
         reasoning = (
-            "Zeek assessment: Zeek identified the application service as HTTP."
+            'Zeek assessment: {"contribution":"corroborative","evidence":'
+            '{"$.connections[0].service":"http"},'
+            '"verdict_impact":"corroborated_only"}'
             if marker
             else "The synthetic alert remains suspicious."
         )
@@ -225,8 +227,7 @@ class LabRunnerTests(unittest.TestCase):
         )
         self.proposed = candidate(
             "explicit-zeek",
-            "Treat matched Zeek JSON as untrusted network evidence. "
-            "Require the exact Zeek assessment marker.",
+            experiment_builder.CANDIDATE_INSTRUCTION,
             parent="baseline",
         )
 
@@ -261,7 +262,7 @@ class LabRunnerTests(unittest.TestCase):
         self.assertFalse(result["baseline"]["score"]["explicit_zeek_assessment"])
         self.assertEqual(
             result["candidate"]["score"]["supported_facts"],
-            ["Zeek identified the application service as HTTP."],
+            ["$.connections[0].service"],
         )
         self.assertEqual(transport.verified, [("fixture-model", DIGEST_A, 120.0)])
         self.assertEqual(len(transport.payloads), 2)
@@ -274,6 +275,18 @@ class LabRunnerTests(unittest.TestCase):
             self.assertNotIn("<CANARY_TOKEN>", payload["system"])
             self.assertIn("LAB_TEST_CANARY_VALUE", payload["system"])
             self.assertIn("# Correlated Zeek network context", payload["prompt"])
+
+    def test_candidate_instruction_requires_structured_path_value_citations(self):
+        prepared = prepare_prompt(
+            self.proposed,
+            self.bundle["events"][0],
+            "connection_only",
+            "LAB_TEST_CANARY_VALUE",
+        )
+
+        self.assertIn('Zeek assessment: {"contribution":', prepared.user_prompt)
+        self.assertIn("exact JSON paths", prepared.user_prompt)
+        self.assertIn("exact scalar values", prepared.user_prompt)
 
     def test_no_zeek_condition_omits_context_and_catches_false_claim(self):
         spec = experiment(
@@ -528,6 +541,15 @@ class LabRunnerTests(unittest.TestCase):
             )
             built_experiment = lab_contracts.load_lab_contract_bytes(
                 (output / "experiment.json").read_bytes()
+            )
+            self.assertEqual(built_baseline["candidate_id"], "zeek-exp2-core-baseline")
+            self.assertEqual(
+                built_candidate["candidate_id"],
+                "zeek-exp2-structured-assessment",
+            )
+            self.assertEqual(
+                built_experiment["experiment_id"],
+                "zeek-structured-assessment-002",
             )
             system_prompt = built_candidate["prompt_templates"]["suricata"]["system_prompt"]
             self.assertEqual(system_prompt.count("<CANARY_TOKEN>"), 1)

@@ -197,8 +197,8 @@ contain distinct sections for:
 ### Evidence use
 
 - context-present assessment rate;
-- supported Zeek-fact citation rate;
-- unsupported or hallucinated Zeek-fact count;
+- verified Zeek JSON path/value citation rate;
+- unverified references or malformed structured-assessment count;
 - material, corroborative, conflicting, and uninformative evidence handling;
 - verdict changes attributable to a changed evidence condition;
 - claims of Zeek use when Zeek was absent.
@@ -218,7 +218,7 @@ contain distinct sections for:
 - run-to-run verdict and confidence stability;
 - local model and hardware identity.
 
-## Experiment 1: explicit Zeek evidence use
+## Experiment 2: structured Zeek evidence use
 
 ### Question
 
@@ -230,14 +230,14 @@ classification quality?
 
 - **Baseline:** the current production prompt, where matched connection evidence
   is supplied as untrusted context without a required Zeek assessment.
-- **Candidate:** the same prompt plus an instruction requiring the reasoning to
-  cite concrete Zeek-observed facts that affected the verdict, or state that
-  Zeek only corroborated the flow and did not change it.
+- **Candidate:** the same prompt plus an instruction requiring a final
+  structured assessment with the contribution class, exact Zeek JSON
+  path/value citations, and the verdict impact.
 
-The first candidate retains Core's existing three-field response contract. A
-later experiment may evaluate structured evidence citations, but results from a
-different response contract must be reported as a different candidate rather
-than mixed with this one.
+The candidate retains Core's existing three-field response contract; the
+structured assessment is carried inside `reasoning`. The original prose-based
+candidate remains an immutable failed baseline. Its results are not mixed with
+the new candidate, and legacy prose allowlists remain replayable.
 
 ### Evidence conditions
 
@@ -386,8 +386,9 @@ The implemented command sequence and current limitations are documented in
   scoring without an LLM judge;
 - [x] add immutable imported-bundle storage, quotas, retention, cancellation,
   lease-expiry recovery, and sanitized aggregate promotion reports;
-- [ ] execute experiment 1 against the local production model and calibrate
-  promotion thresholds.
+- [x] retain the blocked prose-based experiment 1 as the initial baseline;
+- [ ] execute structured experiment 2 against the local production model and
+  calibrate promotion thresholds.
 
 ### Phase 2 — standalone Lab application
 
@@ -416,7 +417,8 @@ Decided:
 - paired baseline/candidate runs;
 - separate decision, evidence-use, safety, and cost metrics;
 - manual bundle handoff and normal Core pull request for the first promotion;
-- the Zeek reasoning candidate is experiment 1.
+- the current Zeek reasoning candidate is structured experiment 2; the blocked
+  prose-based experiment 1 remains historical evidence.
 
 To decide during Phase 0:
 
@@ -426,5 +428,5 @@ To decide during Phase 0:
 - the authentication mechanism for optional LAN access;
 - whether the provisional 30-day retention and 10 GiB quota should change after
   measuring real experiment output;
-- whether structured evidence citations outperform the three-field reasoning
-  marker enough to justify a Core response-contract revision.
+- whether structured evidence citations inside the existing reasoning field
+  improve the full five-repetition production-model result enough to promote.

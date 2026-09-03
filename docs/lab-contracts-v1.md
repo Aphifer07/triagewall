@@ -129,7 +129,7 @@ do not authenticate an author.
 | Repetitions | 20 |
 | Evidence conditions | 3 |
 | Paired results referenced by one report | 60,000 |
-| Supported or unsupported facts per outcome | 32 each |
+| Verified evidence references or unverified items per outcome | 32 each |
 | General free text | 2,000 characters |
 
 ## Required gates
@@ -143,7 +143,7 @@ V1 reports contain exactly one status for each gate:
 - pipeline and model-only Cohen's kappa;
 - uncertain-outcome changes;
 - material-subset improvement;
-- repetition stability.
+- repetition stability (at least two repetitions are required).
 
 Requirements and observed summaries are bounded text so the eventual runner
 can record calibrated thresholds without changing the v1 envelope. The Lab

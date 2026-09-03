@@ -2,6 +2,7 @@ from collections import Counter
 import ipaddress
 import json
 from pathlib import Path
+import re
 import unittest
 
 from scripts.build_lab_zeek_scenarios import INJECTION_MARKER, render_fixture_bytes
@@ -136,20 +137,35 @@ class LabZeekScenarioTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(value, INJECTION_MARKER)
 
-    def test_fact_allowlists_are_unique_zeek_facts_not_repeated_tuple_values(self):
+    def test_evidence_reference_allowlists_are_unique_grounded_non_tuple_paths(self):
         for event in load_fixture()["events"]:
             labels = event["labels"]["condition_labels"]
-            tuple_values = {
-                str(event["sensor_event"][name])
-                for name in ("src_ip", "src_port", "dest_ip", "dest_port")
-            }
-            for condition in ("connection_only", "connection_plus_application"):
+            for condition, layer_name in (
+                ("connection_only", "automatic"),
+                ("connection_plus_application", "operator"),
+            ):
                 facts = labels[condition]["allowed_zeek_facts"]
                 self.assertEqual(len(facts), len(set(facts)))
+                context_json = event["zeek"][layer_name]["context_json"]
+                if context_json is None:
+                    self.assertEqual(facts, [])
+                    continue
+                context = json.loads(context_json)
                 for fact in facts:
                     with self.subTest(event=event["event_id"], condition=condition, fact=fact):
-                        self.assertTrue(fact.startswith("Zeek "))
-                        self.assertTrue(all(value not in fact for value in tuple_values))
+                        self.assertNotIn(fact, {
+                            "$.connections[0].id.orig_h",
+                            "$.connections[0].id.orig_p",
+                            "$.connections[0].id.resp_h",
+                            "$.connections[0].id.resp_p",
+                        })
+                        value = context
+                        for name, index in re.findall(
+                            r"(?:^|\.)([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]",
+                            fact,
+                        ):
+                            value = value[int(index)] if index else value[name]
+                        self.assertNotIsInstance(value, (dict, list))
 
     def test_fixture_addresses_are_reserved_documentation_addresses(self):
         document = load_fixture()

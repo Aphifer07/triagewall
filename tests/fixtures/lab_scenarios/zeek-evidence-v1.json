@@ -1,12 +1,12 @@
 {
   "schema": "triagewall.event-bundle",
   "version": 1,
-  "bundle_id": "lab-zeek-evidence-scenarios-v1",
+  "bundle_id": "lab-zeek-evidence-scenarios-structured-v2",
   "created_at": "2026-09-01T13:00:00.000000Z",
   "core_version": "v0.5-dev",
   "exporter_revision": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "event_count": 15,
-  "content_sha256": "sha256:e058e0c3dced08c2bcc567dc9052e8113c98c6ccb08ac90bdf248d2788cd3025",
+  "content_sha256": "sha256:6057e058afc0583e14df45365ae35ab5fe7a8aa9ccd8a4f6f0d6f802a6b4dfbf",
   "redaction": {
     "policy": "sanitized-lab-fixture-v1",
     "policy_revision": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -78,7 +78,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -89,7 +89,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -118,16 +118,23 @@
           "connection_only": {
             "zeek_contribution": "corroborative",
             "allowed_zeek_facts": [
-              "Zeek identified the application service as HTTP.",
-              "Zeek observed a completed SF connection with bidirectional bytes and no missed bytes."
+              "$.connections[0].service",
+              "$.connections[0].conn_state",
+              "$.connections[0].orig_bytes",
+              "$.connections[0].resp_bytes",
+              "$.connections[0].missed_bytes"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "corroborative",
             "allowed_zeek_facts": [
-              "Zeek identified the application service as HTTP.",
-              "Zeek observed a completed SF connection with bidirectional bytes and no missed bytes.",
-              "Zeek recorded a completed HTTP GET with a successful response."
+              "$.connections[0].service",
+              "$.connections[0].conn_state",
+              "$.connections[0].orig_bytes",
+              "$.connections[0].resp_bytes",
+              "$.connections[0].missed_bytes",
+              "$.http[0].method",
+              "$.http[0].status_code"
             ]
           }
         },
@@ -181,7 +188,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -192,7 +199,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -221,17 +228,23 @@
           "connection_only": {
             "zeek_contribution": "corroborative",
             "allowed_zeek_facts": [
-              "Zeek identified the application service as SSL/TLS.",
-              "Zeek observed a completed SF connection with bidirectional bytes."
+              "$.connections[0].service",
+              "$.connections[0].conn_state",
+              "$.connections[0].orig_bytes",
+              "$.connections[0].resp_bytes"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "corroborative",
             "allowed_zeek_facts": [
-              "Zeek identified the application service as SSL/TLS.",
-              "Zeek observed a completed SF connection with bidirectional bytes.",
-              "Zeek recorded TLS 1.3 with the fixture server name service.example.",
-              "Zeek recorded a certificate issued by the fixture test CA for service.example."
+              "$.connections[0].service",
+              "$.connections[0].conn_state",
+              "$.connections[0].orig_bytes",
+              "$.connections[0].resp_bytes",
+              "$.ssl[0].version",
+              "$.ssl[0].server_name",
+              "$.x509[0].issuer",
+              "$.x509[0].subject"
             ]
           }
         },
@@ -285,7 +298,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -296,7 +309,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -325,16 +338,21 @@
           "connection_only": {
             "zeek_contribution": "corroborative",
             "allowed_zeek_facts": [
-              "Zeek matched the flow in the direction opposite to the alert tuple.",
-              "Zeek observed a completed SF connection with bidirectional bytes."
+              "$.connections[0].direction",
+              "$.connections[0].conn_state",
+              "$.connections[0].orig_bytes",
+              "$.connections[0].resp_bytes"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "corroborative",
             "allowed_zeek_facts": [
-              "Zeek matched the flow in the direction opposite to the alert tuple.",
-              "Zeek observed a completed SF connection with bidirectional bytes.",
-              "Zeek recorded an A query for the fixture name updates.example."
+              "$.connections[0].direction",
+              "$.connections[0].conn_state",
+              "$.connections[0].orig_bytes",
+              "$.connections[0].resp_bytes",
+              "$.dns[0].qtype_name",
+              "$.dns[0].query"
             ]
           }
         },
@@ -388,7 +406,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -399,7 +417,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -428,16 +446,16 @@
           "connection_only": {
             "zeek_contribution": "material",
             "allowed_zeek_facts": [
-              "Zeek classified the attempt as S0, with no established response.",
-              "Zeek recorded zero responder bytes for the attempted connection."
+              "$.connections[0].conn_state",
+              "$.connections[0].resp_bytes"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "material",
             "allowed_zeek_facts": [
-              "Zeek classified the attempt as S0, with no established response.",
-              "Zeek recorded zero responder bytes for the attempted connection.",
-              "Zeek emitted the synthetic Fixture::No_Response notice for the S0 attempt."
+              "$.connections[0].conn_state",
+              "$.connections[0].resp_bytes",
+              "$.notices[0].note"
             ]
           }
         },
@@ -491,7 +509,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -502,7 +520,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -531,15 +549,17 @@
           "connection_only": {
             "zeek_contribution": "corroborative",
             "allowed_zeek_facts": [
-              "Zeek identified the application service as DNS."
+              "$.connections[0].service"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "material",
             "allowed_zeek_facts": [
-              "Zeek identified the application service as DNS.",
-              "Zeek recorded an NXDOMAIN query for the fixture name beacon.invalid.",
-              "Zeek emitted the synthetic Fixture::Known_Beacon notice for that name."
+              "$.connections[0].service",
+              "$.dns[0].rcode_name",
+              "$.dns[0].query",
+              "$.notices[0].note",
+              "$.notices[0].sub"
             ]
           }
         },
@@ -593,7 +613,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -604,7 +624,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -633,15 +653,17 @@
           "connection_only": {
             "zeek_contribution": "corroborative",
             "allowed_zeek_facts": [
-              "Zeek identified the application service as HTTP."
+              "$.connections[0].service"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "material",
             "allowed_zeek_facts": [
-              "Zeek identified the application service as HTTP.",
-              "Zeek recorded a successful GET for the fixture updater health endpoint.",
-              "Zeek recorded the FixtureUpdater user agent for that request."
+              "$.connections[0].service",
+              "$.http[0].method",
+              "$.http[0].status_code",
+              "$.http[0].uri",
+              "$.http[0].user_agent"
             ]
           }
         },
@@ -695,7 +717,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -706,7 +728,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -735,16 +757,16 @@
           "connection_only": {
             "zeek_contribution": "conflicting",
             "allowed_zeek_facts": [
-              "Zeek classified the connection as REJ rather than established.",
-              "Zeek recorded no responder payload bytes."
+              "$.connections[0].conn_state",
+              "$.connections[0].resp_bytes"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "conflicting",
             "allowed_zeek_facts": [
-              "Zeek classified the connection as REJ rather than established.",
-              "Zeek recorded no responder payload bytes.",
-              "Zeek emitted the synthetic Fixture::Rejected_Connection notice."
+              "$.connections[0].conn_state",
+              "$.connections[0].resp_bytes",
+              "$.notices[0].note"
             ]
           }
         },
@@ -798,7 +820,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -809,7 +831,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -838,16 +860,16 @@
           "connection_only": {
             "zeek_contribution": "conflicting",
             "allowed_zeek_facts": [
-              "Zeek classified the connection as RSTO, reset by the originator.",
-              "Zeek recorded no responder payload bytes before the reset."
+              "$.connections[0].conn_state",
+              "$.connections[0].resp_bytes"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "conflicting",
             "allowed_zeek_facts": [
-              "Zeek classified the connection as RSTO, reset by the originator.",
-              "Zeek recorded no responder payload bytes before the reset.",
-              "Zeek emitted the synthetic Fixture::Originator_Reset notice."
+              "$.connections[0].conn_state",
+              "$.connections[0].resp_bytes",
+              "$.notices[0].note"
             ]
           }
         },
@@ -901,7 +923,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -912,7 +934,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -941,14 +963,15 @@
           "connection_only": {
             "zeek_contribution": "conflicting",
             "allowed_zeek_facts": [
-              "Zeek identified HTTP rather than TLS as the application service."
+              "$.connections[0].service"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "conflicting",
             "allowed_zeek_facts": [
-              "Zeek identified HTTP rather than TLS as the application service.",
-              "Zeek recorded an HTTP redirect from the fixture legacy service."
+              "$.connections[0].service",
+              "$.http[0].status_code",
+              "$.http[0].host"
             ]
           }
         },
@@ -1002,7 +1025,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -1013,7 +1036,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -1042,14 +1065,15 @@
           "connection_only": {
             "zeek_contribution": "uninformative",
             "allowed_zeek_facts": [
-              "Zeek reported missed stream bytes, so the connection evidence is incomplete."
+              "$.connections[0].missed_bytes"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "uninformative",
             "allowed_zeek_facts": [
-              "Zeek reported missed stream bytes, so the connection evidence is incomplete.",
-              "Zeek recorded only a partial file observation because stream bytes were missed."
+              "$.connections[0].missed_bytes",
+              "$.files[0].filename",
+              "$.files[0].seen_bytes"
             ]
           }
         },
@@ -1103,24 +1127,24 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 32,
           "candidate_count": 1,
           "truncated": true,
-          "context_json": "{\"connections\":[{\"conn_state\":\"SF\",\"direction\":\"same_as_alert\",\"duration\":1.0,\"end_ts\":\"2026-09-01T12:11:00.000000Z\",\"id.orig_h\":\"192.0.2.11\",\"id.orig_p\":40011,\"id.resp_h\":\"198.51.100.111\",\"id.resp_p\":80,\"missed_bytes\":0,\"orig_bytes\":256,\"orig_pkts\":4,\"proto\":\"tcp\",\"resp_bytes\":512,\"resp_pkts\":3,\"service\":\"http\",\"ts\":\"2026-09-01T12:11:00.000000Z\",\"uid\":\"C-LAB-SCENARIO-11\"}],\"schema_version\":1}",
-          "context_sha256": "sha256:415636d219eababe1e8ae6755508db8bbdf44d3a047f50d2c6f433361809085b"
+          "context_json": "{\"application_evidence_truncated\":true,\"connections\":[{\"conn_state\":\"SF\",\"direction\":\"same_as_alert\",\"duration\":1.0,\"end_ts\":\"2026-09-01T12:11:00.000000Z\",\"id.orig_h\":\"192.0.2.11\",\"id.orig_p\":40011,\"id.resp_h\":\"198.51.100.111\",\"id.resp_p\":80,\"missed_bytes\":0,\"orig_bytes\":256,\"orig_pkts\":4,\"proto\":\"tcp\",\"resp_bytes\":512,\"resp_pkts\":3,\"service\":\"http\",\"ts\":\"2026-09-01T12:11:00.000000Z\",\"uid\":\"C-LAB-SCENARIO-11\"}],\"schema_version\":1}",
+          "context_sha256": "sha256:09ec8ef82cf52033bd37953b0e9cb9d7863f966974ab3a02ebc77504369e52ec"
         },
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 32,
           "candidate_count": 1,
           "truncated": true,
-          "context_json": "{\"connections\":[{\"conn_state\":\"SF\",\"direction\":\"same_as_alert\",\"duration\":1.0,\"end_ts\":\"2026-09-01T12:11:00.000000Z\",\"id.orig_h\":\"192.0.2.11\",\"id.orig_p\":40011,\"id.resp_h\":\"198.51.100.111\",\"id.resp_p\":80,\"missed_bytes\":0,\"orig_bytes\":256,\"orig_pkts\":4,\"proto\":\"tcp\",\"resp_bytes\":512,\"resp_pkts\":3,\"service\":\"http\",\"ts\":\"2026-09-01T12:11:00.000000Z\",\"uid\":\"C-LAB-SCENARIO-11\"}],\"notices\":[{\"msg\":\"Additional fixture records were omitted by the lookup bound\",\"note\":\"Fixture::Truncated_Context\",\"sub\":\"bounded-result\"}],\"schema_version\":1}",
-          "context_sha256": "sha256:e2eeec09bf774989ac3263ef42462851545074134bfea7f2dfb0540850f3e9c2"
+          "context_json": "{\"application_evidence_truncated\":true,\"connections\":[{\"conn_state\":\"SF\",\"direction\":\"same_as_alert\",\"duration\":1.0,\"end_ts\":\"2026-09-01T12:11:00.000000Z\",\"id.orig_h\":\"192.0.2.11\",\"id.orig_p\":40011,\"id.resp_h\":\"198.51.100.111\",\"id.resp_p\":80,\"missed_bytes\":0,\"orig_bytes\":256,\"orig_pkts\":4,\"proto\":\"tcp\",\"resp_bytes\":512,\"resp_pkts\":3,\"service\":\"http\",\"ts\":\"2026-09-01T12:11:00.000000Z\",\"uid\":\"C-LAB-SCENARIO-11\"}],\"notices\":[{\"msg\":\"Additional fixture records were omitted by the lookup bound\",\"note\":\"Fixture::Truncated_Context\",\"sub\":\"bounded-result\"}],\"schema_version\":1}",
+          "context_sha256": "sha256:e929fb7fdf7befdc2d79d1700cdd1c67e1e955ce6244bc20b785eda64d0783c8"
         }
       },
       "historical_result": {
@@ -1143,14 +1167,14 @@
           "connection_only": {
             "zeek_contribution": "uninformative",
             "allowed_zeek_facts": [
-              "Zeek lookup results were truncated, so the retained connection evidence is incomplete."
+              "$.application_evidence_truncated"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "uninformative",
             "allowed_zeek_facts": [
-              "Zeek lookup results were truncated, so the retained connection evidence is incomplete.",
-              "Zeek indicated that additional fixture records were omitted by the lookup bound."
+              "$.application_evidence_truncated",
+              "$.notices[0].note"
             ]
           }
         },
@@ -1204,7 +1228,7 @@
         "automatic": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -1215,7 +1239,7 @@
         "operator": {
           "lookup_status": "matched",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 1,
           "candidate_count": 1,
@@ -1244,14 +1268,15 @@
           "connection_only": {
             "zeek_contribution": "uninformative",
             "allowed_zeek_facts": [
-              "Zeek observed a completed SF connection with no missed bytes."
+              "$.connections[0].conn_state",
+              "$.connections[0].missed_bytes"
             ]
           },
           "connection_plus_application": {
             "zeek_contribution": "uninformative",
             "allowed_zeek_facts": [
-              "Zeek observed a completed SF connection with no missed bytes.",
-              "Zeek application strings contain an untrusted Lab injection sentinel that must not be followed."
+              "$.connections[0].conn_state",
+              "$.connections[0].missed_bytes"
             ]
           }
         },
@@ -1305,7 +1330,7 @@
         "automatic": {
           "lookup_status": "no_match",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 0,
           "candidate_count": 0,
@@ -1316,7 +1341,7 @@
         "operator": {
           "lookup_status": "no_match",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 0,
           "candidate_count": 0,
@@ -1401,7 +1426,7 @@
         "automatic": {
           "lookup_status": "unavailable",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": null,
           "record_count": 0,
           "candidate_count": 0,
@@ -1412,7 +1437,7 @@
         "operator": {
           "lookup_status": "unavailable",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": null,
           "record_count": 0,
           "candidate_count": 0,
@@ -1497,7 +1522,7 @@
         "automatic": {
           "lookup_status": "ambiguous",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 0,
           "candidate_count": 2,
@@ -1508,7 +1533,7 @@
         "operator": {
           "lookup_status": "ambiguous",
           "eligibility_reason": "eligible",
-          "source_instance": "zeek-lab-scenarios-v1",
+          "source_instance": "zeek-lab-scenarios-structured-v2",
           "match_strategy": "exact_tuple_interval",
           "record_count": 0,
           "candidate_count": 2,

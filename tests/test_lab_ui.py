@@ -27,7 +27,7 @@ os.environ.setdefault(
 )
 os.environ.setdefault("TRIAGEWALL_LAB_SESSION_SECRET", "module-test-secret-" * 3)
 
-from scripts.build_lab_experiment_1 import build_documents
+from scripts.build_lab_experiment_2 import build_documents
 from triagewall.event_bundle import canonical_json, load_event_bundle_bytes
 from triagewall.lab.app import create_app
 from triagewall.lab.auth import LabAuthSettings, hash_lab_api_key

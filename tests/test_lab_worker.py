@@ -6,7 +6,7 @@ from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
-from scripts.build_lab_experiment_1 import build_documents
+from scripts.build_lab_experiment_2 import build_documents
 from triagewall.event_bundle import canonical_json, load_event_bundle_bytes
 from triagewall.lab.worker import LabWorker, LabWorkerSettings
 

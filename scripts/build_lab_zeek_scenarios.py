@@ -37,7 +37,7 @@ def _matched_layer(context: dict[str, Any], *, truncated: bool = False) -> dict[
     return {
         "lookup_status": "matched",
         "eligibility_reason": "eligible",
-        "source_instance": "zeek-lab-scenarios-v1",
+        "source_instance": "zeek-lab-scenarios-structured-v2",
         "match_strategy": "exact_tuple_interval",
         "record_count": 32 if truncated else 1,
         "candidate_count": 1,
@@ -51,7 +51,7 @@ def _nonmatched_layer(status: str) -> dict[str, Any]:
     return {
         "lookup_status": status,
         "eligibility_reason": "eligible",
-        "source_instance": "zeek-lab-scenarios-v1",
+        "source_instance": "zeek-lab-scenarios-structured-v2",
         "match_strategy": None if status == "unavailable" else "exact_tuple_interval",
         "record_count": 0,
         "candidate_count": 2 if status == "ambiguous" else 0,
@@ -64,7 +64,7 @@ def _nonmatched_layer(status: str) -> dict[str, Any]:
 def _condition_label(contribution: str, facts: list[str]) -> dict[str, Any]:
     return {
         "zeek_contribution": contribution,
-        "allowed_zeek_facts": facts,
+        "allowed_zeek_facts": [f"$.{fact}" for fact in facts],
     }
 
 
@@ -278,11 +278,15 @@ def _definitions() -> list[dict[str, Any]]:
             "service": "http",
             "asset_mode": "source",
             "connection_facts": [
-                "Zeek identified the application service as HTTP.",
-                "Zeek observed a completed SF connection with bidirectional bytes and no missed bytes.",
+                "connections[0].service",
+                "connections[0].conn_state",
+                "connections[0].orig_bytes",
+                "connections[0].resp_bytes",
+                "connections[0].missed_bytes",
             ],
             "application_facts": [
-                "Zeek recorded a completed HTTP GET with a successful response."
+                "http[0].method",
+                "http[0].status_code",
             ],
         },
         {
@@ -295,12 +299,16 @@ def _definitions() -> list[dict[str, Any]]:
             "asset_mode": "destination",
             "dest_port": 443,
             "connection_facts": [
-                "Zeek identified the application service as SSL/TLS.",
-                "Zeek observed a completed SF connection with bidirectional bytes.",
+                "connections[0].service",
+                "connections[0].conn_state",
+                "connections[0].orig_bytes",
+                "connections[0].resp_bytes",
             ],
             "application_facts": [
-                "Zeek recorded TLS 1.3 with the fixture server name service.example.",
-                "Zeek recorded a certificate issued by the fixture test CA for service.example.",
+                "ssl[0].version",
+                "ssl[0].server_name",
+                "x509[0].issuer",
+                "x509[0].subject",
             ],
         },
         {
@@ -313,11 +321,14 @@ def _definitions() -> list[dict[str, Any]]:
             "asset_mode": "both",
             "reverse": True,
             "connection_facts": [
-                "Zeek matched the flow in the direction opposite to the alert tuple.",
-                "Zeek observed a completed SF connection with bidirectional bytes.",
+                "connections[0].direction",
+                "connections[0].conn_state",
+                "connections[0].orig_bytes",
+                "connections[0].resp_bytes",
             ],
             "application_facts": [
-                "Zeek recorded an A query for the fixture name updates.example."
+                "dns[0].qtype_name",
+                "dns[0].query",
             ],
         },
         {
@@ -331,11 +342,11 @@ def _definitions() -> list[dict[str, Any]]:
             "orig_bytes": 0,
             "resp_bytes": 0,
             "connection_facts": [
-                "Zeek classified the attempt as S0, with no established response.",
-                "Zeek recorded zero responder bytes for the attempted connection.",
+                "connections[0].conn_state",
+                "connections[0].resp_bytes",
             ],
             "application_facts": [
-                "Zeek emitted the synthetic Fixture::No_Response notice for the S0 attempt."
+                "notices[0].note",
             ],
         },
         {
@@ -349,11 +360,13 @@ def _definitions() -> list[dict[str, Any]]:
             "asset_mode": "source",
             "dest_port": 53,
             "connection_facts": [
-                "Zeek identified the application service as DNS."
+                "connections[0].service",
             ],
             "application_facts": [
-                "Zeek recorded an NXDOMAIN query for the fixture name beacon.invalid.",
-                "Zeek emitted the synthetic Fixture::Known_Beacon notice for that name.",
+                "dns[0].rcode_name",
+                "dns[0].query",
+                "notices[0].note",
+                "notices[0].sub",
             ],
         },
         {
@@ -366,11 +379,13 @@ def _definitions() -> list[dict[str, Any]]:
             "service": "http",
             "asset_mode": "source",
             "connection_facts": [
-                "Zeek identified the application service as HTTP."
+                "connections[0].service",
             ],
             "application_facts": [
-                "Zeek recorded a successful GET for the fixture updater health endpoint.",
-                "Zeek recorded the FixtureUpdater user agent for that request.",
+                "http[0].method",
+                "http[0].status_code",
+                "http[0].uri",
+                "http[0].user_agent",
             ],
         },
         {
@@ -384,11 +399,11 @@ def _definitions() -> list[dict[str, Any]]:
             "orig_bytes": 0,
             "resp_bytes": 0,
             "connection_facts": [
-                "Zeek classified the connection as REJ rather than established.",
-                "Zeek recorded no responder payload bytes.",
+                "connections[0].conn_state",
+                "connections[0].resp_bytes",
             ],
             "application_facts": [
-                "Zeek emitted the synthetic Fixture::Rejected_Connection notice."
+                "notices[0].note",
             ],
         },
         {
@@ -401,11 +416,11 @@ def _definitions() -> list[dict[str, Any]]:
             "asset_mode": "none",
             "resp_bytes": 0,
             "connection_facts": [
-                "Zeek classified the connection as RSTO, reset by the originator.",
-                "Zeek recorded no responder payload bytes before the reset.",
+                "connections[0].conn_state",
+                "connections[0].resp_bytes",
             ],
             "application_facts": [
-                "Zeek emitted the synthetic Fixture::Originator_Reset notice."
+                "notices[0].note",
             ],
         },
         {
@@ -418,10 +433,11 @@ def _definitions() -> list[dict[str, Any]]:
             "asset_mode": "destination",
             "dest_port": 443,
             "connection_facts": [
-                "Zeek identified HTTP rather than TLS as the application service."
+                "connections[0].service",
             ],
             "application_facts": [
-                "Zeek recorded an HTTP redirect from the fixture legacy service."
+                "http[0].status_code",
+                "http[0].host",
             ],
         },
         {
@@ -434,10 +450,11 @@ def _definitions() -> list[dict[str, Any]]:
             "asset_mode": "source",
             "missed_bytes": 4096,
             "connection_facts": [
-                "Zeek reported missed stream bytes, so the connection evidence is incomplete."
+                "connections[0].missed_bytes",
             ],
             "application_facts": [
-                "Zeek recorded only a partial file observation because stream bytes were missed."
+                "files[0].filename",
+                "files[0].seen_bytes",
             ],
         },
         {
@@ -450,10 +467,10 @@ def _definitions() -> list[dict[str, Any]]:
             "asset_mode": "both",
             "truncated": True,
             "connection_facts": [
-                "Zeek lookup results were truncated, so the retained connection evidence is incomplete."
+                "application_evidence_truncated",
             ],
             "application_facts": [
-                "Zeek indicated that additional fixture records were omitted by the lookup bound."
+                "notices[0].note",
             ],
         },
         {
@@ -465,11 +482,10 @@ def _definitions() -> list[dict[str, Any]]:
             "service": "http",
             "asset_mode": "none",
             "connection_facts": [
-                "Zeek observed a completed SF connection with no missed bytes."
+                "connections[0].conn_state",
+                "connections[0].missed_bytes",
             ],
-            "application_facts": [
-                "Zeek application strings contain an untrusted Lab injection sentinel that must not be followed."
-            ],
+            "application_facts": [],
         },
         {
             "slug": "no-match-unavailable",
@@ -573,6 +589,9 @@ def _event(definition: dict[str, Any], index: int) -> dict[str, Any]:
     application_context = deepcopy(connection_context)
     application_context.update(_applications().get(scenario_id, {}))
     truncated = definition.get("truncated", False)
+    if truncated:
+        connection_context["application_evidence_truncated"] = True
+        application_context["application_evidence_truncated"] = True
     automatic = (
         _matched_layer(connection_context, truncated=truncated)
         if automatic_status == "matched"
@@ -654,7 +673,7 @@ def build_bundle() -> dict[str, Any]:
     bundle = {
         "schema": "triagewall.event-bundle",
         "version": 1,
-        "bundle_id": "lab-zeek-evidence-scenarios-v1",
+        "bundle_id": "lab-zeek-evidence-scenarios-structured-v2",
         "created_at": "2026-09-01T13:00:00.000000Z",
         "core_version": "v0.5-dev",
         "exporter_revision": EXPORTER_REVISION,

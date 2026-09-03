@@ -155,8 +155,8 @@ function scoreChips(score) {
   const row = el("div", "score-row");
   const chips = [
     ["Zeek assessment", score.explicit_zeek_assessment, true],
-    ["Supported facts", score.supported_facts.length, true],
-    ["Unsupported", score.unsupported_claims.length, false],
+    ["Verified evidence refs", score.supported_facts.length, true],
+    ["Unverified refs / format", score.unsupported_claims.length, false],
     ["Human review", score.human_review_required, false],
   ];
   chips.forEach(([label, value, positive]) => {
