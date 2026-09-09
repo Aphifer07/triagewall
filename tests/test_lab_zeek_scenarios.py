@@ -40,7 +40,7 @@ class LabZeekScenarioTests(unittest.TestCase):
 
         self.assertEqual(
             verdicts,
-            Counter({"real": 5, "false_positive": 5, "uncertain": 5}),
+            Counter({"real": 6, "uncertain": 5, "false_positive": 4}),
         )
         self.assertEqual(
             contributions,
@@ -80,7 +80,7 @@ class LabZeekScenarioTests(unittest.TestCase):
         self.assertTrue({"SF", "S0", "REJ", "RSTO"}.issubset(states))
         self.assertTrue({"matched", "no_match", "unavailable", "ambiguous"}.issubset(statuses))
         self.assertTrue(truncated)
-        self.assertEqual(directions, {"same_as_alert", "reverse_of_alert"})
+        self.assertEqual(directions, {"same_as_alert", "reversed_from_alert"})
 
     def test_deeper_evidence_covers_supported_application_record_classes(self):
         record_classes = set()
@@ -99,10 +99,38 @@ class LabZeekScenarioTests(unittest.TestCase):
                     )
 
         self.assertTrue(
-            {"dns", "http", "ssl", "x509", "files", "notices"}.issubset(
+            {"dns", "http", "tls", "certificates", "files", "notices"}.issubset(
                 record_classes
             )
         )
+
+    def test_application_records_match_production_identity_and_correlation_shape(self):
+        for event in load_fixture()["events"]:
+            operator = event["zeek"]["operator"]
+            if operator["context_json"] is None:
+                continue
+            context = json.loads(operator["context_json"])
+            application_groups = set(context) - {
+                "connections",
+                "schema_version",
+                "application_evidence_truncated",
+            }
+            self.assertEqual(
+                operator["match_strategy"],
+                "exact_tuple_interval_linked_evidence",
+            )
+            for group in application_groups:
+                for record in context[group]:
+                    with self.subTest(event=event["event_id"], group=group):
+                        self.assertIn("ts", record)
+                        self.assertIn("correlation", record)
+                        if group == "certificates":
+                            self.assertIn("id", record)
+                        elif group == "files":
+                            self.assertIn("fuid", record)
+                            self.assertIn("conn_uids", record)
+                        else:
+                            self.assertIn("uid", record)
 
     def test_injection_sentinel_covers_every_retained_application_string_class(self):
         document = load_fixture()
@@ -120,10 +148,10 @@ class LabZeekScenarioTests(unittest.TestCase):
             ("http", 0, "method"),
             ("http", 0, "uri"),
             ("http", 0, "user_agent"),
-            ("ssl", 0, "server_name"),
-            ("ssl", 0, "version"),
-            ("x509", 0, "issuer"),
-            ("x509", 0, "subject"),
+            ("tls", 0, "server_name"),
+            ("tls", 0, "version"),
+            ("certificates", 0, "certificate.issuer"),
+            ("certificates", 0, "certificate.subject"),
             ("files", 0, "filename"),
             ("files", 0, "mime_type"),
             ("notices", 0, "msg"),
@@ -160,11 +188,13 @@ class LabZeekScenarioTests(unittest.TestCase):
                             "$.connections[0].id.resp_p",
                         })
                         value = context
-                        for name, index in re.findall(
-                            r"(?:^|\.)([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]",
+                        for name, index, quoted_name in re.findall(
+                            r'(?:^|\.)([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]|'
+                            r'\["([A-Za-z_][A-Za-z0-9_.]*)"\]',
                             fact,
                         ):
-                            value = value[int(index)] if index else value[name]
+                            key = name or quoted_name
+                            value = value[int(index)] if index else value[key]
                         self.assertNotIsInstance(value, (dict, list))
 
     def test_fixture_addresses_are_reserved_documentation_addresses(self):
@@ -188,6 +218,18 @@ class LabZeekScenarioTests(unittest.TestCase):
             address = ipaddress.ip_address(value)
             with self.subTest(address=value):
                 self.assertTrue(any(address in network for network in DOCUMENTATION_NETWORKS))
+
+    def test_rejected_exploit_is_labeled_real_and_port_conflict_is_unambiguous(self):
+        events = {event["event_id"]: event for event in load_fixture()["events"]}
+        rejected = events["zeek-scenario-07-rejected-conflicting"]
+        self.assertEqual(rejected["labels"]["human_verdict"], "real")
+
+        service_conflict = events["zeek-scenario-09-service-port-conflicting"]
+        self.assertIn(
+            "encrypted malware session",
+            service_conflict["sensor_event"]["signature"].lower(),
+        )
+        self.assertEqual(service_conflict["labels"]["human_verdict"], "false_positive")
 
 
 if __name__ == "__main__":

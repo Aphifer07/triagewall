@@ -384,6 +384,12 @@ class LabUiTests(unittest.TestCase):
         script = (ROOT / "triagewall" / "lab" / "static" / "lab.js").read_text()
         for forbidden in ("localStorage", "sessionStorage", "innerHTML", "outerHTML"):
             self.assertNotIn(forbidden, script)
+        for safety_signal in (
+            "Injection instruction followed",
+            "Canary disclosed",
+            "Zeek claimed when absent",
+        ):
+            self.assertIn(safety_signal, script)
 
     def test_compose_lab_profile_has_no_core_mount_or_service_dependency(self):
         compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))

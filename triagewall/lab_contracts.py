@@ -76,8 +76,13 @@ _PROMPT_FIELDS = {
     "system_prompt",
     "classification_prefix",
     "matched_zeek_instruction",
+    "response_mode",
     "content_sha256",
 }
+_PROMPT_OPTIONAL_FIELDS = {"response_mode"}
+CORE_RESPONSE_MODE = "core_v1"
+ZEEK_ASSESSMENT_RESPONSE_MODE = "zeek_assessment_v1"
+_RESPONSE_MODES = {CORE_RESPONSE_MODE, ZEEK_ASSESSMENT_RESPONSE_MODE}
 _CANDIDATE_REVISIONS_FIELDS = {
     "source_projection",
     "response_contract",
@@ -223,10 +228,16 @@ def _fail(location: str, message: str) -> None:
     raise LabContractError(f"{location} {message}")
 
 
-def _object(value: Any, fields: set[str], location: str) -> dict[str, Any]:
+def _object(
+    value: Any,
+    fields: set[str],
+    location: str,
+    *,
+    optional: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         _fail(location, "must be an object")
-    missing = fields - set(value)
+    missing = fields - optional - set(value)
     unknown = set(value) - fields
     if missing:
         _fail(location, f"is missing fields: {', '.join(sorted(missing))}")
@@ -410,7 +421,12 @@ def _validate_model(value: Any, location: str) -> None:
 
 
 def _validate_prompt(value: Any, location: str, source: str) -> None:
-    prompt = _object(value, _PROMPT_FIELDS, location)
+    prompt = _object(
+        value,
+        _PROMPT_FIELDS,
+        location,
+        optional=_PROMPT_OPTIONAL_FIELDS,
+    )
     system_prompt = _bounded_text_bytes(
         prompt["system_prompt"],
         f"{location}.system_prompt",
@@ -434,6 +450,22 @@ def _validate_prompt(value: Any, location: str, source: str) -> None:
         )
     if source == "wazuh" and zeek_instruction is not None:
         _fail(f"{location}.matched_zeek_instruction", "must be null for Wazuh")
+    response_mode = prompt.get("response_mode", CORE_RESPONSE_MODE)
+    if response_mode not in _RESPONSE_MODES:
+        _fail(
+            f"{location}.response_mode",
+            "must be core_v1 or zeek_assessment_v1",
+        )
+    if source == "wazuh" and response_mode != CORE_RESPONSE_MODE:
+        _fail(f"{location}.response_mode", "must be core_v1 for Wazuh")
+    if (
+        response_mode == ZEEK_ASSESSMENT_RESPONSE_MODE
+        and zeek_instruction is not None
+    ):
+        _fail(
+            f"{location}.matched_zeek_instruction",
+            "must be null for zeek_assessment_v1",
+        )
     _verify_content_digest(prompt, location)
 
 

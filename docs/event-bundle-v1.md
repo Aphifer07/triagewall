@@ -82,6 +82,13 @@ object. A `matched` layer requires context, at least one record, and exactly one
 candidate. Ambiguous and nonmatched results cannot carry automatic model
 context.
 
+The reference validator also restricts context field names to the production
+Zeek projection plus the legacy Lab SSL/X.509 aliases. This prevents an
+uploaded bundle from moving instruction-like text into an object key. At the
+model boundary, every Zeek string value is base64-isolated regardless of its
+field name; no UID, service, protocol, address, timestamp, or application value
+is trusted merely because it occupies an expected path.
+
 Automatic eligibility is recomputed from the normalized event and prefilter
 outcome. Wazuh events are `unsupported_source`; prefilter-resolved Suricata
 events are `prefilter_resolved`; incomplete or unsupported flows retain the

@@ -12,8 +12,10 @@ from typing import Any
 
 try:
     from .time_utils import format_utc_timestamp
+    from .zeek_isolation import ZeekIsolationError, validate_zeek_context_json
 except ImportError:  # Direct script-style imports used by container entrypoints.
     from time_utils import format_utc_timestamp
+    from zeek_isolation import ZeekIsolationError, validate_zeek_context_json
 
 
 EVENT_BUNDLE_SCHEMA = "triagewall.event-bundle"
@@ -461,6 +463,12 @@ def _validate_zeek_layer(value: Any, location: str) -> None:
             f"{location}.context_json",
             maximum_bytes=MAX_EVIDENCE_BYTES,
         )
+        try:
+            validate_zeek_context_json(context)
+        except ZeekIsolationError as exc:
+            raise EventBundleError(
+                f"{location}.context_json must use recognized Zeek fields"
+            ) from exc
     _verify_text_hash(context, digest, location)
     if status == "matched":
         if context is None or records < 1 or candidates != 1:

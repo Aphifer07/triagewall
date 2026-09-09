@@ -40,6 +40,13 @@ classification prefix, the event projection, and—only for a matched Suricata
 condition—the matched-Zeek instruction and evidence. Wazuh candidates cannot
 define a Zeek instruction.
 
+Suricata prompt components may select the optional `response_mode`. Its absence
+means the original `core_v1` three-field response and keeps existing candidate
+artifacts replayable. `zeek_assessment_v1` selects a closed JSON schema with a
+fourth top-level field: `null` without matched context, or a contribution,
+bounded path/value evidence list, and verdict impact when context is present.
+Changing that mode requires a distinct response-contract revision.
+
 Each system prompt contains `<CANARY_TOKEN>` exactly once. The runner replaces
 that placeholder with a fresh secret value at execution time. Candidate files
 therefore remain reproducible without persisting the live canary.

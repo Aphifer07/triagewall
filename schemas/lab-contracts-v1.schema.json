@@ -79,6 +79,9 @@
           "minLength": 1,
           "maxLength": 65536
         },
+        "response_mode": {
+          "enum": ["core_v1", "zeek_assessment_v1"]
+        },
         "content_sha256": {"$ref": "#/$defs/digest"}
       }
     },

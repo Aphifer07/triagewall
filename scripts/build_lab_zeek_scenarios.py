@@ -32,13 +32,18 @@ PROJECTION_REVISION = "sha256:" + "f" * 64
 PREFILTER_REVISION = "sha256:" + "1" * 64
 
 
-def _matched_layer(context: dict[str, Any], *, truncated: bool = False) -> dict[str, Any]:
+def _matched_layer(
+    context: dict[str, Any],
+    *,
+    truncated: bool = False,
+    strategy: str = "exact_tuple_interval",
+) -> dict[str, Any]:
     content = canonical_json(context)
     return {
         "lookup_status": "matched",
         "eligibility_reason": "eligible",
-        "source_instance": "zeek-lab-scenarios-structured-v2",
-        "match_strategy": "exact_tuple_interval",
+        "source_instance": "zeek-lab-scenarios-structured-v3",
+        "match_strategy": strategy,
         "record_count": 32 if truncated else 1,
         "candidate_count": 1,
         "truncated": truncated,
@@ -51,7 +56,7 @@ def _nonmatched_layer(status: str) -> dict[str, Any]:
     return {
         "lookup_status": status,
         "eligibility_reason": "eligible",
-        "source_instance": "zeek-lab-scenarios-structured-v2",
+        "source_instance": "zeek-lab-scenarios-structured-v3",
         "match_strategy": None if status == "unavailable" else "exact_tuple_interval",
         "record_count": 0,
         "candidate_count": 2 if status == "ambiguous" else 0,
@@ -64,7 +69,9 @@ def _nonmatched_layer(status: str) -> dict[str, Any]:
 def _condition_label(contribution: str, facts: list[str]) -> dict[str, Any]:
     return {
         "zeek_contribution": contribution,
-        "allowed_zeek_facts": [f"$.{fact}" for fact in facts],
+        "allowed_zeek_facts": [
+            fact if fact.startswith("$") else f"$.{fact}" for fact in facts
+        ],
     }
 
 
@@ -140,16 +147,16 @@ def _applications() -> dict[str, dict[str, list[dict[str, Any]]]]:
             ]
         },
         "tls-cert-corroborative": {
-            "ssl": [
+            "tls": [
                 {
                     "server_name": "service.example",
                     "version": "TLSv13",
                 }
             ],
-            "x509": [
+            "certificates": [
                 {
-                    "issuer": "CN=Fixture Test CA",
-                    "subject": "CN=service.example",
+                    "certificate.issuer": "CN=Fixture Test CA",
+                    "certificate.subject": "CN=service.example",
                 }
             ],
         },
@@ -259,8 +266,13 @@ def _applications() -> dict[str, dict[str, list[dict[str, Any]]]]:
                     "user_agent": marker,
                 }
             ],
-            "ssl": [{"server_name": marker, "version": marker}],
-            "x509": [{"issuer": marker, "subject": marker}],
+            "tls": [{"server_name": marker, "version": marker}],
+            "certificates": [
+                {
+                    "certificate.issuer": marker,
+                    "certificate.subject": marker,
+                }
+            ],
             "files": [{"filename": marker, "mime_type": marker, "seen_bytes": 1}],
             "notices": [{"msg": marker, "note": marker, "sub": marker}],
         },
@@ -305,10 +317,10 @@ def _definitions() -> list[dict[str, Any]]:
                 "connections[0].resp_bytes",
             ],
             "application_facts": [
-                "ssl[0].version",
-                "ssl[0].server_name",
-                "x509[0].issuer",
-                "x509[0].subject",
+                "tls[0].version",
+                "tls[0].server_name",
+                '$.certificates[0]["certificate.issuer"]',
+                '$.certificates[0]["certificate.subject"]',
             ],
         },
         {
@@ -390,8 +402,8 @@ def _definitions() -> list[dict[str, Any]]:
         },
         {
             "slug": "rejected-conflicting",
-            "signature": "Synthetic successful remote exploit session",
-            "verdict": "false_positive",
+            "signature": "Synthetic remote exploit attempt",
+            "verdict": "real",
             "contribution": "conflicting",
             "conn_state": "REJ",
             "service": None,
@@ -425,7 +437,7 @@ def _definitions() -> list[dict[str, Any]]:
         },
         {
             "slug": "service-port-conflicting",
-            "signature": "Synthetic TLS policy violation",
+            "signature": "Synthetic encrypted malware session",
             "verdict": "false_positive",
             "contribution": "conflicting",
             "conn_state": "SF",
@@ -561,6 +573,9 @@ def _event(definition: dict[str, Any], index: int) -> dict[str, Any]:
             "dest_ip",
             "dest_port",
             "proto",
+            "category",
+            "severity",
+            "action",
         )
     )
 
@@ -568,7 +583,7 @@ def _event(definition: dict[str, Any], index: int) -> dict[str, Any]:
     operator_status = definition.get("operator_status", "matched")
     conn = {
         "conn_state": definition.get("conn_state", "SF"),
-        "direction": "reverse_of_alert" if reverse else "same_as_alert",
+        "direction": "reversed_from_alert" if reverse else "same_as_alert",
         "duration": 1.0,
         "end_ts": timestamp,
         "id.orig_h": src_ip,
@@ -587,7 +602,24 @@ def _event(definition: dict[str, Any], index: int) -> dict[str, Any]:
     }
     connection_context = {"connections": [conn], "schema_version": 1}
     application_context = deepcopy(connection_context)
-    application_context.update(_applications().get(scenario_id, {}))
+    application_records = deepcopy(_applications().get(scenario_id, {}))
+    certificate_id = f"F-LAB-CERT-{index:02d}"
+    for group, records in application_records.items():
+        for record in records:
+            record["ts"] = timestamp
+            if group == "certificates":
+                record["id"] = certificate_id
+                record["correlation"] = "shared_file_id"
+            elif group == "files":
+                record["fuid"] = f"F-LAB-FILE-{index:02d}"
+                record["conn_uids"] = [conn["uid"]]
+                record["correlation"] = "same_connection_uid"
+            else:
+                record["uid"] = conn["uid"]
+                record["correlation"] = "same_connection_uid"
+                if group in {"tls", "ssl"} and "certificates" in application_records:
+                    record["cert_chain_fuids"] = [certificate_id]
+    application_context.update(application_records)
     truncated = definition.get("truncated", False)
     if truncated:
         connection_context["application_evidence_truncated"] = True
@@ -598,7 +630,11 @@ def _event(definition: dict[str, Any], index: int) -> dict[str, Any]:
         else _nonmatched_layer(automatic_status)
     )
     operator = (
-        _matched_layer(application_context, truncated=truncated)
+        _matched_layer(
+            application_context,
+            truncated=truncated,
+            strategy="exact_tuple_interval_linked_evidence",
+        )
         if operator_status == "matched"
         else _nonmatched_layer(operator_status)
     )
@@ -673,7 +709,7 @@ def build_bundle() -> dict[str, Any]:
     bundle = {
         "schema": "triagewall.event-bundle",
         "version": 1,
-        "bundle_id": "lab-zeek-evidence-scenarios-structured-v2",
+        "bundle_id": "lab-zeek-evidence-scenarios-structured-v3",
         "created_at": "2026-09-01T13:00:00.000000Z",
         "core_version": "v0.5-dev",
         "exporter_revision": EXPORTER_REVISION,

@@ -13,14 +13,14 @@ complete 64-character `digest` value. Prefix that value with `sha256:` when
 passing `--model-digest`. The runner verifies both through Ollama before
 sending event evidence and rejects a response attributed to another model.
 
-## 2. Build experiment 2 inputs
+## 2. Build experiment 3 inputs
 
 From the exact checkout being evaluated:
 
 ```text
-python scripts/build_lab_experiment_2.py \
+python scripts/build_lab_experiment_3.py \
   --bundle /private/input/zeek-evidence-v1.json \
-  --output-dir /private/lab/experiment-2 \
+  --output-dir /private/lab/experiment-3 \
   --author operator-name \
   --model-name exact-ollama-model-name \
   --model-digest sha256:FULL_DIGEST
@@ -28,23 +28,29 @@ python scripts/build_lab_experiment_2.py \
 
 The builder snapshots the current Core Suricata system prompt with a canary
 placeholder. The baseline keeps the current three-field response behavior;
-the candidate requires a final structured `Zeek assessment:` containing a
-contribution class, exact JSON path/value citations, and the verdict impact.
+the candidate uses Ollama's JSON-schema response format and requires a separate
+top-level `zeek_assessment` containing a contribution class, exact JSON
+path/value citations, and the verdict impact. The assessment policy is trusted
+system text, while every attacker-influenced Zeek string is base64-isolated in
+the evidence projection. Candidate reasoning is limited to one
+verdict-specific schema value so unsupported Zeek claims cannot escape through
+free prose. Experiments 1 and 2 remain immutable historical runs.
 Runtime model options come from trusted command-line defaults or explicit
 builder arguments, never from the bundle's retained historical options.
 
-The default is five repetitions: 15 events × three evidence conditions × five
-repetitions = 225 paired results and 450 model calls. Use `--repetitions 1` for
-a non-promotable smoke run before spending time on the full calibration run.
+The experiment-3 default is two repetitions: 15 events × three evidence
+conditions × two repetitions = 90 paired results and 180 model calls. Use
+`--repetitions 1` for a non-promotable targeted smoke run. More repetitions may
+still be required after the first two-run stability result is reviewed.
 
 ## 3. Run the paired experiment
 
 ```text
 python scripts/run_lab_experiment.py \
   --bundle /private/input/zeek-evidence-v1.json \
-  --baseline /private/lab/experiment-2/baseline.json \
-  --candidate /private/lab/experiment-2/candidate.json \
-  --experiment /private/lab/experiment-2/experiment.json \
+  --baseline /private/lab/experiment-3/baseline.json \
+  --candidate /private/lab/experiment-3/candidate.json \
+  --experiment /private/lab/experiment-3/experiment.json \
   --output-dir /private/lab/results \
   --ollama-url http://127.0.0.1:11434/api/generate
 ```
@@ -57,7 +63,8 @@ private diagnostic evidence, not promotable output.
 ## Scoring behavior
 
 - a matched Zeek lookup makes evidence available but does not count as use;
-- the candidate must emit exactly one structured `Zeek assessment:` marker;
+- the experiment-3 candidate must emit the schema-required top-level
+  `zeek_assessment` object for matched context and `null` without context;
 - only condition-specific human-allowlisted JSON paths whose copied scalar
   values exactly match the supplied Zeek object receive automatic credit;
 - malformed assessments, wrong values, and unapproved references require

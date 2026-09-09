@@ -218,7 +218,7 @@ contain distinct sections for:
 - run-to-run verdict and confidence stability;
 - local model and hardware identity.
 
-## Experiment 2: structured Zeek evidence use
+## Experiment 3: schema-enforced Zeek evidence use
 
 ### Question
 
@@ -230,14 +230,16 @@ classification quality?
 
 - **Baseline:** the current production prompt, where matched connection evidence
   is supplied as untrusted context without a required Zeek assessment.
-- **Candidate:** the same prompt plus an instruction requiring a final
-  structured assessment with the contribution class, exact Zeek JSON
-  path/value citations, and the verdict impact.
+- **Candidate:** the same classification policy plus trusted system-level Zeek
+  assessment instructions and an Ollama-enforced response schema requiring a
+  separate top-level contribution, exact Zeek JSON path/value citations, and
+  verdict impact.
 
-The candidate retains Core's existing three-field response contract; the
-structured assessment is carried inside `reasoning`. The original prose-based
-candidate remains an immutable failed baseline. Its results are not mixed with
-the new candidate, and legacy prose allowlists remain replayable.
+The baseline retains Core's existing three-field response contract. The
+candidate uses the optional `zeek_assessment_v1` Lab response mode; Core is not
+changed to consume that response. Experiments 1 and 2 remain immutable failed
+historical evidence, their results are not mixed with experiment 3, and their
+legacy candidates remain replayable.
 
 ### Evidence conditions
 
@@ -282,14 +284,15 @@ always has an empty allowlist. The model never creates its own ground truth.
 
 ### Scoring
 
-For the three-field candidate, the scorer locates the required `Zeek
-assessment:` sentence and compares its claims with the condition's allowlisted
-facts. Ambiguous natural-language matches become human-review items rather than
-automatic passes.
-
-A future structured-citation candidate may return evidence paths such as
-`connections[0].conn_state`, but its additional schema and validation behavior
-must be evaluated independently before Core adopts it.
+For the experiment-3 candidate, the response schema requires a top-level
+assessment object whenever matched context is supplied and requires `null`
+otherwise. The scorer resolves only bounded allowlisted JSON paths and credits
+only exact raw scalar values. Zeek claims in free-form reasoning, missing or
+malformed assessments, unapproved paths, and mismatched values require human
+review. Experiment 3 removes candidate free-form reasoning entirely: the
+schema permits only one verdict-specific sentence, and all Zeek-derived facts
+must live in the assessment. Production-style dotted keys use a restricted
+bracket notation.
 
 ### Provisional promotion gates
 
@@ -387,8 +390,9 @@ The implemented command sequence and current limitations are documented in
 - [x] add immutable imported-bundle storage, quotas, retention, cancellation,
   lease-expiry recovery, and sanitized aggregate promotion reports;
 - [x] retain the blocked prose-based experiment 1 as the initial baseline;
-- [ ] execute structured experiment 2 against the local production model and
-  calibrate promotion thresholds.
+- [x] execute structured experiment 2 and retain its blocked report;
+- [ ] execute schema-enforced experiment 3 against the local production model,
+  first as a smoke run and then with at least two repetitions.
 
 ### Phase 2 — standalone Lab application
 
@@ -417,8 +421,8 @@ Decided:
 - paired baseline/candidate runs;
 - separate decision, evidence-use, safety, and cost metrics;
 - manual bundle handoff and normal Core pull request for the first promotion;
-- the current Zeek reasoning candidate is structured experiment 2; the blocked
-  prose-based experiment 1 remains historical evidence.
+- the current Zeek candidate is schema-enforced experiment 3; blocked
+  experiments 1 and 2 remain historical evidence.
 
 To decide during Phase 0:
 
@@ -428,5 +432,5 @@ To decide during Phase 0:
 - the authentication mechanism for optional LAN access;
 - whether the provisional 30-day retention and 10 GiB quota should change after
   measuring real experiment output;
-- whether structured evidence citations inside the existing reasoning field
-  improve the full five-repetition production-model result enough to promote.
+- whether the separate schema-enforced assessment improves the two-repetition
+  production-model result enough to justify a larger calibration run.
